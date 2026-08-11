@@ -1,0 +1,75 @@
+[project]
+name = "finetune-minimol"
+version = "0.1.0"
+description = "Full-trunk fine-tuning of MiniMol on AmpC docking-score regression"
+authors = [{ name = "Ethan Kreuzer" }]
+
+# Pinned to 3.11, not a range. The torch-scatter/sparse/cluster wheels on data.pyg.org are
+# built per (python, torch, cuda) triple -- cp311 + pt26cu124 here -- so the interpreter is
+# part of the ABI contract, not a preference. graphium 2.4.7 classifiers stop at 3.11.
+requires-python = "==3.11.*"
+
+dependencies = [
+    # Pulls graphium==2.4.7 and hydra-core. The wheel also carries the pretrained weights,
+    # which is why it is 19 MB. Vendored at vendor/ as a hedge -- see NOTES.
+    "minimol==1.3.4",
+
+    # torch is pinned exactly and explicitly. graphium declares NO torch dependency at all
+    # (only torch-sparse/cluster/scatter/geometric), so an unpinned resolve is free to pick
+    # whatever the newest torch is -- on 2026-08-10 it picked 2.13.0 with CUDA-13 wheels,
+    # silently uninstalling the cu124 build and orphaning the three compiled extensions.
+    # cu124 covers sm_90 (H100/H200), which is what TamIA runs.
+    "torch==2.6.0+cu124",
+    "torchvision==0.21.0+cu124",
+
+    # Compiled against torch 2.6.0+cu124. Sourced from the flat index below, never PyPI --
+    # PyPI carries only sdists for these, which try to compile against torch at build time.
+    "torch-scatter==2.1.2+pt26cu124",
+    "torch-sparse==0.6.18+pt26cu124",
+    "torch-cluster==1.6.3+pt26cu124",
+
+    # graphium pins torchmetrics<0.11, and torchmetrics 0.10.3 imports pkg_resources at
+    # module scope. setuptools 81 deprecated pkg_resources and 84 removed it. uv builds bare
+    # venvs with no setuptools at all, so without this the env installs cleanly and then
+    # fails on `import graphium` with ModuleNotFoundError: No module named 'pkg_resources'.
+    "setuptools<81",
+
+    # graphium's featurizer builds the adjacency matrix as float16 and hands it to
+    # scipy.sparse.coo_matrix. Newer scipy enforces a dtype whitelist in sparse construction
+    # (scipy/sparse/_sputils.py::getdtype) that excludes float16, so featurization raises
+    # "scipy.sparse does not support dtype float16".
+    #
+    # Measured by constructing a float16 coo_matrix on each version: 1.13.1 accepts,
+    # 1.14.1 accepts, 1.15.3 rejects, 1.17.1 rejects. So the true boundary is 1.15, and
+    # `<1.15` would also be correct. Pinned at `<1.14` because 1.13.1 is the version the
+    # full trunk verification actually ran under; 1.14.x is untested with graphium here.
+    "scipy<1.14",
+]
+
+[project.optional-dependencies]
+dev = ["ipython", "jupyter"]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[[tool.uv.index]]
+name = "pyg"
+url = "https://data.pyg.org/whl/torch-2.6.0+cu124.html"
+format = "flat"
+explicit = true
+
+# `explicit = true` on both indexes means these packages are drawn ONLY from the index named
+# here, and every other package comes only from PyPI. Without it uv would consider PyPI's
+# sdists for the three extensions and try to build them.
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+torch-scatter = { index = "pyg" }
+torch-sparse = { index = "pyg" }
+torch-cluster = { index = "pyg" }
+
+# src/ holds scripts, not an installable package -- nothing here to build or install.
+[tool.uv]
+package = false

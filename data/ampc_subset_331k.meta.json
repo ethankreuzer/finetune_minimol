@@ -1,0 +1,107 @@
+{
+  "input": "data/ampc_unif_random_10M_pprop10M.csv",
+  "input_bytes": 729890681,
+  "input_mtime": 1785775362.3072553,
+  "output": "data/ampc_subset_331k.csv",
+  "seed": 0,
+  "per_bin": 60000,
+  "take_all_above": 2.5,
+  "bin_width": 0.5,
+  "rows_in": 10000000,
+  "rows_out": 331480,
+  "smiles": "rdkit canonical (isomeric), deduplicated",
+  "canonicalisation": {
+    "rewritten": 8518,
+    "unparseable": 0,
+    "dropped_identical_score": 61,
+    "dropped_differing_score": 1
+  },
+  "n_pprop_ge_3.5": 3153,
+  "n_pprop_ge_5.0": 100,
+  "bins": [
+    {
+      "bin": "0.0",
+      "population": 6837971,
+      "taken": 60000,
+      "ipw": 113.96618333333333
+    },
+    {
+      "bin": "0.5",
+      "population": 2162095,
+      "taken": 60000,
+      "ipw": 36.03491666666667
+    },
+    {
+      "bin": "1.0",
+      "population": 683843,
+      "taken": 59997,
+      "ipw": 11.397953230994883
+    },
+    {
+      "bin": "1.5",
+      "population": 216115,
+      "taken": 59991,
+      "ipw": 3.60245703522195
+    },
+    {
+      "bin": "2.0",
+      "population": 68434,
+      "taken": 59966,
+      "ipw": 1.141213354234066
+    },
+    {
+      "bin": "2.5",
+      "population": 21560,
+      "taken": 21548,
+      "ipw": 1.0005568962316689
+    },
+    {
+      "bin": "3.0",
+      "population": 6828,
+      "taken": 6825,
+      "ipw": 1.0004395604395604
+    },
+    {
+      "bin": "3.5",
+      "population": 2158,
+      "taken": 2157,
+      "ipw": 1.0004636068613815
+    },
+    {
+      "bin": "4.0",
+      "population": 682,
+      "taken": 682,
+      "ipw": 1.0
+    },
+    {
+      "bin": "4.5",
+      "population": 214,
+      "taken": 214,
+      "ipw": 1.0
+    },
+    {
+      "bin": "5.0",
+      "population": 69,
+      "taken": 69,
+      "ipw": 1.0
+    },
+    {
+      "bin": "5.5",
+      "population": 21,
+      "taken": 21,
+      "ipw": 1.0
+    },
+    {
+      "bin": "6.0",
+      "population": 7,
+      "taken": 7,
+      "ipw": 1.0
+    },
+    {
+      "bin": "6.5",
+      "population": 3,
+      "taken": 3,
+      "ipw": 1.0
+    }
+  ]
+}
