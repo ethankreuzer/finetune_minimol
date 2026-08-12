@@ -1,18 +1,37 @@
-"""One training run: staged fine-tuning of MiniMol on AmpC pProp regression.
+"""One training run: staged fine-tuning of MiniMol on the AmpC pProp task.
 
-A prototype of the real thing, deliberately kept to one fold and one seed. The schedule is
-the experiment: the head trains alone on top of the frozen embedding for `--freeze-epochs`,
-then the trunk is unfrozen and both train together. The head is given a chance to stop being
-random before its gradients are allowed to reach 10M pretrained parameters.
+One fold, one seed. The schedule is the experiment: the head trains alone on top of the
+frozen embedding for `--freeze-epochs`, then the trunk is unfrozen and both train together.
+The head is given a chance to stop being random before its gradients are allowed to reach
+10M pretrained parameters.
 
-Target is `pprop` (NOTES §1, settled 2026-08-11). Objective is Pearson correlation on the
-held-out fold; MSE is the loss and is tracked for both splits.
+The task is joint (`head.DualHead`): a **binary classifier at pProp >= 3.5** and a
+**regression on continuous pProp**, sharing one MLP over the 512-d embedding. 3.5 is the
+threshold at which binders become possible; it is also the finest split at which the
+positive class is still large enough to learn from -- 3,153 molecules, 619-643 per
+validation fold, against only 100 in the whole dataset at pProp >= 5.0.
 
     python src/train.py --fold 0 --seed 0
     python src/train.py --epochs 2 --freeze-epochs 1 --subset 5000 --no-wandb   # smoke
+    python src/train.py --fold 0 --seed 0 --freeze-epochs 20                    # baseline
 
-THE ORDERING TRAP
------------------
+The last form is the frozen-trunk baseline: `--freeze-epochs == --epochs` never unfreezes,
+so it reproduces the frozen-embedding workflow *on these splits*, which is the only honest
+comparison for the fine-tuned arm.
+
+THE LOSS
+--------
+`losses.combined_loss`: `w_cls * cls + huber + w_pair * pair + w_std * std`, with huber
+grounded at weight 1 as the only term anchoring the absolute pProp level. See `losses.py`
+for what changed in the port from `pProp_MLP` and why.
+
+`--weights` selects the per-sample weight vector, defaulting to `balanced` (two-group
+inverse frequency at pProp 3.5, a 104x ratio). **Weights are derived per fold, from that
+fold's own composition** -- the training fold never sees the validation fold's group sizes,
+and vice versa.
+
+TWO ORDERING TRAPS, BOTH ENFORCED IN CODE
+-----------------------------------------
 `MiniMolRegressor.param_groups` filters on `p.requires_grad` at *construction* time and
 drops a group that comes back empty (model.py:69). So freezing the trunk before building
 the optimizer yields a one-group optimizer, and unfreezing later sets `requires_grad = True`
@@ -25,10 +44,18 @@ measures it directly: the trunk must be bit-for-bit unchanged across the frozen 
 *while the head provably moves*, and must change once unfrozen. An unchanged trunk proves
 nothing on its own -- it is equally what a broken training loop looks like -- which is why
 the check is paired, following `verify_trunk.py::check_excluded_unreachable`.
+
+METRICS ARE ON THE RAW pProp SCALE, ALWAYS
+------------------------------------------
+`--pprop-norm` changes what the regression head predicts, not what is reported: `evaluate`
+denormalizes before computing anything. Pearson would survive either way (scale-invariant)
+but MSE and MAE would not, and `val/mse` is declared with `summary="min"` -- so a normalized
+report would silently make that summary incomparable across `--pprop-norm` settings.
 """
 
 import argparse
 import json
+import math
 import platform
 import subprocess
 import sys
@@ -38,21 +65,35 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from scipy.stats import pearsonr
 from torch.utils.data import DataLoader, Dataset
 from torch_geometric.data import Batch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from features import load_features          # noqa: E402
-from head import MLPHead                    # noqa: E402
-from model import MiniMolRegressor          # noqa: E402
-from splits import load_fold                # noqa: E402
-from trunk import MiniMolTrunk              # noqa: E402
+from features import load_features                                          # noqa: E402
+from head import DualHead                                                   # noqa: E402
+from losses import (PPROP_EDGE, binary_labels, build_sample_weights,         # noqa: E402
+                    combined_loss, effective_sample_size, pairwise_distance_loss,
+                    std_match_loss, weighted_bce_loss, weighted_huber_loss)
+from metrics import enrichment_factor, flavoured_metrics, group_split_metrics  # noqa: E402
+from model import MiniMolRegressor                                          # noqa: E402
+from normalization import (NORM_STRATEGIES, compute_norm_stats,              # noqa: E402
+                           denormalize_pprop, normalize_pprop)
+from objective import (OBJECTIVE_VERSION, REQUIRED_FLAVOURS,                 # noqa: E402
+                       compute_objective)
+from run_paths import run_dir                                               # noqa: E402
+from splits import load_fold, load_meta                                     # noqa: E402
+from trunk import MiniMolTrunk                                              # noqa: E402
 
 # The tensor verify_trunk.py uses to prove an optimizer step moves the trunk. Reused here so
 # both scripts are watching the same weight.
 TRUNK_PROBE = "gnn.layers.0.model.nn.fully_connected.0.linear.weight"
+
+# The pairwise term is O(N^2), so its *reported* value on a 66k validation fold is estimated
+# on a fixed seeded subsample -- 66,296^2 is 4.4e9 pairs. Same constant and same reasoning as
+# pProp_MLP. The loss scalar is an estimate; every metric beside it is exact.
+PAIR_EVAL_K = 4096
+PAIR_EVAL_SEED = 12345
 
 
 def parse_args(argv=None):
@@ -65,27 +106,56 @@ def parse_args(argv=None):
     p.add_argument("--seed", type=int, default=0,
                    help="head init, dropout and shuffling only -- never the partition")
 
-    p.add_argument("--epochs", type=int, default=5)
-    p.add_argument("--freeze-epochs", type=int, default=3,
-                   help="epochs training the head alone before the trunk is unfrozen")
-    p.add_argument("--hidden-dims", type=int, nargs="*", default=[1024, 32])
+    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument("--freeze-epochs", type=int, default=5,
+                   help="epochs training the head alone before the trunk is unfrozen; "
+                        "set equal to --epochs for the frozen-trunk baseline")
+
+    # Head shape as scalars, not a list: sweep drivers pass scalars, and a list-valued
+    # hyperparameter has no natural representation in Optuna or a wandb sweep config.
+    p.add_argument("--n-layers", type=int, default=2, help="shared trunk depth (0 = none)")
+    p.add_argument("--hidden-dim", type=int, default=1024)
+    p.add_argument("--cls-n-layers", type=int, default=1)
+    p.add_argument("--cls-hidden-dim", type=int, default=256)
+    p.add_argument("--reg-n-layers", type=int, default=1)
+    p.add_argument("--reg-hidden-dim", type=int, default=256)
+    p.add_argument("--head-norm", default="layer", help="'layer', 'batch' or 'none'")
     p.add_argument("--dropout", type=float, default=0.0, help="head dropout")
 
     p.add_argument("--head-lr", type=float, default=1e-3)
     p.add_argument("--trunk-lr", type=float, default=1e-4)
+    p.add_argument("--lr-schedule", choices=("none", "cosine"), default="cosine")
+    p.add_argument("--eta-min", type=float, default=1e-8,
+                   help="cosine floor; 1e-8 matches the schedule these defaults came from")
     p.add_argument("--weight-decay", type=float, default=0.01)
-    p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--num-workers", type=int, default=4)
+    # Batch 1200 is doing double duty: throughput (reports/compute_profile.md measures the
+    # fixed per-step overhead falling from 28% at 256 to ~9% at 1024) and tail variance
+    # (~11.4 positives per batch instead of 2.4, so the up-weighted half of the loss is not
+    # riding on two or three molecules). Both arguments point the same way.
+    p.add_argument("--batch-size", type=int, default=1200)
+    p.add_argument("--num-workers", type=int, default=16)
 
-    p.add_argument("--weights", choices=["uniform", "ipw"], default="uniform",
-                   help="per-sample loss weights. 'uniform' is plain MSE; the hook exists "
-                        "because a weighting scheme is planned but unchosen (NOTES §1)")
+    p.add_argument("--weights", choices=("uniform", "balanced"), default="balanced",
+                   help="per-sample loss weights (losses.build_sample_weights)")
+    p.add_argument("--pprop-norm", choices=NORM_STRATEGIES, default="zscore",
+                   help="regression target transform; stats from the TRAINING fold only")
+    p.add_argument("--w-cls", type=float, default=0.4418)
+    p.add_argument("--w-pair", type=float, default=7.486)
+    p.add_argument("--w-std", type=float, default=0.7911)
+    p.add_argument("--huber-delta", type=float, default=1.0513)
+
     p.add_argument("--subset", type=int, default=None,
                    help="use only N train and N val rows (smoke test)")
     p.add_argument("--out", type=Path, default=None,
-                   help="output dir; defaults to outputs/fold{fold}_seed{seed}")
+                   help="output dir; defaults to outputs/<sweep_id>/fold{fold}_seed{seed}")
+    p.add_argument("--outputs-root", type=Path, default=Path("outputs"))
+    p.add_argument("--sweep-id", default=None,
+                   help="groups runs on disk; falls back to WANDB_SWEEP_ID then _no_sweep")
     p.add_argument("--wandb-project", default="finetune_minimol")
     p.add_argument("--wandb-entity", default="ethan_personal")
+    p.add_argument("--wandb-group", default=None,
+                   help="groups the runs of one grid into a single wandb view")
+    p.add_argument("--wandb-tags", nargs="*", default=None)
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--no-assert-schedule", dest="assert_schedule", action="store_false",
                    help="skip the freeze/unfreeze weight-delta assertions (not advised)")
@@ -95,22 +165,25 @@ def parse_args(argv=None):
 # -- data ---------------------------------------------------------------------------
 
 class RowDataset(Dataset):
-    """`(graph, target, weight, row_index)` for one row of the subset CSV.
+    """`(graph, y_norm, y_binary, weight, row_index)` for one row of the subset CSV.
 
     The row index is carried through the batch so validation predictions can be written back
     against the CSV rows they belong to -- which is what makes pooled out-of-fold tail
-    metrics possible later without re-running anything.
+    metrics possible later (`src/pool_oof.py`) without re-running anything. It also means
+    the *raw* target never has to travel in the batch: `y_raw = y[rows]` recovers it exactly
+    after the fact.
     """
 
-    def __init__(self, cache, y, w, indices):
-        self.cache, self.y, self.w, self.indices = cache, y, w, indices
+    def __init__(self, cache, y_norm, y_bin, w, indices):
+        self.cache, self.y_norm, self.y_bin, self.w = cache, y_norm, y_bin, w
+        self.indices = indices
 
     def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, i):
         row = int(self.indices[i])
-        return self.cache[row], self.y[row], self.w[row], row
+        return self.cache[row], self.y_norm[row], self.y_bin[row], self.w[row], row
 
 
 def collate_batch(items):
@@ -120,52 +193,57 @@ def collate_batch(items):
     the model would drag a CUDA-resident module into forked children. Nothing here touches
     CUDA -- the move to device happens in the training loop.
     """
-    graphs, y, w, idx = zip(*items)
+    graphs, y_norm, y_bin, w, idx = zip(*items)
     batch = Batch.from_data_list(list(graphs))
     return ({"features": batch, "batch_indices": batch.batch},
-            torch.tensor(y, dtype=torch.float32),
+            torch.tensor(y_norm, dtype=torch.float32),
+            torch.tensor(y_bin, dtype=torch.float32),
             torch.tensor(w, dtype=torch.float32),
             torch.tensor(idx, dtype=torch.long))
 
 
-def build_weights(kind, csv, n):
-    if kind == "uniform":
-        return np.ones(n, dtype=np.float64)
-    ipw = pd.read_csv(csv, usecols=["ipw"])["ipw"].to_numpy(dtype=np.float64)
-    if len(ipw) != n:
-        raise SystemExit(f"ipw column has {len(ipw)} rows, expected {n}")
-    return ipw
+def fold_weights(kind, y, train_idx, val_idx):
+    """A full-length weight vector whose folds are each weighted by their *own* composition.
 
+    Building one vector over all 331,480 rows and slicing it would leak: `balanced` weights
+    depend on the group sizes of whatever set they are computed over, so a global vector
+    would encode the validation fold's tail fraction into the training loss. Each fold is
+    therefore weighted independently and written into its own positions.
 
-# -- loss and metrics ---------------------------------------------------------------
-
-def weighted_mse(pred, target, w):
-    """Plain MSE when `w` is uniform; the hook for a weighting scheme when it is not.
-
-    Normalised by `w.sum()` rather than `len(w)`, so the loss scale does not move when a
-    weighting scheme is swapped in -- otherwise the learning rate would silently need
-    retuning alongside it.
+    Rows in neither fold keep weight 0; nothing reads them, and a zero is a louder failure
+    than a plausible-looking 1 if that ever stops being true.
     """
-    return ((pred - target) ** 2 * w).sum() / w.sum()
-
-
-def pearson(pred, target):
-    """Pearson r, with the degenerate case reported rather than returned as a bare nan.
-
-    A model predicting a constant has zero variance and Pearson is undefined. That is a real
-    possibility here in early epochs -- 36% of rows sit below pProp 1.0, so predicting the
-    mean is a genuine local optimum -- and a silent nan in wandb is far harder to diagnose
-    than a logged standard deviation next to it.
-    """
-    pred = np.asarray(pred, dtype=np.float64)
-    target = np.asarray(target, dtype=np.float64)
-    std = float(pred.std())
-    if std == 0.0 or float(target.std()) == 0.0:
-        return float("nan"), std
-    return float(pearsonr(pred, target)[0]), std
+    w = np.zeros(len(y), dtype=np.float64)
+    for idx in (train_idx, val_idx):
+        w[idx] = build_sample_weights(kind, y[idx])
+    return w
 
 
 # -- schedule -----------------------------------------------------------------------
+
+def scheduled_lr(base, epoch, cfg):
+    """Cosine-annealed learning rate for a 1-indexed epoch, or `base` if the schedule is off.
+
+    `CosineAnnealingLR(T_max=epochs, eta_min=...)` in closed form, over the whole run --
+    matching `pProp_MLP/src/sweep_train.py`, which is where these LR and loss defaults come
+    from.
+
+    This is computed rather than delegated to a torch scheduler because a scheduler writes
+    `group["lr"]` on every step and would silently overwrite the freeze, which also writes
+    it. Two authorities over one field is exactly the class of bug the module docstring's
+    ordering traps are about, so there is one authority here: `apply_lrs`.
+
+    **Annealing matters more here than it did there**, because selection is at the final
+    epoch with no early stopping. With the LR annealed to ~`eta_min` the final epoch is a
+    settled model; at a constant LR it is an arbitrary point on a still-moving trajectory,
+    which would make pProp_MLP's measured 0.003-0.005 final-epoch selection penalty a floor
+    rather than an estimate.
+    """
+    if cfg.lr_schedule == "none" or cfg.epochs <= 1:
+        return base
+    t = (epoch - 1) / cfg.epochs
+    return cfg.eta_min + (base - cfg.eta_min) * (1 + math.cos(math.pi * t)) / 2
+
 
 def set_trunk_trainable(model, optimizer, trainable, trunk_lr):
     """Flip the trunk between frozen and training.
@@ -173,12 +251,33 @@ def set_trunk_trainable(model, optimizer, trainable, trunk_lr):
     Sets `requires_grad` *and* the trunk group's lr. Either alone would suffice -- AdamW
     skips a parameter whose `.grad` is None -- but doing both makes the state legible in the
     logged learning rate and stops one of them being changed later in isolation.
+
+    Every freeze transition in the run goes through this one function, including the ones
+    `apply_lrs` performs each epoch. That is deliberate: `verify_metrics.py` neuters this
+    name to prove the schedule assertion has teeth, and a second path around it would make
+    that negative test pass while testing nothing.
     """
     for p in model.trunk.parameters():
         p.requires_grad_(trainable)
     for group in optimizer.param_groups:
         if group.get("name") == "trunk":
             group["lr"] = trunk_lr if trainable else 0.0
+
+
+def apply_lrs(model, optimizer, epoch, cfg, trunk_trainable):
+    """The single authority over both learning rates each epoch. Returns what it set.
+
+    Delegates the trunk to `set_trunk_trainable` rather than writing its lr directly, so the
+    freeze keeps exactly one implementation.
+    """
+    trunk_lr = scheduled_lr(cfg.trunk_lr, epoch, cfg)
+    set_trunk_trainable(model, optimizer, trunk_trainable, trunk_lr)
+
+    head_lr = scheduled_lr(cfg.head_lr, epoch, cfg)
+    for group in optimizer.param_groups:
+        if group.get("name") == "head":
+            group["lr"] = head_lr
+    return {"head": head_lr, "trunk": trunk_lr if trunk_trainable else 0.0}
 
 
 def probe_weights(model):
@@ -190,52 +289,118 @@ def probe_weights(model):
 
 # -- loops --------------------------------------------------------------------------
 
-def train_one_epoch(model, loader, optimizer, device):
-    model.train()
-    total_w = 0.0
-    total_se = 0.0
-    preds, targets = [], []
-    for batch, y, w, _ in loader:
-        batch = model.trunk.to_device(batch, device)
-        y, w = y.to(device), w.to(device)
+def train_one_epoch(model, loader, optimizer, device, cfg):
+    """One pass over the training fold. Returns the mean of each loss term.
 
-        pred = model(batch)
-        loss = weighted_mse(pred, y, w)
+    Terms are accumulated weighted by batch size and reported *unscaled* -- before their
+    `w_*` multipliers. That is the only way to see whether a swept weight is doing anything,
+    since a term that has collapsed and a term whose weight is tiny look identical once
+    multiplied.
+    """
+    model.train()
+    totals = {"loss": 0.0, "cls": 0.0, "huber": 0.0, "pair": 0.0, "std": 0.0}
+    n_seen = 0
+    for batch, y_norm, y_bin, w, _ in loader:
+        batch = model.trunk.to_device(batch, device)
+        y_norm, y_bin, w = y_norm.to(device), y_bin.to(device), w.to(device)
+
+        logits, pred = model(batch)
+        loss, terms = combined_loss(logits, pred, y_bin, y_norm, w,
+                                    w_cls=cfg.w_cls, w_pair=cfg.w_pair,
+                                    w_std=cfg.w_std, huber_delta=cfg.huber_delta)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
 
-        with torch.no_grad():
-            total_se += float((((pred - y) ** 2) * w).sum())
-            total_w += float(w.sum())
-            preds.append(pred.detach().float().cpu().numpy())
-            targets.append(y.detach().float().cpu().numpy())
+        bs = len(y_norm)
+        n_seen += bs
+        totals["loss"] += float(loss) * bs
+        for k, v in terms.items():
+            totals[k] += v * bs
 
-    preds, targets = np.concatenate(preds), np.concatenate(targets)
-    r, std = pearson(preds, targets)
-    return {"mse": total_se / total_w, "pearson": r, "pred_std": std}
+    return {k: v / max(n_seen, 1) for k, v in totals.items()}
 
 
 @torch.no_grad()
-def evaluate(model, loader, device):
+def predict(model, loader, device):
+    """Forward the whole loader. Returns normalized predictions, logits and row indices."""
     model.eval()
-    total_w = 0.0
-    total_se = 0.0
-    preds, targets, rows = [], [], []
-    for batch, y, w, idx in loader:
+    preds, logits, rows = [], [], []
+    for batch, _, _, _, idx in loader:
         batch = model.trunk.to_device(batch, device)
-        y, w = y.to(device), w.to(device)
-        pred = model(batch)
-        total_se += float((((pred - y) ** 2) * w).sum())
-        total_w += float(w.sum())
-        preds.append(pred.float().cpu().numpy())
-        targets.append(y.float().cpu().numpy())
+        lo, pr = model(batch)
+        preds.append(pr.float().cpu().numpy())
+        logits.append(lo.float().cpu().numpy())
         rows.append(idx.numpy())
+    return (np.concatenate(preds), np.concatenate(logits), np.concatenate(rows))
 
-    preds, targets, rows = (np.concatenate(x) for x in (preds, targets, rows))
-    r, std = pearson(preds, targets)
-    return {"mse": total_se / total_w, "pearson": r, "pred_std": std}, preds, rows
+
+def loss_terms_from_arrays(pred_norm, logits, y_norm, y_bin, w, cfg, device="cpu"):
+    """The four loss terms recomputed on a whole split, for reporting.
+
+    `cls`, `huber` and `std` are exact and O(N). `pair` is O(N^2) so it is estimated on a
+    fixed seeded subsample of `PAIR_EVAL_K` points -- fixed and seeded so the estimate is
+    comparable across epochs and runs rather than adding its own noise to the curve.
+    """
+    t = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.float32, device=device)  # noqa: E731
+    pred_t, logit_t, yn_t, yb_t, w_t = t(pred_norm), t(logits), t(y_norm), t(y_bin), t(w)
+
+    rng = np.random.default_rng(PAIR_EVAL_SEED)
+    k = min(PAIR_EVAL_K, len(pred_norm))
+    sub = rng.choice(len(pred_norm), k, replace=False)
+
+    with torch.no_grad():
+        cls = float(weighted_bce_loss(logit_t, yb_t, w_t))
+        huber = float(weighted_huber_loss(pred_t, yn_t, w_t, delta=cfg.huber_delta))
+        pair = float(pairwise_distance_loss(pred_t[sub], yn_t[sub]))
+        std = float(std_match_loss(pred_t, yn_t, w_t))
+
+    return {"cls": cls, "huber": huber, "pair": pair, "std": std,
+            "loss": cfg.w_cls * cls + huber + cfg.w_pair * pair + cfg.w_std * std,
+            "pair_eval_k": k}
+
+
+def score_split(pred_norm, logits, rows, y_raw, w_loss, y_norm, cfg):
+    """Every reported number for one split, on the raw pProp scale.
+
+    Predictions are denormalized first -- see the module docstring. The weighting flavours
+    are rebuilt here from *this split's* rows, so `balanced` reflects this fold's own group
+    sizes rather than the dataset's.
+    """
+    pred_raw = denormalize_pprop(pred_norm, cfg._norm_stats)
+
+    flavours = {f: build_sample_weights(f, y_raw) for f in REQUIRED_FLAVOURS}
+    m = flavoured_metrics(y_raw, pred_raw, logits, flavours, edge=PPROP_EDGE)
+    m.update(compute_objective(m))
+    m.update(group_split_metrics(y_raw, pred_raw, group_edge=PPROP_EDGE))
+    m.update(enrichment_factor(y_raw, logits))
+    m.update(loss_terms_from_arrays(pred_norm, logits,
+                                    y_norm[rows], binary_labels(y_raw, PPROP_EDGE),
+                                    w_loss[rows], cfg))
+    # Logged beside Pearson so a nan correlation is diagnosable rather than mysterious: a
+    # model predicting a constant has zero variance and Pearson is undefined, which is a
+    # real early-epoch possibility when 36% of rows sit below pProp 1.0.
+    m["pred_std"] = float(np.std(pred_raw))
+    m["mse"] = float(np.mean((pred_raw - y_raw) ** 2))
+    return m, pred_raw
+
+
+# -- provenance ---------------------------------------------------------------------
+
+def hardware():
+    """What the run actually executed on -- the cost model in reports/ is built from this."""
+    import os
+    info = {"cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+            "slurm_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
+            "cpu_count": os.cpu_count()}
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        info.update(gpu_name=props.name,
+                    gpu_total_gb=round(props.total_memory / 1e9, 1),
+                    gpu_capability=f"sm_{props.major}{props.minor}")
+    return info
 
 
 def git_sha():
@@ -246,12 +411,23 @@ def git_sha():
         return None
 
 
+def log_prefixed(prefix, metrics):
+    """`{"val/ap_uniform": ...}` from `{"ap_uniform": ...}`, dropping non-scalar entries."""
+    return {f"{prefix}/{k}": v for k, v in metrics.items()
+            if isinstance(v, (int, float, np.floating, np.integer))}
+
+
 def main(argv=None):
     args = parse_args(argv)
     if args.freeze_epochs > args.epochs:
         raise SystemExit(f"--freeze-epochs {args.freeze_epochs} > --epochs {args.epochs}")
+    frozen_baseline = args.freeze_epochs == args.epochs
 
-    out = args.out or Path("outputs") / f"fold{args.fold}_seed{args.seed}"
+    import os
+    sweep_id = args.sweep_id or os.environ.get("WANDB_SWEEP_ID")
+    out = (args.out if args.out is not None
+           else run_dir(args.outputs_root, sweep_id, f"fold{args.fold}_seed{args.seed}"))
+    out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
 
     # Seeds govern head init, dropout and shuffling. The partition is loaded frozen from
@@ -261,33 +437,56 @@ def main(argv=None):
     generator = torch.Generator().manual_seed(args.seed)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"device: {device}")
+    print(f"device: {device} | objective {OBJECTIVE_VERSION}")
 
     cache = load_features(args.features)
     y = pd.read_csv(args.csv, usecols=["pprop"])["pprop"].to_numpy(dtype=np.float64)
     if len(cache) != len(y):
         raise SystemExit(f"feature cache has {len(cache)} graphs but the CSV has {len(y)} "
                          "rows; they are aligned by row position only")
-    w = build_weights(args.weights, args.csv, len(y))
+
     train_idx, val_idx = load_fold(args.splits, fold=args.fold)
     if args.subset:
         rng = np.random.default_rng(args.seed)
         train_idx = rng.choice(train_idx, min(args.subset, len(train_idx)), replace=False)
         val_idx = rng.choice(val_idx, min(args.subset, len(val_idx)), replace=False)
-    print(f"fold {args.fold}: {len(train_idx):,} train / {len(val_idx):,} val")
+    print(f"fold {args.fold}: {len(train_idx):,} train / {len(val_idx):,} val | "
+          f"{int(binary_labels(y[train_idx]).sum()):,} / "
+          f"{int(binary_labels(y[val_idx]).sum()):,} positive at pProp >= {PPROP_EDGE}")
+
+    # Normalization statistics come from the TRAINING fold only, so the validation fold
+    # never leaks into the transform.
+    norm_stats = compute_norm_stats(y[train_idx], args.pprop_norm)
+    args._norm_stats = norm_stats
+    y_norm = normalize_pprop(y, norm_stats)
+    y_bin = binary_labels(y, PPROP_EDGE).astype(np.float64)
+    w = fold_weights(args.weights, y, train_idx, val_idx)
+    ess = effective_sample_size(w[train_idx])
+    print(f"weights={args.weights}: train ESS {ess:,.0f} "
+          f"({100 * ess / len(train_idx):.2f}% of the fold) | norm={args.pprop_norm}")
 
     common = dict(batch_size=args.batch_size, collate_fn=collate_batch,
                   num_workers=args.num_workers,
                   persistent_workers=args.num_workers > 0)
     # shuffle=True is load-bearing, not hygiene: ampc_subset_331k.csv is sorted by the
     # target, so an unshuffled loader trains on target-sorted batches (CLAUDE.md footguns).
-    train_loader = DataLoader(RowDataset(cache, y, w, train_idx), shuffle=True,
+    train_loader = DataLoader(RowDataset(cache, y_norm, y_bin, w, train_idx), shuffle=True,
                               generator=generator, **common)
-    val_loader = DataLoader(RowDataset(cache, y, w, val_idx), shuffle=False, **common)
+    # A second, unshuffled view of the training fold, used once at the final epoch. The
+    # in-loop training numbers are computed from predictions made *while* the weights were
+    # changing, so they are not comparable to validation; the train/val gap is the headline
+    # result and it has to be measured with both sides scored the same way.
+    train_eval_loader = DataLoader(RowDataset(cache, y_norm, y_bin, w, train_idx),
+                                   shuffle=False, **common)
+    val_loader = DataLoader(RowDataset(cache, y_norm, y_bin, w, val_idx),
+                            shuffle=False, **common)
 
     model = MiniMolRegressor(
         MiniMolTrunk(),
-        MLPHead(hidden_dims=tuple(args.hidden_dims), dropout=args.dropout),
+        DualHead(hidden_dim=args.hidden_dim, n_layers=args.n_layers,
+                 cls_hidden_dim=args.cls_hidden_dim, cls_n_layers=args.cls_n_layers,
+                 reg_hidden_dim=args.reg_hidden_dim, reg_n_layers=args.reg_n_layers,
+                 dropout=args.dropout, norm=args.head_norm),
     ).to(device)
     counts = model.n_parameters()
     print(f"trunk {counts['trunk']:,} + head {counts['head']:,} = {counts['total']:,} params")
@@ -307,37 +506,72 @@ def main(argv=None):
     if not args.no_wandb:
         import wandb
         run = wandb.init(project=args.wandb_project, entity=args.wandb_entity,
-                         dir=str(out), config={**vars(args), "device": device,
-                                               "params": counts, "git_sha": git_sha()},
+                         group=args.wandb_group, tags=args.wandb_tags,
+                         dir=str(out), config={**{k: v for k, v in vars(args).items()
+                                                  if not k.startswith("_")},
+                                               "device": device, "params": counts,
+                                               "git_sha": git_sha(),
+                                               "objective_version": OBJECTIVE_VERSION,
+                                               "pprop_edge": PPROP_EDGE,
+                                               "train_ess": ess, **hardware()},
                          settings=wandb.Settings(start_method="thread"))
-        wandb.define_metric("val/pearson", summary="max")
+        wandb.define_metric("val/goal_metric", summary="max")
+        wandb.define_metric("val/ap_uniform", summary="max")
         wandb.define_metric("val/mse", summary="min")
 
     trunk0, head0 = probe_weights(model)
     history, checks = [], {}
     started_all = time.time()
+    val_metrics = {}
 
     for epoch in range(1, args.epochs + 1):
+        trunk_trainable = epoch > args.freeze_epochs
+        lrs = apply_lrs(model, optimizer, epoch, args, trunk_trainable)
         if epoch == args.freeze_epochs + 1:
-            set_trunk_trainable(model, optimizer, trainable=True, trunk_lr=args.trunk_lr)
-            print(f"--- epoch {epoch}: unfreezing trunk (lr {args.trunk_lr}) ---")
+            print(f"--- epoch {epoch}: unfreezing trunk (lr {lrs['trunk']:.2e}) ---")
         phase = "head_only" if epoch <= args.freeze_epochs else "full"
+        final = epoch == args.epochs
+
+        # Train and validation are timed separately: the report attributes cost per phase,
+        # and validation is forward-only so it scales differently from training.
+        if device == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+        started = time.time()
+        tr = train_one_epoch(model, train_loader, optimizer, device, args)
+        train_secs = time.time() - started
 
         started = time.time()
-        tr = train_one_epoch(model, train_loader, optimizer, device)
-        va, val_preds, val_rows = evaluate(model, val_loader, device)
-        secs = time.time() - started
+        val_pred_n, val_logits, val_rows = predict(model, val_loader, device)
+        val_metrics, val_pred_raw = score_split(val_pred_n, val_logits, val_rows,
+                                                y[val_rows], w, y_norm, args)
+        val_secs = time.time() - started
+        peak_gb = (torch.cuda.max_memory_allocated() / 1e9) if device == "cuda" else 0.0
 
-        lrs = {g["name"]: g["lr"] for g in optimizer.param_groups}
-        row = {"epoch": epoch, "phase": phase, "seconds": round(secs, 1),
-               "train/mse": tr["mse"], "train/pearson": tr["pearson"],
-               "val/mse": va["mse"], "val/pearson": va["pearson"],
-               "val/pred_std": va["pred_std"],
-               "lr/trunk": lrs["trunk"], "lr/head": lrs["head"]}
+        row = {"epoch": epoch, "phase": phase, "seconds": round(train_secs + val_secs, 1),
+               "train_seconds": round(train_secs, 2), "val_seconds": round(val_secs, 2),
+               "peak_gpu_gb": round(peak_gb, 2),
+               "lr/trunk": lrs["trunk"], "lr/head": lrs["head"],
+               **{f"train/{k}": v for k, v in tr.items()},
+               **log_prefixed("val", val_metrics)}
+
+        # The train-set eval pass is the final epoch only: it costs ~4x a validation pass
+        # (265k rows against 66k) and only the final-epoch value is comparable to the
+        # selected model. Same throttle as pProp_MLP, for the same reason.
+        if final:
+            started = time.time()
+            tr_pred_n, tr_logits, tr_rows = predict(model, train_eval_loader, device)
+            train_metrics, _ = score_split(tr_pred_n, tr_logits, tr_rows,
+                                           y[tr_rows], w, y_norm, args)
+            row["train_eval_seconds"] = round(time.time() - started, 2)
+            row.update(log_prefixed("train_eval", train_metrics))
+
         history.append(row)
-        print(f"epoch {epoch} [{phase:9s}] {secs:5.1f}s  "
-              f"train mse {tr['mse']:.4f} r {tr['pearson']:.4f}  |  "
-              f"val mse {va['mse']:.4f} r {va['pearson']:.4f}", flush=True)
+        print(f"epoch {epoch} [{phase:9s}] {train_secs:5.1f}s+{val_secs:4.1f}s "
+              f"{peak_gb:5.2f}GB  loss {tr['loss']:.4f}  |  "
+              f"val goal {val_metrics['goal_metric']:.4f} "
+              f"ap {val_metrics['ap_uniform']:.4f} "
+              f"r {val_metrics['pearson_uniform']:.4f} "
+              f"mae {val_metrics['mae_uniform']:.4f}", flush=True)
         if run is not None:
             run.log(row, step=epoch)
 
@@ -354,7 +588,7 @@ def main(argv=None):
                     f"freeze violated: trunk moved by {td:.3e} (expected exactly 0) or the "
                     f"head did not move ({hd:.3e}). The schedule did not do what it claims.")
 
-        if epoch == args.epochs and args.assert_schedule and args.freeze_epochs < args.epochs:
+        if final and args.assert_schedule and not frozen_baseline:
             t2, _ = probe_weights(model)
             td = float((t2 - trunk0).abs().max())
             checks["after_unfreeze"] = {"trunk_max_delta": td}
@@ -364,18 +598,44 @@ def main(argv=None):
                     "trunk did not change after unfreezing. It is still effectively frozen "
                     "-- check that the optimizer holds a 'trunk' group.")
 
-    torch.save(model.state_dict(), out / "final.pt")
-    np.save(out / "val_predictions.npy", val_preds)
+    torch.save({"model_state": model.state_dict(),
+                "config": {k: (str(v) if isinstance(v, Path) else v)
+                           for k, v in vars(args).items() if not k.startswith("_")},
+                "norm_stats": norm_stats,
+                "objective_version": OBJECTIVE_VERSION,
+                "pprop_edge": PPROP_EDGE,
+                "val_goal_metric": val_metrics.get("goal_metric")},
+               out / "final.pt")
+    # The substrate for pooled out-of-fold tail metrics (`src/pool_oof.py`). Predictions are
+    # raw-scale so they need no norm_stats to interpret; the logits ride along because AP is
+    # the classifier's metric and reconstructing it from the regression output would be a
+    # different measurement. Row indices tie both back to CSV rows.
+    np.save(out / "val_predictions.npy", val_pred_raw)
+    np.save(out / "val_logits.npy", val_logits)
     np.save(out / "val_indices.npy", val_rows)
 
     import graphium
+    split_meta = load_meta(args.splits)
     meta = {
         "script": "src/train.py",
         "argv": sys.argv,
-        "config": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+        "config": {k: (str(v) if isinstance(v, Path) else v)
+                   for k, v in vars(args).items() if not k.startswith("_")},
         "device": device,
+        "hardware": hardware(),
         "params": counts,
         "n_train": len(train_idx), "n_val": len(val_idx),
+        "frozen_baseline": frozen_baseline,
+        # The provenance triple. pProp_MLP's runs/ became unreadable because an objective
+        # revision and an in-place split regeneration both went unrecorded, so old
+        # checkpoints scored new data and printed plausible wrong numbers. Filter on all
+        # three before comparing any two runs.
+        "objective_version": OBJECTIVE_VERSION,
+        "split_sha256": split_meta.get("split_sha256"),
+        "input_sha256": split_meta.get("input_sha256"),
+        "pprop_edge": PPROP_EDGE,
+        "norm_stats": norm_stats,
+        "train_ess": ess,
         "history": history,
         "schedule_checks": checks,
         "total_minutes": round((time.time() - started_all) / 60, 2),
@@ -385,11 +645,9 @@ def main(argv=None):
                      "graphium": graphium.__version__},
         "host": platform.node(),
     }
-    (out / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+    (out / "meta.json").write_text(json.dumps(meta, indent=2, default=float) + "\n")
 
-    best = max((h["val/pearson"] for h in history if h["val/pearson"] == h["val/pearson"]),
-               default=float("nan"))
-    print(f"\nbest val pearson {best:.4f} | wrote {out} | "
+    print(f"\nfinal val goal_metric {val_metrics['goal_metric']:.4f} | wrote {out} | "
           f"{meta['total_minutes']:.1f} min")
     if run is not None:
         run.finish()

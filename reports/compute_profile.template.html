@@ -1,0 +1,521 @@
+<title>Computational profile — full-trunk MiniMol fine-tuning</title>
+<style>
+  :root {
+    color-scheme: light;
+    --ground:      #f7f8f9;
+    --surface:     #ffffff;
+    --surface-2:   #eef1f4;
+    --ink:         #0e1116;
+    --ink-2:       #414b57;
+    --ink-3:       #6b7683;
+    --rule:        #d9dee4;
+    --accent:      #1f63b4;
+    --measured:    #12885f;
+    --projected:   #c4531f;
+    --shadow:      0 1px 2px rgba(14,17,22,.05), 0 8px 24px rgba(14,17,22,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --ground:    #12151a;
+      --surface:   #191d24;
+      --surface-2: #222831;
+      --ink:       #eef1f4;
+      --ink-2:     #b3bdc9;
+      --ink-3:     #8794a2;
+      --rule:      #2c333d;
+      --accent:    #62a5ef;
+      --measured:  #35c48d;
+      --projected: #f0854f;
+      --shadow:    0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.25);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --ground:    #12151a;
+    --surface:   #191d24;
+    --surface-2: #222831;
+    --ink:       #eef1f4;
+    --ink-2:     #b3bdc9;
+    --ink-3:     #8794a2;
+    --rule:      #2c333d;
+    --accent:    #62a5ef;
+    --measured:  #35c48d;
+    --projected: #f0854f;
+    --shadow:    0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.25);
+  }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font: 400 17px/1.65 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    margin: 0;
+    padding: 0 20px 96px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  .prose { max-width: 68ch; }
+
+  h1, h2, h3 {
+    font-family: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+    text-wrap: balance; color: var(--ink); margin: 0;
+  }
+  h1 { font-size: clamp(2rem, 1.4rem + 2.4vw, 3rem); line-height: 1.12; letter-spacing: -.012em; font-weight: 600; }
+  h2 { font-size: 1.6rem; line-height: 1.2; font-weight: 600; }
+  h3 { font-size: 1.14rem; line-height: 1.3; font-weight: 600; }
+  p, li { color: var(--ink-2); }
+  strong { color: var(--ink); font-weight: 650; }
+  a { color: var(--accent); }
+  code, .num {
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+  code { font-size: .88em; background: var(--surface-2); padding: .12em .38em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 8px;
+        padding: 16px 18px; overflow-x: auto; font-size: .82rem; line-height: 1.6; color: var(--ink-2); }
+  pre code { background: none; padding: 0; }
+
+  header.masthead { padding: 72px 0 36px; border-bottom: 1px solid var(--rule); }
+  .eyebrow {
+    font-size: .72rem; letter-spacing: .13em; text-transform: uppercase;
+    color: var(--ink-3); font-weight: 600; margin: 0 0 18px;
+  }
+  .lede { font-size: 1.18rem; line-height: 1.55; color: var(--ink-2); margin: 20px 0 0; max-width: 60ch; }
+
+  .provenance { display: flex; flex-wrap: wrap; gap: 10px; margin: 28px 0 0; }
+  .tag {
+    font-size: .76rem; letter-spacing: .02em; padding: 6px 11px; border-radius: 999px;
+    border: 1px solid var(--rule); background: var(--surface); color: var(--ink-2);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .tag.measured  { border-color: var(--measured); color: var(--measured); }
+  .tag.projected { border-color: var(--projected); color: var(--projected); font-weight: 600; }
+
+  section { padding: 52px 0 0; }
+  section > h2 { margin-bottom: 6px; }
+  .kicker { font-size: .74rem; letter-spacing: .12em; text-transform: uppercase;
+            color: var(--ink-3); font-weight: 600; margin: 0 0 8px; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; margin: 28px 0 0; }
+  .tile { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px;
+          padding: 18px 18px 16px; box-shadow: var(--shadow); border-top: 3px solid var(--measured); }
+  .tile.proj { border-top-color: var(--projected); }
+  .tile .v { font: 600 1.75rem/1.1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+             font-variant-numeric: tabular-nums; color: var(--ink); letter-spacing: -.02em; }
+  .tile .k { font-size: .82rem; color: var(--ink-3); margin-top: 7px; line-height: 1.4; }
+
+  .scroll { overflow-x: auto; margin: 24px 0 0; border: 1px solid var(--rule);
+            border-radius: 10px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: .88rem; }
+  th, td { padding: 11px 15px; text-align: left; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+  th { font-size: .72rem; letter-spacing: .07em; text-transform: uppercase; color: var(--ink-3);
+       font-weight: 600; background: var(--surface-2); }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.n { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+         font-variant-numeric: tabular-nums; color: var(--ink); }
+
+  figure { margin: 30px 0 0; }
+  figure img { width: 100%; height: auto; display: block; border: 1px solid var(--rule); border-radius: 10px; background: #fcfcfb; }
+  figcaption { font-size: .82rem; color: var(--ink-3); margin-top: 10px; max-width: 68ch; }
+
+  .callout {
+    margin: 28px 0 0; padding: 18px 20px; border-radius: 10px;
+    background: var(--surface); border: 1px solid var(--rule); border-left: 3px solid var(--accent);
+  }
+  .callout.measured  { border-left-color: var(--measured); }
+  .callout.projected { border-left-color: var(--projected); }
+  .callout p:first-child { margin-top: 0; }
+  .callout p:last-child { margin-bottom: 0; }
+  .callout .lbl { font-size: .72rem; letter-spacing: .12em; text-transform: uppercase;
+                  font-weight: 700; color: var(--ink-3); display: block; margin-bottom: 7px; }
+  .callout.measured .lbl  { color: var(--measured); }
+  .callout.projected .lbl { color: var(--projected); }
+
+  ul.tight { padding-left: 20px; }
+  ul.tight li { margin: 9px 0; }
+  hr { border: 0; border-top: 1px solid var(--rule); margin: 56px 0 0; }
+  footer { margin-top: 40px; font-size: .84rem; color: var(--ink-3); }
+</style>
+
+<div class="wrap">
+
+<header class="masthead">
+  <p class="eyebrow">Compute profile · finetune_minimol</p>
+  <h1>What full-trunk MiniMol fine-tuning actually costs</h1>
+  <p class="lede">And what TamIA's H100/H200s would buy over three RTX A6000s — which turns
+  out not to be the argument the spec sheets suggest.</p>
+  <div class="provenance">
+    <span class="tag measured">measured 2026-08-11 · rabelais-1 · 3× RTX A6000</span>
+    <span class="tag projected">TamIA speeds are PROJECTED — nothing has been run there</span>
+    <span class="tag">331,480 molecules · 5-fold cluster CV</span>
+  </div>
+</header>
+
+<section>
+  <p class="kicker">The short version</p>
+  <h2>Buying faster silicon is the second thing to do</h2>
+  <div class="tiles">
+    <div class="tile"><div class="v">13 min</div><div class="k">the 10-run grid, wall clock<br>(0.54 GPU-hours)</div></div>
+    <div class="tile"><div class="v">28%</div><div class="k">of every step is fixed overhead at batch 256</div></div>
+    <div class="tile"><div class="v">3.6×</div><div class="k">ceiling on <em>any</em> GPU upgrade at batch 256</div></div>
+    <div class="tile proj"><div class="v">4–8×</div><div class="k">realistic TamIA gain on a Bayesian sweep — bounded by the sweep, not the cluster</div></div>
+  </div>
+
+  <div class="prose">
+    <p style="margin-top:30px">At the batch size we train with, roughly a third of every step is
+    fixed overhead — kernel launch, sync, Python dispatch — that faster silicon does not touch.
+    Raising the batch size costs nothing in hardware and lifts the ceiling on any upgrade from
+    <strong>3.6× to 43×</strong>. That is worth more than the GPU generation gap at this batch size.</p>
+
+    <p><strong>TamIA is worth moving to, but for a smaller and more specific reason than it
+    first appears.</strong> The cluster has ~260 GPUs against your three — yet a Bayesian sweep
+    cannot use more than ~8–16 trials in parallel before it stops being Bayesian, so the
+    realistic gain is <strong>4–8×</strong>, not 80×. And the thing actually preventing the move
+    is not compute: <strong><code>wandb agent</code> requires internet, and TamIA's compute nodes
+    have none.</strong></p>
+  </div>
+
+  <div class="callout">
+    <span class="lbl">Why 3.6× and 2.6× are consistent</span>
+    <p>The 3.6× ceiling assumes an <em>infinitely</em> fast GPU, which only removes the 72% of
+    the step that is variable. The H200's projected 6.25× on that portion already captures most
+    of the available headroom — which is precisely why more silicon is the wrong lever here.</p>
+  </div>
+
+  <h3 style="margin-top:40px">Recommended order</h3>
+  <div class="prose">
+    <ul class="tight">
+      <li><strong>Replace the sweep mechanism</strong> — Optuna with filesystem storage. This is
+      the gating item; nothing else matters until it is solved.</li>
+      <li><strong>Move to batch ~1024 and 16 dataloader workers</strong>, and re-tune the learning
+      rate. Worth more than the hardware change (3.4× vs 2.3× per-GPU gain on H100).</li>
+      <li><strong>Keep <code>rabelais</code> for development</strong> — zero queue wait and a
+      13-minute grid beat any shared cluster for iteration.</li>
+      <li><strong>Request 1–2 nodes on <code>gpubase_bynode_b2</code> (12 h)</strong> for the
+      sweep; bundle many trials per job, four concurrent — one per GPU, never split.</li>
+    </ul>
+  </div>
+</section>
+
+<hr>
+
+<section>
+  <p class="kicker">Section 1</p>
+  <h2>What one run costs</h2>
+  <div class="prose"><p>Ten runs — 5 folds × 2 seeds — of 4 epochs each (2 frozen, 2 full) at
+  batch 256. Steady-state medians, with the first epoch of each phase excluded.</p></div>
+
+  <div class="scroll"><table>
+    <thead><tr><th>Phase</th><th>Epoch</th><th>Train</th><th>Val</th><th>Warm-up</th><th>Peak GPU</th><th>Throughput</th></tr></thead>
+    <tbody>
+      <tr><td>head only (trunk frozen)</td><td class="n">32.0 s</td><td class="n">26.1 s</td><td class="n">6.1 s</td><td class="n">+3.3%</td><td class="n">0.16 GB</td><td class="n">10,178 mol/s</td></tr>
+      <tr><td>trunk + head (full)</td><td class="n">65.7 s</td><td class="n">59.4 s</td><td class="n">6.2 s</td><td class="n">−0.7%</td><td class="n">1.52 GB</td><td class="n">4,462 mol/s</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="prose">
+    <ul class="tight">
+      <li><strong>Freezing the trunk is 2.05× faster and uses 9.5× less memory.</strong> Not
+      merely because the backward pass is skipped — with no trunk parameter requiring grad,
+      autograd builds no graph through the trunk at all, so the activations are never stored.</li>
+      <li><strong>Warm-up is negligible</strong> (+3.3% on the first frozen epoch, nothing
+      measurable on the first full one) — worth measuring rather than assuming, since with two
+      epochs per phase it would otherwise be half the sample.</li>
+      <li>Run-to-run spread across the grid was <span class="num">57.6–60.4 s</span> (4.9%).</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <p class="kicker">Section 2</p>
+  <h2>What actually limits it</h2>
+  <div class="prose">
+    <p>Step time is almost perfectly linear in batch size — <strong>R² = 0.999</strong> for both
+    phases. The intercept is per-step cost that does not shrink with batch size, and faster
+    silicon does not remove it.</p>
+  </div>
+
+  <pre><code>full    step_ms = 15.8 + 0.1618 × batch
+frozen  step_ms =  7.2 + 0.0655 × batch</code></pre>
+
+  <figure>
+    <img src="{{FIG_FIXED}}" alt="Horizontal stacked bars showing fixed overhead versus GPU work at batch 256, 1024 and 4096. Fixed overhead is 28% of the step at batch 256 and 2% at batch 4096.">
+    <figcaption>At batch 256 the fixed 15.8 ms is 28% of the step, capping any hardware upgrade at 3.6×. At batch 4096 it is 2%.</figcaption>
+  </figure>
+
+  <figure>
+    <img src="{{FIG_BATCH}}" alt="Line chart of throughput versus batch size for frozen and full phases; both climb steeply to batch 512 then flatten, with the grid's batch 256 marked well below saturation.">
+    <figcaption>Throughput was still climbing at the batch size the grid ran. The full phase saturates near 6,000 mol/s; the frozen phase near 14,800.</figcaption>
+  </figure>
+
+  <div class="callout measured">
+    <span class="lbl">Three measurements agree this is not compute-bound</span>
+    <p><strong>bf16 made it 8% slower</strong>, not faster (52.7 → 57.1 ms) — autocast overhead
+    exceeds any tensor-core gain when kernels are this small. TF32 did help (+16%), so a modest
+    matmul component exists. <strong>Memory is nowhere near a limit</strong>: batch 4096 peaks at
+    21.8 GB of 48, and the grid used 1.5 GB. <strong>4,487 kernel launches per step</strong> for
+    256 molecules — the signature of many tiny operations, which is what a GNN over ~25-node
+    graphs produces.</p>
+  </div>
+
+  <div class="callout measured">
+    <span class="lbl">The cross-check that validates the model</span>
+    <p>The GPU-only step time predicts the grid's observed end-to-end epoch to <strong>+11%</strong>
+    (53.6 s predicted vs 59.4 s observed). That gap is the CPU pipeline not perfectly overlapping
+    the GPU — the expected direction and magnitude. The benchmark and the real runs are measuring
+    the same thing.</p>
+  </div>
+
+  <h3 style="margin-top:36px">Achieved ceilings, measured on this card</h3>
+  <div class="prose"><p>So the projection can be achieved-to-achieved, rather than against vendor
+  peaks no real kernel reaches.</p></div>
+  <div class="scroll"><table>
+    <thead><tr><th>Ceiling</th><th>Measured</th><th>Vendor peak</th><th>Efficiency</th></tr></thead>
+    <tbody>
+      <tr><td>GEMM fp32</td><td class="n">22.7 TFLOP/s</td><td class="n">38.7</td><td class="n">59%</td></tr>
+      <tr><td>GEMM TF32</td><td class="n">58.0 TFLOP/s</td><td class="n">—</td><td class="n">—</td></tr>
+      <tr><td>GEMM bf16</td><td class="n">105.9 TFLOP/s</td><td class="n">—</td><td class="n">—</td></tr>
+      <tr><td>Memory bandwidth</td><td class="n">687 GB/s</td><td class="n">768</td><td class="n">89%</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 style="margin-top:36px">The CPU pipeline is not the bottleneck — yet</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>Dataloader workers</th><th>Throughput (CPU only)</th><th>ms / batch</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td class="n">6,074 mol/s</td><td class="n">42.1</td></tr>
+      <tr><td>4 — current</td><td class="n">28,579 mol/s</td><td class="n">9.0</td></tr>
+      <tr><td>8</td><td class="n">57,694 mol/s</td><td class="n">4.4</td></tr>
+      <tr><td>16</td><td class="n">149,501 mol/s</td><td class="n">1.7</td></tr>
+      <tr><td>32</td><td class="n">190,912 mol/s</td><td class="n">1.3</td></tr>
+    </tbody>
+  </table></div>
+  <div class="prose"><p style="margin-top:18px">At 4 workers the pipeline delivers 28,579 mol/s
+  against a GPU consuming 4,999 — invisible today. A 5× faster GPU would consume ~25,000 mol/s and
+  the CPU would become the limit. <strong>On faster hardware, raise workers to 16.</strong> This
+  box has 124 cores; the headroom is already there.</p></div>
+</section>
+
+<section>
+  <p class="kicker">Section 3</p>
+  <h2>Sustained load: capped, but the trend is unmeasured</h2>
+  <figure>
+    <img src="{{FIG_CLOCKS}}" alt="SM clock over 13 minutes for three GPUs, oscillating between 1500 and 1900 MHz against a 2100 MHz max boost line, with a sawtooth pattern.">
+    <figcaption>Clocks under three-GPU load, against the 2100 MHz max boost. The sawtooth is the four job waves, not thermal decay.</figcaption>
+  </figure>
+
+  <div class="prose">
+    <p>Under load the cards ran at <strong>1,500–1,800 MHz against a 2,100 MHz max boost</strong>
+    — 14–29% down — at <strong>84–88 °C</strong> and <strong>260–287 W of a 300 W limit</strong>.
+    The <code>clocks_event_reasons</code> field asserted <code>0x4</code> (SW power cap) and
+    <code>0x20</code> (SW thermal slowdown), often together. The throttling is real and identified,
+    not inferred.</p>
+  </div>
+
+  <div class="callout projected">
+    <span class="lbl">What this does not show</span>
+    <p>A trend. The sawtooth is the four job waves — the recoveries at ~3.5 and ~7 minutes are the
+    idle gaps between them — so a linear slope fitted over this 13-minute window is confounded by
+    the scheduling pattern, not evidence of thermal decay. A naive fit gives −6 to −18 MHz/min;
+    <strong>that number should not be used.</strong> Settling it needs one sustained run of an hour
+    or more. It is deliberately excluded from the projection.</p>
+  </div>
+</section>
+
+<section>
+  <p class="kicker">Section 4</p>
+  <h2>Levers on current hardware, in order of value</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Lever</th><th>Effect</th><th>Cost</th></tr></thead>
+    <tbody>
+      <tr><td><strong>batch 256 → 1024</strong></td><td>+26% throughput; lifts the upgrade ceiling 3.6× → 11.5×</td><td>changes optimisation — see below</td></tr>
+      <tr><td>TF32 on</td><td class="n">+16%</td><td>negligible numerical risk here</td></tr>
+      <tr><td>workers 4 → 16</td><td>nothing today; required if the GPU gets faster</td><td>free, 124 cores available</td></tr>
+      <tr><td>bf16 autocast</td><td class="n">−8% — do not use on Ampere</td><td>—</td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout">
+    <span class="lbl">Caveat on batch size, and it is not small</span>
+    <p>Larger batches are a free <em>compute</em> win and not a free <em>training</em> change: at
+    batch 1024 an epoch has a quarter as many optimiser steps, which generally needs the learning
+    rate re-tuned. Treat it as a change requiring a re-run of the schedule comparison, not a
+    drop-in.</p>
+  </div>
+</section>
+
+<section>
+  <p class="kicker">Section 4.5</p>
+  <h2>Should you split a GPU across concurrent runs?</h2>
+  <div class="prose"><p><code>rabelais</code> permits splitting one GPU across concurrent jobs
+  (<code>--gres=mps:N</code>) at the cost of the other two; TamIA's whole-node rule raises the same
+  question. Measured directly — N processes pinned to one GPU with a synchronised start, timing
+  the real training step on a device-resident batch.</p></div>
+
+  <figure>
+    <img src="{{FIG_CONC}}" alt="Line chart of aggregate throughput against number of concurrent processes on one GPU, for batch 256 and batch 1024. Both lines drop from one process to two and then stay flat.">
+    <figcaption>Aggregate throughput never rises above a single process, at either batch size.</figcaption>
+  </figure>
+
+  <div class="scroll"><table>
+    <thead><tr><th>Processes on one GPU</th><th>Batch 256</th><th>Batch 1024</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td class="n">5,006 mol/s</td><td class="n">5,829 mol/s</td></tr>
+      <tr><td>2</td><td class="n">4,705 (0.94×)</td><td class="n">5,284 (0.91×)</td></tr>
+      <tr><td>4</td><td class="n">4,704 (0.94×)</td><td class="n">5,280 (0.91×)</td></tr>
+      <tr><td>6</td><td class="n">4,710 (0.94×)</td><td class="n">5,269 (0.90×)</td></tr>
+      <tr><td>8</td><td class="n">—</td><td class="n">5,271 (0.90×)</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="prose">
+    <p style="margin-top:20px">Memory would have permitted <strong>8 concurrent processes</strong>
+    at batch 1024 (47.4 GB of 49 GB). Sizing by memory alone would have suggested 8 splits and
+    lost a third of the throughput — the error this measurement exists to prevent. Since splitting
+    costs the other two GPUs, the ranking is unambiguous: three whole GPUs give
+    <strong>~17,500 mol/s</strong> against ~5,280 for any split configuration.</p>
+  </div>
+
+  <div class="callout projected">
+    <span class="lbl">A prediction this refuted</span>
+    <p>Before measuring, the expectation was that batch 256 <em>would</em> gain from splitting —
+    28% of its step is fixed overhead, so concurrent processes should fill the idle gaps. It did
+    not. The reasoning failed because <strong>with no MPS daemon, processes time-slice</strong>:
+    one CUDA context runs at a time, so idle gaps cannot be filled however much idle exists. This
+    measurement therefore <strong>cannot distinguish “the GPU is saturated” from “time-slicing
+    prevents overlap.”</strong> Under a real MPS daemon the answer may differ — untested.</p>
+  </div>
+</section>
+
+<section>
+  <p class="kicker">Section 5</p>
+  <h2>What TamIA would buy</h2>
+  <div class="prose">
+    <p>The projection scales each part of the step by the ratio appropriate to it. The fixed
+    15.8 ms/step scales <strong>×1</strong> — launch and dispatch overhead is host-side. The
+    variable 0.1618 ms/molecule scales by a ratio bounded on both sides:</p>
+    <ul class="tight">
+      <li><strong>Conservative, 1.73×</strong> — if the variable part is compute-bound, scaling
+      with fp32 throughput.</li>
+      <li><strong>Optimistic, 4.36× (H100) / 6.25× (H200)</strong> — if bandwidth-bound, scaling
+      the measured 687 GB/s against 3.35 / 4.8 TB/s at the same 89% efficiency.</li>
+    </ul>
+    <p>The evidence points nearer the bandwidth end — bf16 slower, thousands of tiny kernels — but
+    TF32's +16% shows a real compute component, so the honest answer is a range, not a number.</p>
+  </div>
+
+  <figure>
+    <img src="{{FIG_PROJ}}" alt="Grouped bar chart of projected throughput at batch 256, 1024 and 4096 for A6000 measured, a conservative compute-bound case, H100 and H200.">
+    <figcaption>Both bounds are shown. A bandwidth-only projection would overstate the gain by up to 3×.</figcaption>
+  </figure>
+
+  <div class="scroll"><table>
+    <thead><tr><th>Batch</th><th>A6000 (measured)</th><th>Conservative</th><th>H100</th><th>H200</th></tr></thead>
+    <tbody>
+      <tr><td class="n">256</td><td class="n">4,474 mol/s</td><td class="n">6,441 (1.4×)</td><td class="n">10,119 (2.3×)</td><td class="n">11,415 (2.6×)</td></tr>
+      <tr><td class="n">1024</td><td class="n">5,642</td><td class="n">9,178 (1.6×)</td><td class="n">19,033 (3.4×)</td><td class="n">24,203 (4.3×)</td></tr>
+      <tr><td class="n">4096</td><td class="n">6,037</td><td class="n">10,269 (1.7×)</td><td class="n">24,410 (4.0×)</td><td class="n">33,619 (5.6×)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 style="margin-top:40px">Two arguments the measurements do not support</h3>
+  <div class="callout projected">
+    <span class="lbl">Rejected: “the H200's 141 GB unlocks bigger batches”</span>
+    <p>It does not. The workload peaks at <strong>1.5 GB</strong> at the batch we train with and
+    <strong>21.8 GB</strong> at batch 4096 — on a 48 GB card that is already not full. Throughput
+    saturates long before memory does. The H200's headline spec is its least relevant one here.</p>
+  </div>
+  <div class="callout projected">
+    <span class="lbl">Conditional: “NVLink will speed this up”</span>
+    <p>Independent single-GPU runs exchange nothing — no gradient all-reduce, no model sharding —
+    so NVLink is irrelevant to them. But TamIA requires a job to use <strong>all 4 GPUs on its
+    node</strong>, forcing a choice: pack four independent runs one-per-GPU (NVLink stays
+    irrelevant, and the concurrency measurements say this is right), or data-parallel a single run
+    across four (NVLink then matters). Pick the former.</p>
+  </div>
+
+  <h3 style="margin-top:40px">Device count — bounded by the sweep, not the cluster</h3>
+
+  <div class="callout projected">
+    <span class="lbl">Correction, 2026-08-11</span>
+    <p>An earlier version of this report claimed TamIA offered “12 GPUs, one wave”. That was
+    wrong — it was arithmetic on a remembered hardware description (8× H200 + 4× H100), which
+    names node types, not available capacity. Real <code>sinfo</code> output from
+    <code>tamia2</code> replaces it below.</p>
+  </div>
+
+  <div class="scroll"><table>
+    <thead><tr><th>Verified from <code>sinfo</code></th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td><code>gpubase_bynode_b1</code></td><td class="n">65 GPU nodes (44 mix · 15 alloc · 4 down/drain)</td></tr>
+      <tr><td>GPUs at 4 per node</td><td class="n">~260 total, ~244 not down — ~80× rabelais</td></tr>
+      <tr><td>Allocation</td><td class="n">whole nodes; all 4 GPUs must be used</td></tr>
+      <tr><td>Time limits</td><td class="n">b1 3 h · b2 12 h · b3 24 h · interac 6 h</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="prose">
+    <p style="margin-top:22px">So the cluster is far larger than claimed — and the binding
+    constraint is not the hardware. <strong>Bayesian optimisation is sequential by
+    construction</strong>: its advantage over random search is choosing each trial conditioned on
+    completed ones. Run <em>k</em> concurrently and all <em>k</em> come from the same stale
+    posterior. Past roughly 8–16 parallel trials it degenerates toward random search with extra
+    machinery. The realistic allocation is <strong>1–2 nodes</strong>.</p>
+  </div>
+
+  <div class="scroll"><table>
+    <thead><tr><th>250-trial sweep, 20 epochs, batch 1024</th><th>Wall clock</th></tr></thead>
+    <tbody>
+      <tr><td>rabelais, 3× A6000</td><td class="n">~18 h</td></tr>
+      <tr><td>TamIA, 1 node (4 GPUs)</td><td class="n">~4.5 h + queue</td></tr>
+      <tr><td>TamIA, 2 nodes (8 GPUs)</td><td class="n">~2.3 h + queue</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="callout projected">
+    <span class="lbl">The actual blocker is not compute</span>
+    <p><strong>A wandb sweep cannot run on TamIA as currently designed.</strong>
+    <code>python -m wandb agent</code> must reach the wandb server to fetch each next
+    configuration, and TamIA's compute nodes have no internet. This gates the sweep regardless of
+    hardware. The fix is an optimiser whose controller lives on the shared filesystem — Optuna
+    with SQLite/PostgreSQL storage gives TPE and runs fully offline, with
+    <code>WANDB_MODE=offline</code> and a <code>wandb sync</code> from a login node afterwards.</p>
+  </div>
+
+  <div class="prose">
+    <p style="margin-top:22px">A real <strong>4–8×</strong>, from parallelism plus a ~3.4×
+    per-GPU gain at batch 1024 — not the 80× the device count suggests. Queue wait is unmeasured
+    and additive. Two things remain unknown and bear directly on these numbers: <strong>your
+    allocation share</strong> (<code>sinfo</code> shows the whole partition) and
+    <strong>queue wait</strong>.</p>
+  </div>
+</section>
+
+<section>
+  <p class="kicker">Section 6</p>
+  <h2>Open questions</h2>
+  <div class="prose">
+    <ul class="tight">
+      <li><strong>Sustained-load throttling.</strong> Confirmed present, but its trajectory is
+      unmeasured — 13 minutes of sawtooth load cannot separate decay from scheduling. Needs one
+      sustained run of ≥1 hour. Excluded from the projection.</li>
+      <li><strong>Where in the 1.73×–6.25× range the variable part sits.</strong> Settling it needs
+      a memory-throughput profile of the actual GNN kernels (Nsight Compute), not just the
+      microbenchmark bounds used here.</li>
+      <li><strong>Whether TamIA behaves as projected.</strong> <code>src/benchmark.py</code> is
+      self-contained and runs there unchanged; one execution replaces this whole section with
+      measurements.</li>
+    </ul>
+  </div>
+</section>
+
+<hr>
+<footer class="prose">
+  <p>Every figure traces to <code>reports/benchmark.json</code>, <code>grid_summary.json</code>,
+  <code>grid_timings.csv</code> or <code>gpu_telemetry.csv</code> in the
+  <code>finetune_minimol</code> repository. <code>src/benchmark.py</code> refuses to start if
+  another process is resident on the GPU — every timing would otherwise measure contention — and
+  keeps GPU-only, CPU-only and end-to-end timings strictly separate, because conflating them is how
+  a compute report ends up recommending the wrong hardware.</p>
+</footer>
+
+</div>

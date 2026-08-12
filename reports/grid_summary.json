@@ -1,0 +1,44 @@
+{
+  "grid": {
+    "n_runs": 10,
+    "gpus": [
+      "NVIDIA RTX A6000"
+    ],
+    "epochs_per_run": 4,
+    "run_minutes_median": 3.2608333333333333,
+    "run_minutes_min": 3.1933333333333334,
+    "run_minutes_max": 3.32,
+    "total_gpu_hours": 0.5434166666666668,
+    "n_train": 265184,
+    "n_val": 66296,
+    "batch_size": 256,
+    "num_workers": 4
+  },
+  "phases": {
+    "full": {
+      "n_steady_epochs": 10,
+      "n_warmup_epochs": 10,
+      "steady_train_s_median": 59.435,
+      "steady_train_s_std": 1.1185531328958462,
+      "steady_val_s_median": 6.235,
+      "steady_epoch_s_median": 65.7,
+      "warmup_epoch_s_median": 65.25,
+      "peak_gpu_gb_max": 1.52,
+      "warmup_overhead_pct": -0.7,
+      "steady_train_mol_per_s": 4461.748128207285
+    },
+    "head_only": {
+      "n_steady_epochs": 10,
+      "n_warmup_epochs": 10,
+      "steady_train_s_median": 26.055,
+      "steady_train_s_std": 0.38505987990325746,
+      "steady_val_s_median": 6.085,
+      "steady_epoch_s_median": 32.05,
+      "warmup_epoch_s_median": 33.1,
+      "peak_gpu_gb_max": 0.16,
+      "warmup_overhead_pct": 3.3,
+      "steady_train_mol_per_s": 10177.8545384763
+    }
+  },
+  "note": "Timings are end-to-end wall clock per epoch, including the CPU data pipeline overlapped with the GPU. They are NOT gpu_only figures -- see src/benchmark.py for those."
+}

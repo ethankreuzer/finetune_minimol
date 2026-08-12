@@ -20,9 +20,8 @@ An 80x faster load matters because the 5-fold x 2-seed grid is 10 processes, eac
 the load once. `collate` -> `separate` was verified to round-trip every key of every graph
 exactly, and to yield bit-identical embeddings.
 
-*Contents* -- graphs only, no target. `score`, `pprop` and `ipw` are read from the CSV at
-training time by row index. Keeping the target out means the choice between them (NOTES §1,
-still open) does not invalidate this cache.
+*Contents* -- graphs only, no target. `pprop` is read from the CSV at training time by row
+index. Keeping the target out means the choice of target does not invalidate this cache.
 
 The cache is written in **exact CSV row order**. That is what lets `splits.py` indices --
 which are positions into that row order -- index the cache directly, with no mapping layer.

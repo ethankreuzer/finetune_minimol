@@ -7,16 +7,23 @@ edited: `MLPHead` takes its shape as a `hidden_dims` sequence, and `build_head` 
 registry so a genuinely different head (attention pooling, gated, ensemble) is a new class
 plus one line, not a rewrite of `src/model.py`.
 
-    from head import MLPHead, build_head
+    from head import MLPHead, DualHead, build_head
 
     head = MLPHead()                                  # 512 -> 1200 -> 32 -> 1
     head = MLPHead(hidden_dims=(256,), dropout=0.1)   # 512 -> 256 -> 1
     head = MLPHead(hidden_dims=())                    # 512 -> 1, i.e. a linear probe
     head = build_head("mlp", hidden_dims=(1200, 32))  # same, by name
 
-Deliberately absent: target scaling and `ipw` weighting. Those are properties of the loss
+    head = DualHead()                                 # shared trunk -> (logit, pProp)
+    head = build_head("dual", n_layers=4, hidden_dim=1740)
+
+`DualHead` is what `train.py` uses: the task is a binary classification at pProp >= 3.5
+*and* a regression on continuous pProp, trained jointly. It takes scalar `hidden_dim` /
+`n_layers` rather than a `hidden_dims` sequence, because sweep drivers pass scalars.
+
+Deliberately absent: target scaling and loss weighting. Those are properties of the loss
 and the data pipeline, not of the head, and putting them here would make every head
-re-implement them. See NOTES.md §7 Phase 3.
+re-implement them -- `src/normalization.py` and `src/losses.py` own them instead.
 """
 
 from collections.abc import Sequence
@@ -63,6 +70,45 @@ def _make_norm(name, dim):
     return None if cls is None else cls(dim)
 
 
+def _mlp_blocks(in_dim, hidden_dims, activation, dropout, norm, bias):
+    """`[(Linear -> norm? -> activation -> dropout?)] * len(hidden_dims)`, and the width out.
+
+    Shared by `MLPHead` and `DualHead` so the two cannot drift in what a "hidden block"
+    means. Returns the layer list *without* a final output projection -- callers append
+    their own, or none at all if they want the raw block stack (which is what `DualHead`'s
+    shared trunk is).
+
+    `hidden_dims=()` yields no layers and returns `in_dim` unchanged, so the degenerate
+    depth-0 case needs no special-casing anywhere upstream.
+    """
+    layers = []
+    prev = in_dim
+    for width in hidden_dims:
+        layers.append(nn.Linear(prev, width, bias=bias))
+        layer_norm = _make_norm(norm, width)
+        if layer_norm is not None:
+            layers.append(layer_norm)
+        layers.append(_make_activation(activation))
+        if dropout > 0.0:
+            layers.append(nn.Dropout(dropout))
+        prev = width
+    return layers, prev
+
+
+def _validate_dims(hidden_dims, dropout):
+    """Normalise `hidden_dims` to a tuple of positive ints and range-check `dropout`."""
+    if isinstance(hidden_dims, int):
+        hidden_dims = (hidden_dims,)
+    if not isinstance(hidden_dims, Sequence):
+        raise TypeError(f"hidden_dims must be a sequence of ints, got {hidden_dims!r}")
+    hidden_dims = tuple(int(d) for d in hidden_dims)
+    if any(d <= 0 for d in hidden_dims):
+        raise ValueError(f"hidden_dims must all be positive, got {hidden_dims}")
+    if not 0.0 <= dropout < 1.0:
+        raise ValueError(f"dropout must be in [0, 1), got {dropout}")
+    return hidden_dims
+
+
 class MLPHead(nn.Module):
     """A plain MLP: `in_dim -> each of hidden_dims -> out_dim`.
 
@@ -80,31 +126,13 @@ class MLPHead(nn.Module):
                  activation="gelu", dropout=0.0, norm=None, bias=True):
         super().__init__()
 
-        if isinstance(hidden_dims, int):
-            hidden_dims = (hidden_dims,)
-        if not isinstance(hidden_dims, Sequence):
-            raise TypeError(f"hidden_dims must be a sequence of ints, got {hidden_dims!r}")
-        hidden_dims = tuple(int(d) for d in hidden_dims)
-        if any(d <= 0 for d in hidden_dims):
-            raise ValueError(f"hidden_dims must all be positive, got {hidden_dims}")
-        if not 0.0 <= dropout < 1.0:
-            raise ValueError(f"dropout must be in [0, 1), got {dropout}")
+        hidden_dims = _validate_dims(hidden_dims, dropout)
 
         self.in_dim = int(in_dim)
         self.hidden_dims = hidden_dims
         self.out_dim = int(out_dim)
 
-        layers = []
-        prev = self.in_dim
-        for width in hidden_dims:
-            layers.append(nn.Linear(prev, width, bias=bias))
-            layer_norm = _make_norm(norm, width)
-            if layer_norm is not None:
-                layers.append(layer_norm)
-            layers.append(_make_activation(activation))
-            if dropout > 0.0:
-                layers.append(nn.Dropout(dropout))
-            prev = width
+        layers, prev = _mlp_blocks(self.in_dim, hidden_dims, activation, dropout, norm, bias)
         layers.append(nn.Linear(prev, self.out_dim, bias=bias))
 
         self.net = nn.Sequential(*layers)
@@ -118,8 +146,70 @@ class MLPHead(nn.Module):
         return f"dims={dims}"
 
 
+class DualHead(nn.Module):
+    """Shared MLP over the embedding, then a classification logit and a regression scalar.
+
+    Ported in structure from `pProp_MLP.model.DualHeadMLP`, which is where the joint
+    classify-and-regress design was validated. Two things about it are load-bearing here:
+
+    - **The two heads sit on a *shared* trunk**, so the classification signal shapes the
+      representation the regression head reads. That is the entire reason the classifier
+      earns its keep -- the objective could be regression-only, but the auxiliary gradient
+      is what makes "is this above pProp 3.5" inform "how far above".
+    - **LayerNorm, never BatchNorm.** Batch size is a training decision, and the class
+      ratio is 104:1, so per-batch statistics over ~11 positives in 1,200 rows would be
+      unstable. `norm="batch"` remains reachable through the registry but is the wrong
+      choice here.
+
+    Sizes come in as scalars (`hidden_dim`, `n_layers`) rather than as a `hidden_dims`
+    sequence, because sweep drivers pass scalars -- a list-valued hyperparameter has no
+    natural representation in Optuna or a wandb sweep config. `n_layers=0` gives no shared
+    trunk at all, and each head then reads the 512-d embedding directly.
+
+    `forward` returns `(logits, pred)`, both shaped `[B]`. `MiniMolRegressor` passes tuples
+    through untouched.
+    """
+
+    def __init__(self, in_dim=EMBED_DIM, hidden_dim=1024, n_layers=2,
+                 cls_hidden_dim=256, cls_n_layers=1,
+                 reg_hidden_dim=256, reg_n_layers=1,
+                 activation="gelu", dropout=0.0, norm="layer", bias=True):
+        super().__init__()
+
+        _validate_dims((), dropout)          # range-checks dropout
+        self.in_dim = int(in_dim)
+
+        shared_dims = (int(hidden_dim),) * int(n_layers)
+        layers, trunk_out = _mlp_blocks(self.in_dim, _validate_dims(shared_dims, dropout),
+                                        activation, dropout, norm, bias)
+        self.shared = nn.Sequential(*layers)
+        self.shared_out_dim = trunk_out
+
+        head_kwargs = dict(in_dim=trunk_out, out_dim=1, activation=activation,
+                           dropout=dropout, norm=norm, bias=bias)
+        self.cls_head = MLPHead(hidden_dims=(int(cls_hidden_dim),) * int(cls_n_layers),
+                                **head_kwargs)
+        self.reg_head = MLPHead(hidden_dims=(int(reg_hidden_dim),) * int(reg_n_layers),
+                                **head_kwargs)
+
+    def forward(self, x):
+        """`[B, in_dim] -> ([B], [B])` as `(classification logit, predicted pProp)`.
+
+        The logit is raw -- no sigmoid. `losses.weighted_bce_loss` expects logits, and
+        keeping the squashing out of the module means the same value doubles as the ranking
+        score for average precision, which only cares about order.
+        """
+        shared = self.shared(x)
+        return self.cls_head(shared).squeeze(-1), self.reg_head(shared).squeeze(-1)
+
+    def extra_repr(self):
+        return (f"in_dim={self.in_dim}, shared_out={self.shared_out_dim}, "
+                f"cls={self.cls_head.hidden_dims}, reg={self.reg_head.hidden_dims}")
+
+
 HEADS = {
     "mlp": MLPHead,
+    "dual": DualHead,
 }
 
 

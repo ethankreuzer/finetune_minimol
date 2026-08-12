@@ -1,0 +1,361 @@
+{
+  "script": "src/benchmark.py",
+  "argv": [
+    "src/benchmark.py"
+  ],
+  "config": {
+    "features": "data/features/minimol_v1",
+    "out": "reports/benchmark.json",
+    "batch_size": 256,
+    "batch_sweep": [
+      64,
+      128,
+      256,
+      512,
+      1024,
+      2048,
+      4096
+    ],
+    "worker_sweep": [
+      0,
+      4,
+      8,
+      16,
+      32
+    ],
+    "steps": 20,
+    "warmup": 5,
+    "repeats": 3,
+    "only": null,
+    "allow_busy": false
+  },
+  "gpu": {
+    "name": "NVIDIA RTX A6000",
+    "total_gb": 51.0,
+    "capability": "sm_86",
+    "multi_processor_count": 84
+  },
+  "cpu_count": 128,
+  "versions": {
+    "python": "3.11.15",
+    "torch": "2.6.0+cu124",
+    "cuda": "12.4"
+  },
+  "host": "rabelais-1",
+  "minutes": 1.12,
+  "results": {
+    "step": {
+      "frozen": {
+        "kind": "gpu_only",
+        "batch_size": 256,
+        "ms_median": 21.29063941538334,
+        "ms_std_across_repeats": 0.008244663867208967,
+        "mol_per_s": 12024.063486558782,
+        "peak_gb": 0.156354048,
+        "repeats": [
+          {
+            "ms_median": 21.303513552993536,
+            "ms_p10": 21.258895564824343,
+            "ms_p90": 21.447131782770157,
+            "ms_min": 21.207453683018684
+          },
+          {
+            "ms_median": 21.28360141068697,
+            "ms_p10": 21.271592658013105,
+            "ms_p90": 21.346597466617823,
+            "ms_min": 21.268978714942932
+          },
+          {
+            "ms_median": 21.29063941538334,
+            "ms_p10": 21.272270381450653,
+            "ms_p90": 21.32357396185398,
+            "ms_min": 21.261184476315975
+          }
+        ]
+      },
+      "full": {
+        "kind": "gpu_only",
+        "batch_size": 256,
+        "ms_median": 51.20576964691281,
+        "ms_std_across_repeats": 0.04676737394946247,
+        "mol_per_s": 4999.436621404912,
+        "peak_gb": 1.493401088,
+        "repeats": [
+          {
+            "ms_median": 51.20576964691281,
+            "ms_p10": 50.98172528669238,
+            "ms_p90": 51.36464796960354,
+            "ms_min": 50.88871158659458
+          },
+          {
+            "ms_median": 51.20281642302871,
+            "ms_p10": 51.09845669940114,
+            "ms_p90": 51.55278854072094,
+            "ms_min": 50.96457339823246
+          },
+          {
+            "ms_median": 51.30346864461899,
+            "ms_p10": 51.11820502206683,
+            "ms_p90": 51.5048261731863,
+            "ms_min": 50.97061861306429
+          }
+        ]
+      }
+    },
+    "batch": {
+      "frozen": [
+        {
+          "batch_size": 64,
+          "ms_median": 15.374131500720978,
+          "mol_per_s": 4162.836775332557,
+          "peak_gb": 0.17814016
+        },
+        {
+          "batch_size": 128,
+          "ms_median": 15.685215126723051,
+          "mol_per_s": 8160.5511282994885,
+          "peak_gb": 0.170710528
+        },
+        {
+          "batch_size": 256,
+          "ms_median": 21.488485857844353,
+          "mol_per_s": 11913.356841126497,
+          "peak_gb": 0.220464128
+        },
+        {
+          "batch_size": 512,
+          "ms_median": 38.38911186903715,
+          "mol_per_s": 13337.115006636948,
+          "peak_gb": 0.319831552
+        },
+        {
+          "batch_size": 1024,
+          "ms_median": 74.94654366746545,
+          "mol_per_s": 13663.071702725125,
+          "peak_gb": 0.519427584
+        },
+        {
+          "batch_size": 2048,
+          "ms_median": 140.52229141816497,
+          "mol_per_s": 14574.200145267914,
+          "peak_gb": 0.921293824
+        },
+        {
+          "batch_size": 4096,
+          "ms_median": 275.85952216759324,
+          "mol_per_s": 14848.137080117005,
+          "peak_gb": 1.724975616
+        }
+      ],
+      "full": [
+        {
+          "batch_size": 64,
+          "ms_median": 38.657959550619125,
+          "mol_per_s": 1655.5452161461794,
+          "peak_gb": 0.502085632
+        },
+        {
+          "batch_size": 128,
+          "ms_median": 36.931049544364214,
+          "mol_per_s": 3465.9182877063176,
+          "peak_gb": 0.839330304
+        },
+        {
+          "batch_size": 256,
+          "ms_median": 51.72341130673885,
+          "mol_per_s": 4949.402862889801,
+          "peak_gb": 1.493927424
+        },
+        {
+          "batch_size": 512,
+          "ms_median": 93.43089256435633,
+          "mol_per_s": 5479.986179596092,
+          "peak_gb": 2.837981184
+        },
+        {
+          "batch_size": 1024,
+          "ms_median": 179.0805938653648,
+          "mol_per_s": 5718.09584666587,
+          "peak_gb": 5.523923968
+        },
+        {
+          "batch_size": 2048,
+          "ms_median": 344.2853740416467,
+          "mol_per_s": 5948.553596564524,
+          "peak_gb": 10.92580096
+        },
+        {
+          "batch_size": 4096,
+          "ms_median": 681.095230858773,
+          "mol_per_s": 6013.8433135634705,
+          "peak_gb": 21.799198208
+        }
+      ]
+    },
+    "roofline": {
+      "gemm_fp32_tflops": 22.67679077602813,
+      "gemm_tf32_tflops": 58.0206298427051,
+      "gemm_bf16_tflops": 105.93484966942334,
+      "bandwidth_gb_s": 686.500419405197
+    },
+    "kernels": {
+      "frozen": {
+        "wall_ms_per_step": 52.340828347951174,
+        "gpu_busy_ms_per_step": 40.52968040000009,
+        "gpu_busy_fraction": 0.7743415929638526,
+        "kernel_launches_per_step": 1730.3,
+        "top_kernels": [
+          {
+            "name": "aten::addmm",
+            "gpu_ms_per_step": 9.567380799999967,
+            "calls_per_step": 91.0
+          },
+          {
+            "name": "ampere_sgemm_128x64_tn",
+            "gpu_ms_per_step": 8.279777800000009,
+            "calls_per_step": 63.0
+          },
+          {
+            "name": "aten::add",
+            "gpu_ms_per_step": 2.8826334999999714,
+            "calls_per_step": 107.0
+          },
+          {
+            "name": "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<float>, std::array<char*, 3ul> >(int, at::native::CUDAFunctor_add<float>, std::array<char*, 3ul>)",
+            "gpu_ms_per_step": 2.84822689999997,
+            "calls_per_step": 89.0
+          },
+          {
+            "name": "aten::scatter_add_",
+            "gpu_ms_per_step": 1.1575749999999954,
+            "calls_per_step": 61.0
+          },
+          {
+            "name": "void at::native::_scatter_gather_elementwise_kernel<128, 4, at::native::_cuda_scatter_gather_internal_kernel<true, float>::operator()<at::native::ReduceAdd>(at::TensorIterator&, long, long, long, at::native::ReduceAdd const&)::{lambda(int)#1}>(int, at::native::_cuda_scatter_gather_internal_kernel<true, float>::operator()<at::native::ReduceAdd>(at::TensorIterator&, long, long, long, at::native::ReduceAdd const&)::{lambda(int)#1})",
+            "gpu_ms_per_step": 1.1575749999999954,
+            "calls_per_step": 61.0
+          },
+          {
+            "name": "aten::native_layer_norm",
+            "gpu_ms_per_step": 1.1344585000000502,
+            "calls_per_step": 54.0
+          },
+          {
+            "name": "void at::native::(anonymous namespace)::vectorized_layer_norm_kernel<float, float>(int, float, float const*, float const*, float const*, float*, float*, float*)",
+            "gpu_ms_per_step": 1.1344585000000502,
+            "calls_per_step": 54.0
+          },
+          {
+            "name": "ampere_sgemm_32x128_tn",
+            "gpu_ms_per_step": 0.9034412999999961,
+            "calls_per_step": 9.0
+          },
+          {
+            "name": "aten::clamp_min",
+            "gpu_ms_per_step": 0.8705135000000105,
+            "calls_per_step": 21.0
+          }
+        ]
+      },
+      "full": {
+        "wall_ms_per_step": 135.317272413522,
+        "gpu_busy_ms_per_step": 103.36894199999927,
+        "gpu_busy_fraction": 0.7639005734915316,
+        "kernel_launches_per_step": 4487.0,
+        "top_kernels": [
+          {
+            "name": "aten::mm",
+            "gpu_ms_per_step": 13.07029119999974,
+            "calls_per_step": 180.0
+          },
+          {
+            "name": "aten::addmm",
+            "gpu_ms_per_step": 9.814135300000107,
+            "calls_per_step": 91.0
+          },
+          {
+            "name": "ampere_sgemm_128x64_tn",
+            "gpu_ms_per_step": 8.472069900000083,
+            "calls_per_step": 63.0
+          },
+          {
+            "name": "Optimizer.step#AdamW.step",
+            "gpu_ms_per_step": 5.088750599999991,
+            "calls_per_step": 1.0
+          },
+          {
+            "name": "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<float>, std::array<char*, 3ul> >(int, at::native::CUDAFunctor_add<float>, std::array<char*, 3ul>)",
+            "gpu_ms_per_step": 5.045978899999953,
+            "calls_per_step": 177.0
+          },
+          {
+            "name": "void cutlass::Kernel2<cutlass_80_simt_sgemm_128x64_8x5_nt_align1>(cutlass_80_simt_sgemm_128x64_8x5_nt_align1::Params)",
+            "gpu_ms_per_step": 4.817281999999869,
+            "calls_per_step": 48.0
+          },
+          {
+            "name": "ampere_sgemm_128x64_nn",
+            "gpu_ms_per_step": 4.0275800999999305,
+            "calls_per_step": 47.0
+          },
+          {
+            "name": "aten::add",
+            "gpu_ms_per_step": 2.8821723000000956,
+            "calls_per_step": 107.0
+          },
+          {
+            "name": "aten::native_layer_norm_backward",
+            "gpu_ms_per_step": 2.860874899999941,
+            "calls_per_step": 54.0
+          },
+          {
+            "name": "aten::sum",
+            "gpu_ms_per_step": 2.4710616999999067,
+            "calls_per_step": 93.0
+          }
+        ]
+      }
+    },
+    "precision": {
+      "fp32": {
+        "ms_median": 52.73642111569643,
+        "mol_per_s": 4854.330168487758
+      },
+      "tf32": {
+        "ms_median": 44.26628211513162,
+        "mol_per_s": 5783.182769543934
+      },
+      "bf16": {
+        "ms_median": 57.14333523064852,
+        "mol_per_s": 4479.962518230749
+      }
+    },
+    "loader": {
+      "0": {
+        "kind": "cpu_only",
+        "mol_per_s": 6074.37932667973,
+        "ms_per_batch": 42.144223505371734
+      },
+      "4": {
+        "kind": "cpu_only",
+        "mol_per_s": 28579.07064108927,
+        "ms_per_batch": 8.957604087794884
+      },
+      "8": {
+        "kind": "cpu_only",
+        "mol_per_s": 57693.52051100146,
+        "ms_per_batch": 4.437240052826797
+      },
+      "16": {
+        "kind": "cpu_only",
+        "mol_per_s": 149500.52424551506,
+        "ms_per_batch": 1.712368577247179
+      },
+      "32": {
+        "kind": "cpu_only",
+        "mol_per_s": 190911.74910334923,
+        "ms_per_batch": 1.3409337099594405
+      }
+    }
+  }
+}

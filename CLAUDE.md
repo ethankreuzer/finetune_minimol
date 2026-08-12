@@ -9,7 +9,7 @@ on *why*; this file is authoritative on *what currently exists*.
 
 ---
 
-## State as of 2026-08-10
+## State as of 2026-08-12
 
 | Piece | Status |
 |---|---|
@@ -19,15 +19,21 @@ on *why*; this file is authoritative on *what currently exists*.
 | Trainable trunk | **done, 10/10 checks pass** — `src/trunk.py`, `src/verify_trunk.py` |
 | Feature cache (Phase 2) | **done, verified** — `src/featurize.py`, `src/features.py` |
 | Prototype training run | **done, verified** — `src/train.py`, 5 epochs, fold 0 seed 0 |
-| 5×2 grid runner / SLURM | not started (NOTES §7 Phase 4) |
+| Loss / metrics / objective ported from `pProp_MLP` | **done, 8/8 checks pass** — `src/losses.py`, `src/metrics.py`, `src/objective.py`, `src/verify_metrics.py` |
+| Dual head (binary @ 3.5 + regression) | **done** — `head.DualHead` |
+| Pooled out-of-fold tail metrics | **written, code path exercised; no real runs pooled yet** — `src/pool_oof.py` |
+| Compute profile / benchmarks | **done** — `src/benchmark.py`, `reports/compute_profile.md` |
+| 5×2 grid runner / SLURM | `scripts/run_grid.sbatch` exists; sweep driver not started |
+| Hyperparameter sweep (Optuna, offline) | not started — `wandb agent` cannot run on TamIA |
 
 The trunk reproduces frozen MiniMol embeddings **exactly** (max|Δ| = 0.000e+00 over 64×512),
 gradients reach all 284 reachable trunk tensors (7,919,912 params), and an optimizer step
 moves trunk weights. Two further tensors are unreachable inside graphium itself — see "The
 rw_pos dead norm" below. `verification.md` reads `OVERALL: PASS`.
 
-Nothing is committed beyond the initial commit; `pyproject.toml` and `uv.lock` are still
-untracked, so the env is not yet reproducible on TamIA.
+Commit `c00bc4e` tracks the env (`pyproject.toml` + `uv.lock`), the trunk, the feature cache
+code and training, so `git clone` + `uv sync` reproduces on TamIA. Everything from the loss /
+metrics / objective port onward is still uncommitted.
 
 ---
 
@@ -109,7 +115,23 @@ src/
   features.py                        cache loader with provenance guard  <- use this
   fold_histograms.py                 per-fold pProp distribution PNGs
   cluster_histograms.py              ORPHANED — per-cluster version, superseded
-NOTES.md                             the reference document
+
+  trunk.py / model.py / head.py      the trainable trunk, the two-group optimizer, DualHead
+  train.py                           one fold, one seed  <- the entry point
+  losses.py                          4-term loss + the three weighting flavours
+  metrics.py                         AP / correlation / error / enrichment, all suffixed
+  objective.py                       goal_metric + the derived OBJECTIVE_VERSION
+  normalization.py                   --pprop-norm; ported verbatim
+  run_paths.py                       outputs/<sweep_id>/<run_id>  <- never hardcode a path
+  pool_oof.py                        pooled out-of-fold tail metrics across the 5 folds
+  verify_trunk.py / verify_metrics.py    the two verification suites
+  dump_metric_reference.py           run under pProp_MLP's venv; feeds verify_metrics
+  benchmark.py / concurrency.py / collect_runs.py / report_charts.py   the compute profile
+scripts/
+  run_grid.sbatch                    the 5×2 grid as a SLURM array (gpu:1, NOT mps)
+  sample_gpu.sh                      nvidia-smi telemetry sampler
+reports/                             compute_profile.md + its evidence
+NOTES.md                             the reference document; §12 is the pProp_MLP translation
 ```
 
 ---
@@ -121,17 +143,26 @@ NOTES.md                             the reference document
 - `score` — AmpC docking score, kcal/mol, **more negative is better**
 - `pprop` — `-log10(rank_max / 1e7)`, a quantile; monotone in `score`; max 7.0.
   **This is the regression target** (settled 2026-08-11). `score` is kept for reporting.
-- `ipw` — inverse-probability weight; how many library molecules each row stands for.
-  `subset.py` kept the whole potent tail and subsampled the bulk, so the file is
-  deliberately *not* distributed like the library. `ipw` corrects metrics back.
-  Measured: bulk rows (pProp < 1) carry `ipw = 75`, the entire tail carries `ipw = 1`, and
-  `sum(ipw)` is exactly 10,000,000. Potent molecules are ~30× over-represented relative to
-  the library, which is why unweighted subset metrics flatter the model.
+- `ipw` — **a record of how the subsample was drawn, not a modelling input** (settled
+  2026-08-12). It is the per-bin subsampling rate `subset.py` applied: how many library
+  molecules each retained row stands for. `subset.py` kept the whole potent tail and
+  subsampled the bulk, so the file is deliberately *not* distributed like the library.
+  Measured: **75.0 over `[0,1)`, 7.5 over `[1,2)`, 1.14 over `[2,2.5)`, and exactly 1.0
+  everywhere above 2.5** — `--take-all-above 2.5` made that whole region a census, so every
+  molecule in the 10M library with pProp ≥ 2.5 is present, and `sum(ipw)` is exactly
+  10,000,000. The ≥ 3.5 positive class is therefore complete rather than sampled (`sum(ipw)`
+  over its 3,153 rows is 3,154).
 
-**Loss weighting is an open design point, not an absent one.** A weighting scheme is
-planned but unchosen (`ipw` is one candidate, not a decision). The training step must
-therefore accept a **per-sample weight vector defaulting to uniform** — never a hardcoded
-unweighted mean. See NOTES §1.
+  **Nothing in the training or metric code reads this column.** It was briefly a loss
+  weighting option and a metric flavour, and was removed from both on 2026-08-12: it
+  describes the sampling design, not how the model should be trained or scored. It survives
+  in the CSV and in `split.py`'s diagnostics as the provenance of the subsample. The cost of
+  removing it is stated plainly below — subset metrics flatter the model by ~30× tail
+  enrichment and there is now no reweighting that corrects for it.
+
+**The loss is weighted, and the weighting is `balanced`** — two-group inverse frequency at
+pProp 3.5, chosen 2026-08-12 over the alternatives. The training step accepts a
+**per-sample weight vector**, never a hardcoded unweighted mean. See NOTES §1.
 
 SMILES are RDKit-canonical (isomeric) and deduplicated. The tail is thin: **3,153** rows at
 pProp ≥ 3.5, **100** at ≥ 5.0.
@@ -191,13 +222,142 @@ A rerun must reproduce `split_sha256 = 3ef97e78a85d…` in `meta.json`. That has
 
 ## Training — `src/train.py`
 
-One fold, one seed, staged fine-tuning. `--freeze-epochs 3 --epochs 5`: the head trains
-alone on the frozen embedding, then the trunk unfreezes and both train together.
+One fold, one seed, staged fine-tuning. The head trains alone on the frozen embedding for
+`--freeze-epochs`, then the trunk unfreezes and both train together.
 
 ```bash
-python src/train.py --fold 0 --seed 0                                    # 3.7 min
+python src/train.py --fold 0 --seed 0                                     # 20 epochs, freeze 5
+python src/train.py --fold 0 --seed 0 --freeze-epochs 20                  # frozen-trunk BASELINE
 python src/train.py --epochs 2 --freeze-epochs 1 --subset 5000 --no-wandb  # smoke, <1 min
 ```
+
+`--freeze-epochs == --epochs` never unfreezes, so it reproduces the frozen-embedding
+workflow **on these splits**. That is the only honest baseline for the fine-tuned arm —
+`pProp_MLP`'s numbers were measured on different data and a different partition, and cannot
+be quoted against these.
+
+### The task is joint, and binary at pProp ≥ 3.5
+
+`head.DualHead` puts a **classification logit** and a **regression scalar** on one shared MLP
+over the 512-d embedding. 3.5 is the threshold at which binders become possible, and it is
+also the finest split leaving a learnable positive class: **3,153 molecules, 619–643 per
+validation fold**, against only **100 in the whole dataset** at pProp ≥ 5.0.
+
+`pProp_MLP`'s 4-class scheme does not survive the move. pProp caps at **7.0** here (rank 1 of
+10M), so its `7.5+` artifact class is *impossible* — and `WEIGHT_GROUPS = [0,1,2,0]`, which
+existed solely to demote those 46 artifacts, has nothing left to do. It is ported as
+`[0, 1]`, an identity grouping, purely so the shape of the argument survives a rebin.
+
+### The loss — `src/losses.py`
+
+```
+loss = w_cls · cls  +  huber  +  w_pair · pair  +  w_std · std
+```
+
+Huber is **grounded at weight 1** — the only term anchoring the absolute pProp level, so the
+other three are measured against it and only its `delta` is swept. Three deliberate
+deviations from the port:
+
+- **`cls` is BCE normalised by `w.sum()`, not by `N`.** `CrossEntropyLoss(weight=w)` divides
+  by `Σw`; `BCEWithLogitsLoss(reduction="mean")` divides by `N`. At a 104× class ratio those
+  differ by a large constant, which would move every inherited `w_cls` out of the units it
+  was swept in. Verified equal to `CrossEntropyLoss(weight=…)` on 2 classes.
+- **`std_match_loss` takes the sample weights.** The group-weighted target std is **1.455**
+  against **0.864** unweighted, so an unweighted std term would pull prediction spread toward
+  the smaller number while the weighted huber pulled toward the larger. They would fight.
+- **`pair` stays unweighted**, exactly as ported. It is O(B²) — ~1.4M pairs at batch 1200.
+
+`combined_loss` returns the four term values **unscaled**, and they are logged that way: a
+term that has collapsed and a term whose weight is tiny look identical once multiplied.
+
+### Weighting — `--weights {uniform,balanced}`, default `balanced`
+
+Two-group inverse frequency at pProp 3.5: class weights `[0.0190, 1.9810]`, a **104×** ratio.
+One threshold drives the classifier, the loss weights and the metric weighting.
+
+**Weights are derived per fold, from that fold's own composition.** A single global vector
+sliced per fold would encode the validation fold's tail fraction into the training loss.
+
+Why the edge is 3.5 and not 5.0, measured as effective sample size `(Σw)² / Σw²`:
+
+| edge | groups | ratio | ESS | % of N |
+|---|---|---|---|---|
+| 3.0 | 321,502 / 9,978 | 32× | 38,711 | 11.68% |
+| **3.5** | **328,327 / 3,153** | **104×** | **12,492** | **3.77%** |
+| 4.0 | 330,484 / 996 | 332× | 3,972 | 1.20% |
+| 5.0 | 331,380 / 100 | 3,314× | **400** | **0.12%** |
+
+At 5.0 the scheme would train on an effective 400 molecules. For scale, `pProp_MLP`'s scheme
+retained **18.5%** — the same idea costs ~5× more here because the tail is 138× thinner.
+
+That is also why `--batch-size` defaults to **1200**: ~11.4 positives per batch instead of
+2.4 at 256, so the up-weighted half of the loss is not riding on two or three molecules.
+`reports/compute_profile.md` independently wants ~1024 for throughput, so both arguments
+agree. A `--weight-cap` is deliberately **not** implemented — add one only if the
+fold-to-fold spread on tail metrics turns out large.
+
+### Learning rates — two groups, cosine-annealed
+
+`--head-lr 1e-3` / `--trunk-lr 1e-4`, both cosine-annealed over the full run to `--eta-min`
+(`--lr-schedule cosine`, default), matching `pProp_MLP`'s `CosineAnnealingLR(T_max=epochs,
+eta_min=1e-8)`.
+
+**Annealing is load-bearing given final-epoch selection.** With no early stopping, the final
+epoch is what gets scored and saved; annealed to ~`eta_min` that is a settled model, whereas
+at a constant LR it is an arbitrary point on a still-moving trajectory. `pProp_MLP` measured
+final-epoch selection as costing 0.003–0.005 of `goal_metric` (30/30 of its top-30 runs
+peaked earlier) — without annealing that figure would be a floor here, not an estimate.
+
+The schedule is computed in closed form (`scheduled_lr`) rather than delegated to a torch
+scheduler, because a scheduler writes `group["lr"]` every step and would silently fight the
+freeze, which writes the same field. **`apply_lrs` is the single authority**, and it
+delegates the trunk to `set_trunk_trainable` so the freeze keeps exactly one implementation —
+which is also what keeps `verify_metrics.py`'s negative test meaningful, since that test
+neuters `set_trunk_trainable` and expects the run to die.
+
+### Metrics — `src/metrics.py`, `src/objective.py`
+
+**Every metric is computed under both weightings, and every key is suffixed.** There is no
+unsuffixed `weighted_mae` to fall back on, because a sign error in a weight vector is
+invisible in any single number. `verify_metrics.py` asserts `mae_uniform < mae_balanced`
+*and* pins both vectors by their base rates — unweighted must reproduce the true positive
+rate, balanced must be exactly 0.5 (measured 0.499999997; the 2.5e-9 gap is float32 in
+`grouped_frequency_weights`, exact in float64).
+
+- `*_uniform` estimates this 331k subset, which is ~30× tail-enriched by construction, **so
+  it flatters the model rather than being neutral**. Read it as a subset number, never as a
+  library number. Since `ipw` was removed there is no reweighting that corrects back to the
+  10M library — that is the accepted cost of keeping the sampling design out of the metrics.
+- `*_balanced` is tail-emphasising and matches what the loss optimises.
+- `ap_balanced` is **not a performance number** — forcing a 50/50 base rate makes AP a
+  statement about the weighting. `ap_uniform` is the one to read.
+
+`goal_metric = AP* + ½(Pearson* + MAE_skill*)`, at the **final** epoch, no early stopping.
+The starred terms, from `OBJECTIVE_SPEC` — **`AP*` = `ap_uniform` alone**; `Pearson*` and
+`MAE_skill*` each average `uniform` and `balanced`. `objective.py` still flags the
+composition of the two averaged terms as a defensible starting point rather than a settled
+choice; changing either is a one-line edit that re-stamps the version automatically.
+`OBJECTIVE_VERSION` is a **hash of the objective spec**, so editing any term re-stamps it
+automatically — `pProp_MLP` accumulated three incompatible revisions under one metric name,
+and its own CLAUDE.md warns they must never be compared. Every run stamps
+`objective_version`, `split_sha256` and `input_sha256` into `meta.json`; filter on all three
+before comparing two runs.
+
+**The current stamp is `v1-binary3.5-c917327f`.** It replaced `adb3da05` on 2026-08-12 when
+`ap_ipw` left `AP*`, so `AP*` went from a two-metric mean to `ap_uniform` alone. Treat
+`goal_metric` as **not comparable across that boundary** — the two AP flavours measured close
+(0.4861 vs 0.4968), so the magnitude barely moves, which makes an accidental comparison look
+plausible rather than obviously wrong. In practice nothing is at risk: no run had been scored
+under `adb3da05` (the only runs on disk were compute benchmarks with null provenance), which
+is exactly why the change was free to make then and will not be later.
+
+`--pprop-norm` defaults to `zscore` and **metrics denormalize first**, so every reported
+number is on the raw pProp scale. Not cosmetic: `val/mse` is declared `summary="min"`, and a
+normalized report would silently make that summary incomparable across settings. The
+inherited loss hyperparameters are in **z-units** for the same reason — `pProp_MLP` trained
+its huber/pair/std terms against the normalized target (`sweep_train.py:460-465`), which is
+what lets `huber_delta 1.05` / `w_pair 7.49` / `w_std 0.79` transfer across two different
+pProp distributions.
 
 **First result** (fold 0, seed 0, target `pprop`, head 512→1024→32→1, head_lr 1e-3 /
 trunk_lr 1e-4, [run](https://wandb.ai/ethan_personal/finetune_minimol/runs/uj7pnjiw)):
@@ -231,9 +391,9 @@ seed, 5 epochs, no tail metrics.
 - **Freezing is ~2× faster per epoch** (32 s vs 65 s), because with no trunk parameter
   requiring grad, autograd builds no graph through the trunk at all — skipping the backward
   *and* the stored activations.
-- **The loss is weighted, defaulting to uniform** (`weighted_mse`, normalised by `w.sum()`
-  so the loss scale does not move when a scheme is swapped in). `--weights ipw` is wired.
-  Never replace it with a bare `.mean()` — see NOTES §1.
+- **The loss is weighted, defaulting to `balanced`** (`weighted_mse`, normalised by `w.sum()`
+  so the loss scale does not move when a scheme is swapped in). Never replace it with a bare
+  `.mean()` — see NOTES §1.
 - `val_predictions.npy` + `val_indices.npy` are written per run, so pooled out-of-fold tail
   metrics need no re-running.
 - Pearson is `nan` when predictions are constant; `val/pred_std` is logged beside it so that
@@ -260,8 +420,8 @@ Rebuild in ~3.5 min: `python src/featurize.py` (1,745 mol/s — graphium sets
   **1.0 s** to load versus 5.44 GB / **81.7 s** for a list. 80× matters because the 5×2 grid
   is 10 processes each paying it once. `collate`→`separate` verified to round-trip every key
   of every graph exactly and give bit-identical embeddings.
-- **Graphs only, no target.** `score`/`pprop`/`ipw` come from the CSV at train time by row
-  index, so the still-open target choice (NOTES §1) does not invalidate the cache.
+- **Graphs only, no target.** `pprop` comes from the CSV at train time by row index, so the
+  target choice does not invalidate the cache.
 - **`load_features` re-hashes the source CSV and refuses a mismatch**, exactly as
   `splits.py` does, and for the same reason: `subset.py` takes a `--seed`, so a regenerated
   CSV is a different 331k set and would leave every graph bound to the wrong target. A
@@ -341,8 +501,11 @@ Full list in NOTES §9. The ones that bite hardest:
   rdkit 2024.03.5; `minimol_ft` will carry a different one. This is why
   `fingerprints.npy` is persisted rather than recomputed, and why `meta.json` records the
   version.
-- **`data/` is 1.5 GB and untracked, with no `.gitignore`.** `data/splits/cluster_kfold_v1/`
-  alone is 112 MB. Decide on `.gitignore` vs LFS before committing anything under `data/`.
+- **`data/` is 1.5 GB and untracked.** `data/splits/cluster_kfold_v1/` alone is 112 MB.
+  `.gitignore` excludes `data/*` wholesale and un-ignores exactly two things: `data/reference/`
+  (the frozen MiniMol embeddings `verify_trunk.py` checks against, a few hundred KB, useless
+  unless it travels with the code) and `data/*.meta.json`. Splits are regenerable in ~2.5 min
+  from `src/split.py`, which is why they are not tracked.
 
 ---
 

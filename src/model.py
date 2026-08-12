@@ -46,7 +46,12 @@ class MiniMolRegressor(nn.Module):
 
     def forward(self, batch):
         embedding = self.trunk(batch)          # [B, 512], carries grad_fn
-        out = self.head(embedding)             # [B, out_dim]
+        out = self.head(embedding)             # [B, out_dim], or a tuple from a dual head
+        # A multi-output head (`head.DualHead`) returns an already-shaped tuple. Pass it
+        # through rather than trying to squeeze it -- the dispatch is on the value, not on
+        # a flag the head has to remember to set, so a new multi-head needs no change here.
+        if isinstance(out, tuple):
+            return out
         return out.squeeze(-1) if self.squeeze_output else out
 
     def embed(self, batch):

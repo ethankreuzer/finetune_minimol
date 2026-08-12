@@ -1,9 +1,13 @@
 # Fine-tuning the MiniMol trunk — background, findings, and plan
 
-> Status: research complete on the central question; the trunk itself is not started.
-> Nothing has been installed or forked. The dataset subset (`src/subset.py`) and the
-> cross-validation splits (`src/split.py`, §11) are built and verified.
-> Last updated 2026-08-10.
+> Status: the trunk is **built, verified and training**. The environment, the trainable
+> trunk (`src/trunk.py`, 10/10 checks), the feature cache, `src/train.py`, a 10-run grid and
+> a full compute profile (`reports/compute_profile.md`) all exist. The loss, metrics and
+> selection objective have been ported from `pProp_MLP` (§12) and pass 8/8 checks in
+> `src/verify_metrics.py`. What remains is the hyperparameter sweep and its driver.
+> §§1–11 below are the original research record and remain authoritative on *why*; where a
+> statement there has been superseded by what was actually built, §12 says so.
+> Last updated 2026-08-12.
 
 ---
 
@@ -38,6 +42,11 @@ the loss; the scheme is not yet chosen, and `ipw` is only one candidate — the 
 therefore broader than "does `ipw` enter the loss". Design consequence: the training step
 takes a **per-sample weight vector, defaulting to uniform**, so a scheme can be dropped in
 without touching the training loop. Do not hardcode an unweighted mean.
+
+> **Settled 2026-08-12 — see §12.6.** The scheme is `balanced`, and `ipw` was rejected
+> outright: it is the subsampling rate `subset.py` applied, a description of how the dataset
+> was assembled rather than a modelling choice, so it weights neither the loss nor any
+> reported metric. The per-sample weight vector survives exactly as designed above.
 
 Still open: the exact head architecture and the headline metric.
 
@@ -601,3 +610,136 @@ order, `argmin`/`argmax` tie toward the lowest index.
 Reruns are checked by the `split_sha256` in `meta.json` — a hash over the
 `(row_idx, cluster_id, fold)` triples. File byte-identity is the wrong criterion; content
 identity is the right one. Current value: `3ef97e78a85d…`.
+
+---
+
+## 12. What was inherited from `pProp_MLP`, and what the data forced to change
+
+`/home/ethan2/pProp_MLP` trained a dual-head MLP on **frozen** MiniMol embeddings for the
+same target. It is a finished body of work — ~19,600 completed sweep runs — and most of its
+loss, metric and objective design ports directly. This section records what carried, what
+did not, and the measurements that decided each.
+
+### 12.1 The result that motivates this repo
+
+From `pProp_MLP`'s `sweeps/eval_best_model.ipynb`, run `jlwzehi6`, under a hard ≤0.65
+Tanimoto val↔train ceiling:
+
+| class | n (val) | train AP | val AP | train MAE | val MAE |
+|---|---|---|---|---|---|
+| 0–3.5 | 68,168 | 0.985 | 0.958 | 0.382 | 0.463 |
+| 3.5–5 | 23,334 | 0.769 | 0.679 | 0.384 | 0.645 |
+| **5–7.5** | **1,653** | **0.656** | **0.248** | **0.339** | **1.389** |
+
+**The frozen embedding does not transfer to held-out chemistry in the one class that
+matters** — val AP collapses to 0.248 against 0.656 on train. Closing that gap is what
+full-trunk fine-tuning is for, and it is the comparison §7 Phase 3 asks for. Its data-scaling
+notebook adds a second reading: val performance was still climbing monotonically at 100% of
+530k training molecules, with no knee, so frozen-embedding *capacity* was not the binding
+constraint either.
+
+### 12.2 pProp means the same thing in both repos — verified, not assumed
+
+Both compute `-log10(rank / N)`, which is a quantile, so a pProp threshold is the same
+quantile regardless of library size (1.468e9 there, 1e7 here). Checked against absolute
+docking score at matched pProp:
+
+| pProp band | this repo, mean score | pProp_MLP, mean score |
+|---|---|---|
+| [3.4, 3.6) | −75.40 | −75.56 |
+| [4.9, 5.1) | −84.41 | −84.26 |
+| [5.5, 6.0) | −87.63 | −87.64 |
+
+Agreement to ~0.2 kcal/mol confirms `ampc_unif_random_10M` is an unbiased draw from the same
+library. **Consequence:** every threshold and every loss hyperparameter expressed in target
+units transfers *in units*. Only densities change — and they change a lot:
+
+| band | pProp_MLP | here |
+|---|---|---|
+| [0, 3.5) | 454,450 | 328,327 |
+| [3.5, 5) | 155,561 | **3,053** |
+| [5, 7.5) | 13,778 | **100** |
+| 7.5+ | 46 | **0 — impossible**, pProp caps at 7.0 |
+
+### 12.3 The loss hyperparameters transfer because they are in z-units
+
+Verified at `pProp_MLP/src/sweep_train.py:460-465`: `huber`, `pair` and `std` all train
+against the **normalized** target, and the best run (`zfs9n2ln`, `goal_metric` 1.4483) used
+`pprop_norm=zscore`. So its `huber_delta 1.0513`, `w_pair 7.486`, `w_std 0.7911` are in
+z-units and survive the change of pProp distribution (raw mean 1.367 / std 0.864 here versus
+2.392 / 1.437 there). They are the defaults in `train.py`. This is the single largest saving
+available: it converts 19,600 prior runs into narrow priors.
+
+**The head-size priors do NOT transfer, and this is the trap.** That winner's architecture
+(`n_layers=4, hidden_dim=1740, cls 3×468, reg 3×804`) is **13,951,442 parameters — 1.76× the
+7,919,912-parameter trunk**. That was correct there, where a frozen embedding meant the MLP
+did all the learning. Here the trunk is trainable and the division of labour is reversed, so
+head width and depth are wide-sweep dimensions, not inherited constants. The z-unit argument
+covers loss hyperparameters only — those are properties of the target distribution, whereas
+head size is a statement about where the capacity should sit.
+
+### 12.4 ECFP lost decisively — a result recorded nowhere else
+
+Undocumented in `pProp_MLP` itself, recovered from its run artifacts. Comparing only buckets
+scored under its current objective:
+
+| arm | runs | best `goal_metric` |
+|---|---|---|
+| **MiniMol only** (two-tower code, `ecfp_dim=0`) | 816 | **1.4483** |
+| MiniMol only, single tower | 1,431 | 1.4413 |
+| MiniMol + ECFP two-tower | **6,648** | 1.4362 |
+
+The ECFP arm never caught the MiniMol-only best despite ~8× the search budget. That settles
+the whole research question of its `docs/ecfp_concat.md`. **Do not port ECFP here.** One
+architectural detail is worth keeping: the winning arm ran MiniMol through an extra
+`Linear(512→256) → LayerNorm → ReLU` before the shared trunk and beat the plain single-tower
+arm — `MLPHead` already exposes `norm`, so that is a sweep value rather than a new module.
+
+### 12.5 What is deliberately not ported
+
+- **`WEIGHT_GROUPS = [0,1,2,0]`** — existed only to demote the 46 `7.5+` artifacts, a class
+  that cannot occur here. Ported as the identity `[0, 1]`.
+- **`wandb agent` sweeps** (§7 Phase 4, §10). `reports/compute_profile.md` identifies this as
+  *the* gating item: the agent must reach the wandb server for each next configuration, and
+  TamIA's compute nodes have no internet. Replace with Optuna over filesystem storage,
+  `WANDB_MODE=offline`, and a `wandb sync` from a login node.
+- **`--gres=mps:20` GPU packing** (§7 Phase 4, §10). Essential there — five tiny-MLP agents
+  per A6000. Measured **counterproductive here**: 0.90–0.94× of a single process at both
+  batch 256 and 1024. One run per GPU. `scripts/run_grid.sbatch` already departs from Phase 4
+  on this point, with the reason in its header.
+- **`VAL_EVAL_EVERY = 5`.** There, full-set eval was ~half an epoch. Here validation is ~9%
+  of one, so throttling would save nothing and cost curve resolution. The *train*-set eval
+  pass is throttled instead — final epoch only, since it scores 4× as many rows.
+- **Its splits.** `pProp_MLP` guaranteed a per-molecule ≤0.65 Tanimoto ceiling by holding out
+  whole connected components (`overall_max_val_to_train = 0.64999998`); the frozen cluster-CV
+  splits here do not. That is a real difference in *what may be claimed*, and §11.4's framing
+  stands: generalisation to new clusters within this library, not to new chemistry.
+
+### 12.6 Corrections to earlier readings in this document
+
+- §1 says the headline metric is open. It is now `objective.goal_metric`, version-stamped.
+- §1 says loss weighting is deferred. It is settled: two-group inverse frequency at pProp 3.5
+  (`--weights balanced`), with `uniform` retained as the second reporting flavour.
+- **`ipw` was removed from the modelling code entirely on 2026-08-12** (it had briefly been a
+  third weighting flavour and sat beside `ap_uniform` in `AP*`). Rationale: `ipw` records the
+  per-bin rate at which `subset.py` sampled the 10M library, so it belongs to the data's
+  provenance, not to the training or scoring methodology. It remains a CSV column and a
+  `split.py` diagnostics row. Consequences, all accepted deliberately:
+  - `OBJECTIVE_VERSION` re-stamped `adb3da05` → `c917327f`. This cost nothing because no run
+    had been scored under the old spec — the only runs on disk were compute benchmarks with
+    null provenance. The window for a free re-stamp closes once the 5×2 grid runs.
+  - There is **no longer any metric that estimates full-10M-library performance.** `*_uniform`
+    is a subset number and the subset is ~30× tail-enriched, so it flatters the model. Say
+    "on the 331k subset" when reporting, never "on the library".
+  - `verify_metrics.py`'s sign-error check was rebuilt rather than deleted: the old three-way
+    `mae_ipw < mae_uniform < mae_balanced` became `mae_uniform < mae_balanced` plus two
+    base-rate assertions that pin each weight vector down directly (unweighted must reproduce
+    the true positive rate; balanced must be 0.5 — measured 0.499999997, the gap being float32
+    in `grouped_frequency_weights` and exact in float64).
+  - The objective's missing-metric negative test now takes its victim key *from*
+    `OBJECTIVE_SPEC` rather than naming one. It had named `ap_ipw`; had that been deleted
+    without thought, the test would have passed while testing nothing.
+- §7 Phase 3 lists early stopping. Superseded by §11.4's fixed epoch budget, which is what
+  removes the K-fold optimism. `pProp_MLP` measured the cost of final-epoch selection at
+  0.003–0.005 of `goal_metric` (30/30 of its top-30 runs peaked earlier); that is known,
+  accepted, and visible in the per-epoch history.
