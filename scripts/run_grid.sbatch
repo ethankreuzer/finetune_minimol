@@ -28,8 +28,8 @@
 set -e
 
 REPO=/home/ethan2/finetune_minimol
-EPOCHS=${EPOCHS:-4}
 FREEZE=${FREEZE:-2}
+UNFROZEN=${UNFROZEN:-2}
 GROUP=${GROUP:-grid_5fold_2seed}
 
 # 10 runs = folds 0..4 x seeds 0..1. Integer division and modulo keep the mapping obvious
@@ -48,5 +48,5 @@ export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v '/home/ethan2/boltz_docking/.
 cd "$REPO"
 "$REPO/.venv/bin/python" src/train.py \
     --fold "$FOLD" --seed "$SEED" \
-    --epochs "$EPOCHS" --freeze-epochs "$FREEZE" \
+    --freeze-epochs "$FREEZE" --unfrozen-epochs "$UNFROZEN" \
     --wandb-group "$GROUP" --wandb-tags grid fold"$FOLD" seed"$SEED"

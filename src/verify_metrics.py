@@ -268,7 +268,7 @@ def check_freeze_negative(ctx):
     original = train.set_trunk_trainable
     train.set_trunk_trainable = lambda *a, **k: None      # the bug being simulated
     out = Path(ctx["tmp"]) / "freeze_negative"
-    argv = ["--epochs", "2", "--freeze-epochs", "1", "--subset", "1500",
+    argv = ["--freeze-epochs", "1", "--unfrozen-epochs", "1", "--subset", "1500",
             "--batch-size", "256", "--num-workers", "2", "--no-wandb", "--out", str(out)]
     try:
         train.main(argv)

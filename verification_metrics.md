@@ -98,7 +98,7 @@ An unweighted std term paired with a weighted huber would pull prediction spread
 ## PASS — freeze assertion has teeth
 
 with `set_trunk_trainable` neutered: died
-  freeze violated: trunk moved by 5.981e-04 (expected exactly 0) or the head did not move (6.014e-03). The schedule did no
+  freeze violated: trunk moved by 5.980e-04 (expected exactly 0) or the head did not move (6.014e-03). The schedule did no
 
 The trunk trains through the frozen phase when the freeze is a no-op, so `trunk_max_delta` is non-zero and the paired check fires. Confirms the assertion in `train.py` has teeth.
 

@@ -24,7 +24,9 @@ on *why*; this file is authoritative on *what currently exists*.
 | Pooled out-of-fold tail metrics | **written, code path exercised; no real runs pooled yet** — `src/pool_oof.py` |
 | Compute profile / benchmarks | **done** — `src/benchmark.py`, `reports/compute_profile.md` |
 | 5×2 grid runner / SLURM | `scripts/run_grid.sbatch` exists; sweep driver not started |
-| Hyperparameter sweep (Optuna, offline) | not started — `wandb agent` cannot run on TamIA |
+| Config-level runner (1 config = 1 wandb run) | **done, verified 2026-08-13** — `src/run_config.py` |
+| Hyperparameter sweep (wandb bayes) | **config written 2026-08-13, not yet launched** — `sweeps/bayes_v1.yaml` |
+| Layer-wise freeze/unfreeze | **not started, deferred 2026-08-13** — see "Deferred: layer-wise freeze/unfreeze" |
 
 The trunk reproduces frozen MiniMol embeddings **exactly** (max|Δ| = 0.000e+00 over 64×512),
 gradients reach all 284 reachable trunk tensors (7,919,912 params), and an optimizer step
@@ -124,9 +126,12 @@ src/
   normalization.py                   --pprop-norm; ported verbatim
   run_paths.py                       outputs/<sweep_id>/<run_id>  <- never hardcode a path
   pool_oof.py                        pooled out-of-fold tail metrics across the 5 folds
+  run_config.py                      one hyperparameter config -> ONE wandb run  <- sweep entry
   verify_trunk.py / verify_metrics.py    the two verification suites
   dump_metric_reference.py           run under pProp_MLP's venv; feeds verify_metrics
   benchmark.py / concurrency.py / collect_runs.py / report_charts.py   the compute profile
+sweeps/
+  bayes_v1.yaml                      the wandb bayes sweep over the two-phase schedule
 scripts/
   run_grid.sbatch                    the 5×2 grid as a SLURM array (gpu:1, NOT mps)
   sample_gpu.sh                      nvidia-smi telemetry sampler
@@ -222,19 +227,27 @@ A rerun must reproduce `split_sha256 = 3ef97e78a85d…` in `meta.json`. That has
 
 ## Training — `src/train.py`
 
-One fold, one seed, staged fine-tuning. The head trains alone on the frozen embedding for
-`--freeze-epochs`, then the trunk unfreezes and both train together.
+One fold, one seed, staged fine-tuning in **two phases with independent lengths**: the head
+trains alone on the frozen embedding for `--freeze-epochs`, then the trunk unfreezes and both
+train together for `--unfrozen-epochs`.
 
 ```bash
-python src/train.py --fold 0 --seed 0                                     # 20 epochs, freeze 5
-python src/train.py --fold 0 --seed 0 --freeze-epochs 20                  # frozen-trunk BASELINE
-python src/train.py --epochs 2 --freeze-epochs 1 --subset 5000 --no-wandb  # smoke, <1 min
+python src/train.py --fold 0 --seed 0                                       # 5 + 15
+python src/train.py --fold 0 --seed 0 --freeze-epochs 20 --unfrozen-epochs 0  # frozen BASELINE
+python src/train.py --freeze-epochs 1 --unfrozen-epochs 1 --subset 5000 --no-wandb  # smoke
 ```
 
-`--freeze-epochs == --epochs` never unfreezes, so it reproduces the frozen-embedding
-workflow **on these splits**. That is the only honest baseline for the fine-tuned arm —
-`pProp_MLP`'s numbers were measured on different data and a different partition, and cannot
-be quoted against these.
+**There is no `--epochs`.** The total is derived as `--freeze-epochs + --unfrozen-epochs` and
+stamped into `meta.json` like any other setting. Two lengths rather than a total and a cut
+point, because a bayes sweep samples independently and `(epochs, freeze_epochs)` carries the
+constraint `freeze_epochs ≤ epochs` — every violating draw would have died mid-sweep. Two
+non-negative lengths have no cross-constraint. Changed 2026-08-13; `scripts/run_grid.sbatch`
+now takes `FREEZE` / `UNFROZEN`.
+
+`--unfrozen-epochs 0` never unfreezes, so it reproduces the frozen-embedding workflow **on
+these splits**. That is the only honest baseline for the fine-tuned arm — `pProp_MLP`'s
+numbers were measured on different data and a different partition, and cannot be quoted
+against these.
 
 ### The task is joint, and binary at pProp ≥ 3.5
 
@@ -296,24 +309,239 @@ That is also why `--batch-size` defaults to **1200**: ~11.4 positives per batch 
 agree. A `--weight-cap` is deliberately **not** implemented — add one only if the
 fold-to-fold spread on tail metrics turns out large.
 
-### Learning rates — two groups, cosine-annealed
+### Learning rates — one cosine per phase, three peaks
 
-`--head-lr 1e-3` / `--trunk-lr 1e-4`, both cosine-annealed over the full run to `--eta-min`
-(`--lr-schedule cosine`, default), matching `pProp_MLP`'s `CosineAnnealingLR(T_max=epochs,
-eta_min=1e-8)`.
+**Each phase anneals its own cosine, from its own peak down to `--eta-min` (1e-8).** Three
+peaks, because the head has one in each phase and the trunk exists only in the second:
+
+| knob | phase | default |
+|---|---|---|
+| `--head-lr` | 1 (head only) | 1e-3 |
+| `--head-lr-unfrozen` | 2 (trunk + head) | falls back to `--head-lr`; expected lower |
+| `--trunk-lr` | 2 only — it is 0 in phase 1 by construction | 1e-4 |
+
+The phases are **one trajectory, not two runs**: weights carry straight over, and phase 1's
+final weights *are* phase 2's initialization. What restarts at the boundary is the learning
+rate, deliberately — a warm restart inside a continuous run. So `e1` and `head_lr` matter
+almost entirely through the head they hand over, which is why phase 1's own val numbers are
+not a result (except at `--unfrozen-epochs 0`, where phase 1 is the whole run).
+
+Before 2026-08-13 a single cosine ran over the whole run, and the trunk unfroze into it
+already partly annealed — at freeze 5 / total 20 it *began* phase 2 at ~85% of `--trunk-lr`
+and fell from there, having "decayed" through five epochs in which its lr was pinned to 0.
+That was the head's schedule with a hole in it.
+
+**The denominator is `length - 1`, deliberately unlike torch.** `CosineAnnealingLR(T_max=N)`
+puts the last epoch at `t = (N-1)/N`, which never reaches `eta_min`: at N = 20 that is ~0.6%
+of base and passes for converged, but at N = 3 it is **25% of base** and does not. Phase
+lengths are swept down to 1, so the torch form would leave short phases ending hot.
+`t = (epoch-1)/(length-1)` lands the final epoch of every phase exactly on `eta_min`; a
+length-1 phase cannot anneal and stays at `base`. Measured (freeze 3 / unfrozen 5): head
+1.000e-3 → 5.000e-4 → **1e-8**, then restart 1.000e-3 → … → **1e-8**, trunk 1.000e-4 → …
+→ **1e-8**.
+
+The cost is that **the last epoch of a phase trains at ~zero lr**, which is what "settled"
+means but is pure waste at short lengths — a 2-epoch phase is a 1-epoch phase with a no-op
+appended (verified: identical val metrics at epochs 1 and 2 of a length-2 phase). Read
+`freeze_epochs = 2` in a sweep result as `1`.
+
+**The provenance triple does not cover this.** `objective_version`, `split_sha256` and
+`input_sha256` are all unchanged by the schedule rewrite, so a run from before 2026-08-13 and
+one from after pass every provenance filter and are still not comparable — they were trained
+under different schedule shapes. The fold-0 prototype in this file is the only such run, and
+it is quoted as a direction, not a number.
 
 **Annealing is load-bearing given final-epoch selection.** With no early stopping, the final
-epoch is what gets scored and saved; annealed to ~`eta_min` that is a settled model, whereas
-at a constant LR it is an arbitrary point on a still-moving trajectory. `pProp_MLP` measured
+epoch is what gets scored and saved; annealed to `eta_min` that is a settled model, whereas
+at a live LR it is an arbitrary point on a still-moving trajectory. `pProp_MLP` measured
 final-epoch selection as costing 0.003–0.005 of `goal_metric` (30/30 of its top-30 runs
-peaked earlier) — without annealing that figure would be a floor here, not an estimate.
+peaked earlier) — without annealing that figure would be a floor here, not an estimate. It
+applies to phase 1 too: at `--unfrozen-epochs 0` phase 1 is terminal, and the baseline has to
+be as settled as the arm it is compared against.
 
 The schedule is computed in closed form (`scheduled_lr`) rather than delegated to a torch
 scheduler, because a scheduler writes `group["lr"]` every step and would silently fight the
 freeze, which writes the same field. **`apply_lrs` is the single authority**, and it
 delegates the trunk to `set_trunk_trainable` so the freeze keeps exactly one implementation —
 which is also what keeps `verify_metrics.py`'s negative test meaningful, since that test
-neuters `set_trunk_trainable` and expects the run to die.
+neuters `set_trunk_trainable` and expects the run to die. `phase_bounds` is the one place the
+phase boundary is arithmetic rather than a comparison, so a schedule and a freeze cannot
+disagree about which epoch belongs to which phase.
+
+**AdamW state is not symmetric across the boundary.** Frozen params get no `.grad`, so AdamW
+never creates a state entry for them: at unfreeze the trunk starts at `step = 0` with zero
+moments, and bias correction makes its first step ≈ `trunk_lr` per coordinate regardless of
+gradient magnitude, while the head carries warm moments across. That is the mechanism a
+warmup at unfreeze would address. **Not implemented, on purpose** — the fold-0 prototype went
+val MSE 0.2430 → 0.1896 in the first unfrozen epoch at `trunk_lr 1e-4`, which is the opposite
+of a forgetting collapse. Mechanism identified, problem not observed; adding it now would buy
+a sweep dimension no measurement asks for.
+
+## One configuration = one wandb run — `src/run_config.py`
+
+`train.py` trains **one model**. `run_config.py` trains a **configuration** — every
+`(fold, seed)` pair — and logs all of them as a **single** wandb run.
+
+```bash
+python src/run_config.py --fold-list 0 1 2 3 4 --seed-list 0 1     # the full 5×2 grid
+python src/run_config.py --fold-list 0 --seed-list 0 --head-lr 3e-4  # one cheap trial
+python src/run_config.py --aggregate-only outputs/_no_sweep/<cid>    # log, do not train
+```
+
+Before this (2026-08-13) the 5×2 design produced **ten** wandb runs per configuration,
+separated only by tags, and nothing on wandb answered *which configuration is best* — comparing
+two meant eyeballing ten rows against ten others. Now the runs table has one row per
+configuration.
+
+What the run holds: per-model curves (`models/f{fold}s{seed}/val/*`), the across-model curve
+(`agg/val/{metric}_mean`, `_std`), a `wandb.Table` of every model's final epoch, pooled
+out-of-fold metrics (`pooled/*`), and the summary (`final/{metric}_{mean,std,min,max}`).
+Everything logged is also written to `<bucket>/aggregate.json`, so `WANDB_MODE=offline` loses
+nothing and the numbers can be checked without wandb in the loop.
+
+- **Models go through disk, deliberately.** Each is trained by calling `train.main()`
+  in-process with `--no-wandb`, then read back from the files it wrote — the same files
+  `pool_oof.py` scores. An in-memory path would be a second implementation that could drift
+  from the offline one. It also makes `--aggregate-only` free, which is what allows a SLURM
+  array to train the ten models in parallel and aggregate afterwards — the shape
+  `reports/compute_profile.md` says TamIA actually wants (whole-node, 4 GPUs, ≥1 h jobs).
+- **Ten trunks in one process is safe** only because `trunk.py` uses `OmegaConf.load` rather
+  than `hydra.initialize`. Hydra's once-per-process singleton would make this script
+  impossible; see NOTES §9 and the `trunk.py` docstring.
+- **`config_id`** is an 8-char hash of the hyperparameters — same construction as
+  `OBJECTIVE_VERSION` — and names the bucket `outputs/<sweep_id>/<config_id>/`. Fold and seed
+  lists, paths, `--subset` and `--num-workers` are excluded, so a cheap 1-model search trial
+  and the full 5×2 confirmation at the same hyperparameters **share a bucket**. A complete
+  model directory with a matching provenance triple is reused, not retrained (`--force`
+  overrides). That is why widening the grid at the winner costs only the models it adds — and
+  why `final/n_models` can exceed `len(fold_list) × len(seed_list)`: the bucket *is* the
+  configuration, so a cheap trial aggregates every model that configuration has ever trained.
+  `--subset` is part of the hash for the same reason — excluding it would let a full-data run
+  silently reuse smoke models, which the provenance triple cannot catch.
+- **Provenance is asserted.** All models must share the
+  `(objective_version, split_sha256, input_sha256)` triple, or the aggregate raises rather
+  than averaging incomparables — the same rule `pool_oof.group_key` enforces.
+- **`pooled/*` appears only when a seed holds all 5 folds** and they tile the dataset exactly
+  once. A partial set logs the mean and reports why it was not pooled; it never quietly pools
+  four folds.
+- Checkpoints are **off by default** here (`train.py --no-save-checkpoint`): `final.pt` is
+  34 MB, and 10 per trial across a 250-trial sweep is ~85 GB nothing reads. `--keep-checkpoints`
+  restores them. The predictions the pooled metrics need are ~2 MB and always written.
+
+**`scripts/run_grid.sbatch` is the old path** and still opens one wandb run per array task —
+that is the behaviour this replaces. To run the grid in parallel and still get one run, point
+the array at a shared bucket with `--no-wandb --out <bucket>/fold{F}_seed{S}`, then finish with
+`python src/run_config.py --aggregate-only <bucket>`. Not yet done; the sequential driver is
+what has been exercised.
+
+### The sweep — `sweeps/bayes_v1.yaml`
+
+wandb bayes, on TamIA (**`wandb agent` does work there** — confirmed 2026-08-13, superseding
+`reports/compute_profile.md`'s "a wandb sweep cannot run on TamIA", which is why this is wandb
+and not Optuna).
+
+```bash
+wandb sweep --project finetune_minimol --entity ethan_personal sweeps/bayes_v1.yaml
+python -m wandb agent ethan_personal/finetune_minimol/<sweep_id>
+```
+
+`program:` is **`src/run_config.py`**, so one trial is one configuration is one run.
+
+**The objective is `final/goal_metric_mean`** — the mean over models of each model's
+final-epoch `goal_metric`. Two things it is deliberately not:
+
+- **Not the best epoch.** `agg/val/goal_metric_mean` carries `summary="max"`; optimising that
+  would be early stopping on the same validation fold the run reports, exactly the bias the
+  fixed epoch budget exists to avoid. Both are logged so the gap stays visible.
+- **Not the pooled score**, though pooling is the more honest tail estimate (100 potent
+  molecules against 20 per fold). Pooling is *undefined* unless a seed holds all five folds,
+  so it would not exist for a cheap search trial. The mean is defined for any subset, which is
+  what lets search and confirmation share one sortable column. Report `pooled/*` from the
+  winner.
+
+`fold_list` / `seed_list` are **the cost dial**, pinned as parameters: `"0"` × `"0"` is one
+model per trial (~4 min on H100), `"0,1,2,3,4"` × `"0,1"` is the full grid (~40 min). Spell
+them as **comma-separated strings, not YAML lists** — a yaml list reaches the agent as
+`--fold_list=[0, 1]`, which the shell splits and argparse rejects.
+
+Swept: `freeze_epochs`, `unfrozen_epochs` (both `q_log_uniform_values`, integer), the three LR
+peaks, `weight_decay`, `dropout`, and the four loss terms. Deliberately not swept, each with
+its reason in the yaml: head shape (**blocked on the architecture question**), `batch_size`
+(1200 is argued twice over, and moving it would confound every LR axis), `weights`,
+`pprop-norm`, `eta_min`, `lr_schedule`.
+
+No `early_terminate`: hyperband prunes on the intermediate value, which systematically
+penalises long-anneal schedules — a 40-epoch cosine is far from its best at epoch 5 while an
+8-epoch one is nearly done. Schedule length is the axis being swept, so pruning on it would
+decide the sweep before it started.
+
+Three mechanical things the agent needs, all in `train.py` and reused by `run_config.py`:
+
+- **`dashed()`** rewrites `--head_lr=…` to `--head-lr=…`. The agent spells flags exactly as
+  the yaml spells its keys, i.e. underscored, and argparse does not accept an underscore
+  variant of a dashed option. Without it every agent-launched run dies on
+  `unrecognized arguments`.
+- **`sweep_int`** parses `"3.0"`. `q_log_uniform_values` quantizes as `q * round(x/q)` and
+  emits a float, so a plain `type=int` dies on every integer hyperparameter.
+- **`build_parser()`** exposes the parser so `run_config.mirror_train_arguments` can copy
+  every flag onto its own CLI. A hyperparameter added to `train.py` therefore reaches the
+  sweep with no second edit.
+
+**Reading the epoch result:** with final-epoch selection and full annealing, `goal_metric` is
+close to monotone in budget, so bayes will push `unfrozen_epochs` toward the top of its range.
+A winner sitting *on* the boundary means the range was the answer, not the sweep — widen and
+re-run rather than reporting convergence.
+
+### Deferred: layer-wise freeze/unfreeze
+
+**Not started. Noted 2026-08-13 from supervisor feedback; circle back before the sweep is
+specified.** The freeze is all-or-nothing today — `set_trunk_trainable` flips every tensor
+under `model.trunk` at once.
+
+The supervisor ranked the knobs as **(1) the freeze schedule, (2) *which* layers freeze and
+unfreeze, (3) learning rates, (4) total epochs** — the last of which he declined to bound at
+all ("ask the sweep, use `q_log_uniform`" — integer + log-spaced, which in Optuna is
+`suggest_int(..., log=True)`). So partial unfreezing outranks the LR values this repo has
+been tuning, and the one measurement on hand supports his #1: the fold-0 prototype unfroze
+after **3** frozen epochs with val Pearson still climbing (0.8037 → 0.8228), so 3 was too
+short. The default of **5 is untested** — that is the measurement to take first.
+
+The shape to build is gradual unfreezing (ULMFiT). `gnn.depth` is 16, plus `encoder_manager`,
+`pre_nn` and `pre_nn_edges`, so **"unfreeze the top *k* blocks" is one integer knob** rather
+than ~19 booleans — and one integer is sweepable.
+
+Two things make it real work rather than a flag flip:
+
+- **The optimizer ordering trap generalises badly.** `param_groups` (model.py:74) filters on
+  `requires_grad` at construction and *drops* empty groups, and `train.py:500` asserts the
+  group set is exactly `{trunk, head}`. Every per-layer group must be constructed **before**
+  any freezing, and that assertion must be widened rather than deleted — a silently-untrained
+  block with a healthy loss curve is precisely what it exists to catch.
+- **It must stay routed through `set_trunk_trainable`.** `verify_metrics.py` neuters that name
+  to prove the freeze assertion has teeth; a second write path to `group["lr"]` would make
+  that negative test pass while testing nothing.
+
+Ambiguous in the supervisor's guidance, and worth resolving with him before writing code:
+
+1. **Progressive or one-shot?** Unfreeze the top *k* at the handoff and hold that set for the
+   rest of the run, or unfreeze one block at a time on a cadence? These are different
+   mechanisms with different knobs (`k` versus a rate), and the sweep cost differs.
+2. **Binary freeze, or per-depth learning rates?** ULMFiT's other half is discriminative
+   fine-tuning — every block trains, with the LR decayed by a fixed factor per depth. That is
+   the soft version of the same idea and composes with the existing two-group optimizer far
+   more cheaply than N groups.
+3. **Where do the non-GNN modules sit on the depth axis?** `encoder_manager` (the positional
+   encoders), `pre_nn` and `pre_nn_edges` are not GNN layers. "Top *k*" presumes a linear
+   order; these sit structurally *below* layer 0, and `pre_nn_edges` is arguably on a separate
+   axis entirely — edge features rather than node depth. Always frozen, unfrozen last, or on
+   the same axis?
+4. **Does the frozen bottom ever unfreeze**, or stay frozen for the whole run?
+5. **How does this interact with the deliverable?** *If* the product is a pProp-specific 32-d
+   embedding (raised 2026-08-13, not yet confirmed with the supervisor — his head-sizing
+   advice assumed otherwise), then freezing 14 of 16 GNN blocks leaves the representation
+   mostly pretrained, which argues for unfreezing more; feature distortion (LP-FT, Kumar et
+   al. 2022) argues for less. That trade-off is a research question, not an implementation
+   detail.
 
 ### Metrics — `src/metrics.py`, `src/objective.py`
 
@@ -374,7 +602,7 @@ seed, 5 epochs, no tail metrics.
 
 ### Two ordering traps, both enforced in code
 
-- **Build the optimizer BEFORE freezing.** `param_groups` (model.py:69) filters on
+- **Build the optimizer BEFORE freezing.** `param_groups` (model.py:74) filters on
   `requires_grad` at construction and *drops* an empty group. Freeze first and you get a
   one-group optimizer; unfreezing then sets `requires_grad=True` on parameters the optimizer
   has never seen, so the trunk never trains — with no error and a healthy-looking loss curve.

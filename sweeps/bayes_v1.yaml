@@ -1,0 +1,179 @@
+# Bayesian hyperparameter sweep over the two-phase fine-tuning schedule.
+#
+#   wandb sweep --project finetune_minimol --entity ethan_personal sweeps/bayes_v1.yaml
+#   python -m wandb agent ethan_personal/finetune_minimol/<sweep_id>
+#
+# ONE TRIAL = ONE CONFIGURATION = ONE wandb RUN
+# ---------------------------------------------
+# The program is `src/run_config.py`, not `src/train.py`. It trains every (fold, seed) in
+# `fold_list` x `seed_list` and logs them as a *single* run: per-model curves, a per-model
+# table, the across-model mean and standard deviation, and the pooled out-of-fold tail
+# metrics. The runs table therefore gets one row per configuration, which is the only way
+# "which hyperparameters are best" has a sortable answer.
+#
+# `fold_list: [0]` / `seed_list: [0]` below is the CHEAP SEARCH setting -- one model per
+# trial, ~4 min on an H100. Widening to [0,1,2,3,4] x [0,1] makes every trial the full 5x2
+# grid (~40 min) and is a yaml edit, not a code change. The run *shape* is identical either
+# way, so a cheap search trial and a full confirmation are comparable rows in one table.
+#
+# WHAT IS BEING OPTIMISED
+# -----------------------
+# `final/goal_metric_mean` -- the mean over models of each model's FINAL-epoch goal_metric.
+#
+# NOT the best epoch: `agg/val/goal_metric_mean` carries `summary="max"`, and optimising
+# that would be early stopping on the same validation fold the run reports, which is exactly
+# the bias the fixed epoch budget exists to avoid. Both are logged so the gap stays visible.
+#
+# NOT the pooled out-of-fold score either, though it is the more honest tail estimate (100
+# potent molecules against 20 per fold): pooling is undefined unless a seed holds all five
+# folds, so it would not exist for a cheap search trial. It is logged as `pooled/*` whenever
+# it does exist, and it is the number to report from the winning configuration.
+#
+# The epoch budget is itself swept, so trials have different lengths. That is only sound
+# because selection is at the final epoch and both phases anneal to `--eta-min`: every
+# trial is scored on a settled model, whatever its budget.
+
+program: src/run_config.py
+method: bayes
+
+metric:
+  name: final/goal_metric_mean
+  goal: maximize
+
+# The interpreter must be the repo venv -- `python` on a TamIA compute node is not it.
+# `${args}` expands to one `--<key>=<value>` per swept parameter, spelled with underscores;
+# `train.py:dashed` normalises those to the dashed CLI, and `run_config.py` reuses it.
+# `--wandb-tags` is `nargs="*"`, so it goes LAST: anywhere earlier it would compete with
+# `${args}` for the tokens that follow it. Everything else is pinned in `parameters` rather
+# than written here, so each flag appears on the command line exactly once -- spelling one
+# in both places would leave argparse silently taking whichever came last.
+command:
+  - ${env}
+  - /home/ethan2/finetune_minimol/.venv/bin/python
+  - ${program}
+  - ${args}
+  - --wandb-tags
+  - sweep
+  - bayes_v1
+
+# No `early_terminate`. Hyperband prunes on the intermediate value, which systematically
+# penalises long-anneal schedules -- a 40-epoch cosine is far from its best at epoch 5 while
+# an 8-epoch one is nearly done. The schedule length is the axis being swept, so pruning on
+# it would decide the sweep before it started.
+
+parameters:
+
+  # -- which models each trial trains ------------------------------------------------------
+  # THE COST DIAL. [0] x [0] is one model per trial (~4 min); [0,1,2,3,4] x [0,1] is the full
+  # 5x2 grid (~40 min) and makes every trial a low-variance estimate over the whole dataset.
+  # Search cheap, confirm wide: re-run the winning configuration by hand with the full lists,
+  # which lands in the SAME output bucket (config_id ignores the fold and seed lists) and
+  # reuses the models already trained.
+  #
+  # SPELL THESE AS COMMA-SEPARATED STRINGS, NOT YAML LISTS. A yaml list reaches the agent as
+  # `--fold_list=[0, 1]`, which the shell splits into two tokens and argparse rejects with
+  # `unrecognized arguments: 1]`. A quoted string arrives as one token; `run_config.int_list`
+  # reads the integers out of it and also accepts `--fold-list 0 1` when typed by hand.
+  fold_list:
+    value: "0"
+  seed_list:
+    value: "0"
+
+  # -- the schedule: the supervisor's #1 and #2 priorities -----------------------------
+  # Log-spaced because 1 -> 2 epochs is a far bigger change than 20 -> 21. `q: 1` rounds to
+  # integers, and emits them as floats (3.0), which `train.py:sweep_int` accepts.
+  #
+  # NOTE ON READING THE RESULT: with final-epoch selection and full annealing,
+  # `goal_metric` is close to monotone in budget, so bayes will tend to push
+  # `unfrozen_epochs` toward the top of this range. If the winner sits ON the boundary, the
+  # range was the answer and not the sweep -- widen it and re-run rather than reporting
+  # convergence.
+  #
+  # AND ON READING SHORT PHASES: each phase anneals to `eta_min` on its LAST epoch, so that
+  # epoch trains at ~zero lr. A length-2 phase is therefore a length-1 phase with a no-op
+  # appended (verified: identical val metrics at both epochs). `freeze_epochs = 2` in a
+  # result means 1.
+  freeze_epochs:
+    distribution: q_log_uniform_values
+    min: 1
+    max: 10
+    q: 1
+  unfrozen_epochs:
+    distribution: q_log_uniform_values
+    min: 3
+    max: 40
+    q: 1
+
+  # -- learning rates: one peak per phase per group ------------------------------------
+  # Three, not two: the head has its own peak in each phase. `head_lr` is the phase-1 peak
+  # (a random head, so it can be large); `head_lr_unfrozen` is the phase-2 peak, restarted
+  # when the trunk unfreezes and expected lower. `trunk_lr` exists only in phase 2.
+  # Centred on the inherited pProp_MLP values (1e-3 head / 1e-4 trunk), widened a decade
+  # each way -- that transfer argument was made under a single full-run cosine, so it is
+  # weaker here and the range should not assume it.
+  head_lr:
+    distribution: log_uniform_values
+    min: 1.0e-4
+    max: 1.0e-2
+  head_lr_unfrozen:
+    distribution: log_uniform_values
+    min: 1.0e-5
+    max: 1.0e-3
+  trunk_lr:
+    distribution: log_uniform_values
+    min: 1.0e-6
+    max: 3.0e-4
+
+  # -- regularization -------------------------------------------------------------------
+  weight_decay:
+    distribution: log_uniform_values
+    min: 1.0e-4
+    max: 1.0e-1
+  dropout:
+    distribution: uniform
+    min: 0.0
+    max: 0.3
+
+  # -- loss term weights, in z-units ------------------------------------------------------
+  # Inherited from pProp_MLP's own sweep (w_cls 0.4418, w_pair 7.486, w_std 0.7911,
+  # huber_delta 1.0513) and re-swept around those points: they were tuned against a
+  # different pProp distribution, and only the fact that both are normalized targets makes
+  # them transfer at all. Huber's *weight* stays pinned at 1 -- it is the term anchoring the
+  # absolute pProp level, so the other three are measured against it (losses.py).
+  w_cls:
+    distribution: log_uniform_values
+    min: 0.05
+    max: 5.0
+  w_pair:
+    distribution: log_uniform_values
+    min: 1.0
+    max: 30.0
+  w_std:
+    distribution: log_uniform_values
+    min: 0.1
+    max: 3.0
+  huber_delta:
+    distribution: uniform
+    min: 0.5
+    max: 2.0
+
+  # -- DELIBERATELY NOT SWEPT -------------------------------------------------------------
+  # Every one of these is reachable from the CLI; each is fixed for a stated reason, and the
+  # reason is the thing to revisit, not the value.
+  #
+  #   head shape (n_layers, hidden_dim, cls_/reg_hidden_dim, cls_/reg_n_layers)
+  #       Open with the supervisor: whether the 32-d bottleneck is shared (one exportable
+  #       embedding) or per-head. Sweeping the shape before that is settled would optimise a
+  #       question that is still being asked. Add these once it is answered.
+  #   batch_size
+  #       1200 is argued twice over -- throughput (reports/compute_profile.md) and tail
+  #       variance (~11.4 positives per batch vs 2.4 at 256). Sweeping it would also change
+  #       the effective lr scale and confound every lr axis above.
+  #   weights, pprop_norm
+  #       `balanced` and `zscore` are settled decisions (CLAUDE.md), and both change what the
+  #       loss and the reported metrics *mean*, so a sweep over them compares incomparables.
+  #   eta_min, lr_schedule
+  #       1e-8 and `cosine` define the annealing that makes final-epoch selection valid.
+  #   fold, seed
+  #       Pinned above as constant `value` parameters. Varying them measures data and
+  #       optimisation variance, which is what the 5x2 grid is for.

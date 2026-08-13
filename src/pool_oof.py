@@ -142,6 +142,41 @@ def score_pooled(y, pooled):
     return m
 
 
+def pool_from_runs(runs, y_all, expect_folds=5):
+    """`{label: metrics}`, `{label: problems}` for already-loaded run dicts.
+
+    The body `main` used to hold inline, lifted so `run_config.py` can pool the grid it just
+    trained without re-scanning the directory it just wrote. Both callers therefore group by
+    the same `group_key` -- a seed, an arm and a provenance triple -- so an aggregate logged
+    at training time and an offline `pool_oof.py` run over the same directory cannot disagree.
+
+    `runs` is what `load_runs` returns. Groups that do not tile the dataset exactly once land
+    in `problems` and are never partially pooled.
+    """
+    n_rows = len(y_all)
+    groups = defaultdict(list)
+    for r in runs:
+        groups[group_key(r)].append(r)
+
+    results, skipped = {}, {}
+    for key, members in sorted(groups.items(), key=lambda kv: str(kv[0])):
+        seed, frozen, provenance = key
+        label = f"seed{seed}_{'frozen_baseline' if frozen else 'finetuned'}"
+
+        pooled, problems = pool_group(members, n_rows, expect_folds)
+        if problems:
+            skipped[label] = problems
+            continue
+
+        y = y_all[pooled["rows"]]
+        m = score_pooled(y, pooled)
+        m["n_tail"] = int((y >= TAIL_EDGE).sum())
+        m["objective_version"], m["split_sha256"], m["input_sha256"] = provenance
+        m["all_logits_saved"] = all(r["has_logits"] for r in members)
+        results[label] = m
+    return results, skipped
+
+
 def main(argv=None):
     args = parse_args(argv)
     y_all = pd.read_csv(args.csv, usecols=["pprop"])["pprop"].to_numpy(dtype=np.float64)
@@ -151,32 +186,14 @@ def main(argv=None):
     if not runs:
         raise SystemExit(f"no runs with saved predictions under {args.runs}")
 
-    groups = defaultdict(list)
-    for r in runs:
-        groups[group_key(r)].append(r)
+    n_groups = len({group_key(r) for r in runs})
+    print(f"{len(runs)} runs under {args.runs} in {n_groups} group(s)\n")
 
-    print(f"{len(runs)} runs under {args.runs} in {len(groups)} group(s)\n")
-
-    results, skipped = {}, {}
-    for key, members in sorted(groups.items(), key=lambda kv: str(kv[0])):
-        seed, frozen, provenance = key
-        arm = "frozen_baseline" if frozen else "finetuned"
-        label = f"seed{seed}_{arm}"
-
-        pooled, problems = pool_group(members, n_rows, args.expect_folds)
-        if problems:
-            skipped[label] = problems
-            print(f"[SKIP] {label}: " + "; ".join(problems))
-            continue
-
-        y = y_all[pooled["rows"]]
-        m = score_pooled(y, pooled)
-        m["n_tail"] = int((y >= TAIL_EDGE).sum())
-        m["objective_version"], m["split_sha256"], m["input_sha256"] = provenance
-        m["all_logits_saved"] = all(r["has_logits"] for r in members)
-        results[label] = m
-
-        print(f"[OK]   {label}: {len(pooled['rows']):,} rows, "
+    results, skipped = pool_from_runs(runs, y_all, args.expect_folds)
+    for label, problems in skipped.items():
+        print(f"[SKIP] {label}: " + "; ".join(problems))
+    for label, m in results.items():
+        print(f"[OK]   {label}: {n_rows:,} rows, "
               f"{m['n_positive']:,} at pProp>={PPROP_EDGE}, {m['n_tail']} at >={TAIL_EDGE}")
         print(f"         goal {m['goal_metric']:.4f} | ap {m['ap_uniform']:.4f} | "
               f"tail spearman {m['spearman_group_ge_e50']:.4f} | "

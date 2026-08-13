@@ -1,9 +1,14 @@
 """One training run: staged fine-tuning of MiniMol on the AmpC pProp task.
 
-One fold, one seed. The schedule is the experiment: the head trains alone on top of the
-frozen embedding for `--freeze-epochs`, then the trunk is unfrozen and both train together.
-The head is given a chance to stop being random before its gradients are allowed to reach
-10M pretrained parameters.
+One fold, one seed. The schedule is the experiment, and it has two phases with independent
+lengths: the head trains alone on the frozen embedding for `--freeze-epochs`, then the trunk
+is unfrozen and both train together for `--unfrozen-epochs`. The head is given a chance to
+stop being random before its gradients are allowed to reach 10M pretrained parameters.
+
+The two phases are one trajectory, not two runs -- the weights carry straight over, and
+phase 1's final weights *are* phase 2's initialization. What changes at the boundary is
+which parameters are free, and the learning rate, which restarts. **Each phase anneals its
+own cosine from its own peak down to `--eta-min`**; see `scheduled_lr`.
 
 The task is joint (`head.DualHead`): a **binary classifier at pProp >= 3.5** and a
 **regression on continuous pProp**, sharing one MLP over the 512-d embedding. 3.5 is the
@@ -12,12 +17,13 @@ positive class is still large enough to learn from -- 3,153 molecules, 619-643 p
 validation fold, against only 100 in the whole dataset at pProp >= 5.0.
 
     python src/train.py --fold 0 --seed 0
-    python src/train.py --epochs 2 --freeze-epochs 1 --subset 5000 --no-wandb   # smoke
-    python src/train.py --fold 0 --seed 0 --freeze-epochs 20                    # baseline
+    python src/train.py --freeze-epochs 1 --unfrozen-epochs 1 --subset 5000 --no-wandb
+    python src/train.py --fold 0 --seed 0 --freeze-epochs 20 --unfrozen-epochs 0
 
-The last form is the frozen-trunk baseline: `--freeze-epochs == --epochs` never unfreezes,
-so it reproduces the frozen-embedding workflow *on these splits*, which is the only honest
-comparison for the fine-tuned arm.
+The last form is the frozen-trunk baseline: `--unfrozen-epochs 0` never unfreezes, so it
+reproduces the frozen-embedding workflow *on these splits*, which is the only honest
+comparison for the fine-tuned arm. There is no `--epochs`; the total is
+`--freeze-epochs + --unfrozen-epochs`, derived in `main` and stamped into `meta.json`.
 
 THE LOSS
 --------
@@ -33,7 +39,7 @@ and vice versa.
 TWO ORDERING TRAPS, BOTH ENFORCED IN CODE
 -----------------------------------------
 `MiniMolRegressor.param_groups` filters on `p.requires_grad` at *construction* time and
-drops a group that comes back empty (model.py:69). So freezing the trunk before building
+drops a group that comes back empty (model.py:74). So freezing the trunk before building
 the optimizer yields a one-group optimizer, and unfreezing later sets `requires_grad = True`
 on parameters the optimizer has never heard of -- the trunk would never train, while every
 log line still looked healthy. The optimizer is therefore always built *before* the freeze,
@@ -96,7 +102,48 @@ PAIR_EVAL_K = 4096
 PAIR_EVAL_SEED = 12345
 
 
+def dashed(argv):
+    """Rewrite `--head_lr=1e-3` to `--head-lr=1e-3`, leaving values untouched.
+
+    A wandb sweep agent emits one `--<parameter>=<value>` per swept key, spelled exactly as
+    the sweep yaml spells it -- and yaml keys are the config keys, which are underscored.
+    argparse does *not* accept an underscore spelling of a dashed option, so without this
+    every agent-launched run dies on `unrecognized arguments`. Normalising here beats adding
+    a second option string to a dozen flags, and beats underscoring the CLI, which would
+    break every command in the docs.
+
+    Only the part before the first `=` is touched, so a value containing an underscore (a
+    path, a tag) survives. A bare `--foo_bar value` pair is handled too: the value is a
+    separate argv entry and never starts with `--`.
+    """
+    return [f"--{a[2:].split('=', 1)[0].replace('_', '-')}"
+            + (f"={a.split('=', 1)[1]}" if "=" in a else "")
+            if a.startswith("--") else a
+            for a in argv]
+
+
+def sweep_int(s):
+    """`int`, tolerating `"3.0"`.
+
+    wandb's `q_log_uniform_values` quantizes with `q * round(x / q)` and emits the result as
+    a float, so an integer hyperparameter arrives as `--freeze_epochs=3.0` and plain
+    `type=int` dies on it. Used for every integer that a sweep might touch.
+    """
+    return int(float(s))
+
+
 def parse_args(argv=None):
+    """Parse `train.py`'s CLI. See `build_parser` for the parser itself."""
+    return build_parser().parse_args(dashed(sys.argv[1:] if argv is None else list(argv)))
+
+
+def build_parser():
+    """The parser, separately from parsing.
+
+    `run_config.py` walks these actions to mirror every hyperparameter onto its own CLI, so
+    a flag added here reaches the sweep with no second edit. That is the only reason this is
+    split out -- returning a parser rather than a namespace is otherwise no better.
+    """
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--features", type=Path, default=Path("data/features/minimol_v1"))
@@ -106,24 +153,34 @@ def parse_args(argv=None):
     p.add_argument("--seed", type=int, default=0,
                    help="head init, dropout and shuffling only -- never the partition")
 
-    p.add_argument("--epochs", type=int, default=20)
-    p.add_argument("--freeze-epochs", type=int, default=5,
-                   help="epochs training the head alone before the trunk is unfrozen; "
-                        "set equal to --epochs for the frozen-trunk baseline")
+    # Two phase LENGTHS, not a total and a cut point. A bayes sweep samples its parameters
+    # independently, and (epochs, freeze_epochs) carries the cross-constraint
+    # `freeze_epochs <= epochs` -- every violating draw would die on a SystemExit mid-sweep.
+    # Two non-negative lengths have no such constraint. `args.epochs` is derived in `main`.
+    p.add_argument("--freeze-epochs", type=sweep_int, default=5,
+                   help="phase 1: epochs training the head alone on the frozen trunk")
+    p.add_argument("--unfrozen-epochs", type=sweep_int, default=15,
+                   help="phase 2: epochs training trunk and head together; "
+                        "0 never unfreezes, which is the frozen-trunk baseline")
 
     # Head shape as scalars, not a list: sweep drivers pass scalars, and a list-valued
     # hyperparameter has no natural representation in Optuna or a wandb sweep config.
-    p.add_argument("--n-layers", type=int, default=2, help="shared trunk depth (0 = none)")
-    p.add_argument("--hidden-dim", type=int, default=1024)
-    p.add_argument("--cls-n-layers", type=int, default=1)
-    p.add_argument("--cls-hidden-dim", type=int, default=256)
-    p.add_argument("--reg-n-layers", type=int, default=1)
-    p.add_argument("--reg-hidden-dim", type=int, default=256)
+    p.add_argument("--n-layers", type=sweep_int, default=2, help="shared trunk depth (0 = none)")
+    p.add_argument("--hidden-dim", type=sweep_int, default=1024)
+    p.add_argument("--cls-n-layers", type=sweep_int, default=1)
+    p.add_argument("--cls-hidden-dim", type=sweep_int, default=256)
+    p.add_argument("--reg-n-layers", type=sweep_int, default=1)
+    p.add_argument("--reg-hidden-dim", type=sweep_int, default=256)
     p.add_argument("--head-norm", default="layer", help="'layer', 'batch' or 'none'")
     p.add_argument("--dropout", type=float, default=0.0, help="head dropout")
 
-    p.add_argument("--head-lr", type=float, default=1e-3)
-    p.add_argument("--trunk-lr", type=float, default=1e-4)
+    p.add_argument("--head-lr", type=float, default=1e-3,
+                   help="head lr during phase 1 (the peak of the phase-1 cosine)")
+    p.add_argument("--head-lr-unfrozen", type=float, default=None,
+                   help="head lr during phase 2; defaults to --head-lr. The head is no "
+                        "longer random by then, so this is usually lower")
+    p.add_argument("--trunk-lr", type=float, default=1e-4,
+                   help="trunk lr during phase 2 (it is 0 by construction in phase 1)")
     p.add_argument("--lr-schedule", choices=("none", "cosine"), default="cosine")
     p.add_argument("--eta-min", type=float, default=1e-8,
                    help="cosine floor; 1e-8 matches the schedule these defaults came from")
@@ -132,7 +189,7 @@ def parse_args(argv=None):
     # fixed per-step overhead falling from 28% at 256 to ~9% at 1024) and tail variance
     # (~11.4 positives per batch instead of 2.4, so the up-weighted half of the loss is not
     # riding on two or three molecules). Both arguments point the same way.
-    p.add_argument("--batch-size", type=int, default=1200)
+    p.add_argument("--batch-size", type=sweep_int, default=1200)
     p.add_argument("--num-workers", type=int, default=16)
 
     p.add_argument("--weights", choices=("uniform", "balanced"), default="balanced",
@@ -159,7 +216,9 @@ def parse_args(argv=None):
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--no-assert-schedule", dest="assert_schedule", action="store_false",
                    help="skip the freeze/unfreeze weight-delta assertions (not advised)")
-    return p.parse_args(argv)
+    p.add_argument("--no-save-checkpoint", dest="save_checkpoint", action="store_false",
+                   help="skip final.pt (34 MB); predictions and meta.json are still written")
+    return p
 
 
 # -- data ---------------------------------------------------------------------------
@@ -221,27 +280,52 @@ def fold_weights(kind, y, train_idx, val_idx):
 
 # -- schedule -----------------------------------------------------------------------
 
-def scheduled_lr(base, epoch, cfg):
-    """Cosine-annealed learning rate for a 1-indexed epoch, or `base` if the schedule is off.
+def phase_bounds(epoch, cfg):
+    """`(epochs_before_this_phase, phase_length)` for a 1-indexed epoch.
 
-    `CosineAnnealingLR(T_max=epochs, eta_min=...)` in closed form, over the whole run --
-    matching `pProp_MLP/src/sweep_train.py`, which is where these LR and loss defaults come
-    from.
-
-    This is computed rather than delegated to a torch scheduler because a scheduler writes
-    `group["lr"]` on every step and would silently overwrite the freeze, which also writes
-    it. Two authorities over one field is exactly the class of bug the module docstring's
-    ordering traps are about, so there is one authority here: `apply_lrs`.
-
-    **Annealing matters more here than it did there**, because selection is at the final
-    epoch with no early stopping. With the LR annealed to ~`eta_min` the final epoch is a
-    settled model; at a constant LR it is an arbitrary point on a still-moving trajectory,
-    which would make pProp_MLP's measured 0.003-0.005 final-epoch selection penalty a floor
-    rather than an estimate.
+    Phase 1 is `[1, freeze_epochs]`, phase 2 is the rest. This is the only place the phase
+    boundary is arithmetic rather than a comparison, so a schedule and a freeze can never
+    disagree about which epoch belongs to which phase.
     """
-    if cfg.lr_schedule == "none" or cfg.epochs <= 1:
+    if epoch <= cfg.freeze_epochs:
+        return 0, cfg.freeze_epochs
+    return cfg.freeze_epochs, cfg.unfrozen_epochs
+
+
+def scheduled_lr(base, epoch, cfg):
+    """Cosine-annealed lr for a 1-indexed epoch, annealed **within its own phase**.
+
+    Each phase gets its own cosine from `base` down to `eta_min`, so the head restarts at
+    `--head-lr-unfrozen` when the trunk unfreezes rather than inheriting phase 1's decay.
+    Before this, one cosine ran over the whole run and the trunk unfroze into it already
+    partly annealed -- at freeze 5 / total 20 it began phase 2 at ~85% of
+    `--trunk-lr` and fell from there, having "decayed" through five epochs in which its lr
+    was pinned to 0. That was the head's schedule with a hole in it, not a trunk schedule.
+
+    **The denominator is `length - 1`, deliberately unlike `CosineAnnealingLR(T_max=N)`.**
+    Torch's form puts the last epoch at `t = (N-1)/N`, which never reaches `eta_min`: at
+    N=20 that is ~0.6% of base and looks like convergence, but at N=3 it is 25% of base and
+    is not. Phase lengths here are swept down to 1, so the torch form would leave short
+    phases ending at a high lr. `t = (epoch - 1) / (length - 1)` lands the final epoch of
+    every phase exactly on `eta_min`. A length-1 phase cannot anneal and returns `base`.
+
+    That matters because selection is at the final epoch with no early stopping: annealed to
+    `eta_min` the final epoch is a settled model, whereas at a live lr it is an arbitrary
+    point on a still-moving trajectory. It applies to phase 1 too -- with
+    `--unfrozen-epochs 0` (the frozen-trunk baseline) phase 1 *is* the terminal phase, and
+    the baseline has to be as settled as the arm it is compared against.
+
+    Computed in closed form rather than delegated to a torch scheduler because a scheduler
+    writes `group["lr"]` every step and would silently fight the freeze, which writes the
+    same field. Two authorities over one field is exactly the class of bug the module
+    docstring's ordering traps are about, so there is one authority here: `apply_lrs`.
+    """
+    if cfg.lr_schedule == "none":
         return base
-    t = (epoch - 1) / cfg.epochs
+    start, length = phase_bounds(epoch, cfg)
+    if length <= 1:
+        return base
+    t = (epoch - start - 1) / (length - 1)
     return cfg.eta_min + (base - cfg.eta_min) * (1 + math.cos(math.pi * t)) / 2
 
 
@@ -269,15 +353,20 @@ def apply_lrs(model, optimizer, epoch, cfg, trunk_trainable):
 
     Delegates the trunk to `set_trunk_trainable` rather than writing its lr directly, so the
     freeze keeps exactly one implementation.
+
+    The trunk's cosine is only *evaluated* once it is trainable: in phase 1 its schedule
+    would be read off the phase-1 clock, which is not its clock. It is 0 there instead, which
+    is also what `set_trunk_trainable` would write anyway.
     """
-    trunk_lr = scheduled_lr(cfg.trunk_lr, epoch, cfg)
+    trunk_lr = scheduled_lr(cfg.trunk_lr, epoch, cfg) if trunk_trainable else 0.0
     set_trunk_trainable(model, optimizer, trunk_trainable, trunk_lr)
 
-    head_lr = scheduled_lr(cfg.head_lr, epoch, cfg)
+    head_base = cfg.head_lr if epoch <= cfg.freeze_epochs else cfg.head_lr_unfrozen
+    head_lr = scheduled_lr(head_base, epoch, cfg)
     for group in optimizer.param_groups:
         if group.get("name") == "head":
             group["lr"] = head_lr
-    return {"head": head_lr, "trunk": trunk_lr if trunk_trainable else 0.0}
+    return {"head": head_lr, "trunk": trunk_lr}
 
 
 def probe_weights(model):
@@ -419,9 +508,19 @@ def log_prefixed(prefix, metrics):
 
 def main(argv=None):
     args = parse_args(argv)
-    if args.freeze_epochs > args.epochs:
-        raise SystemExit(f"--freeze-epochs {args.freeze_epochs} > --epochs {args.epochs}")
-    frozen_baseline = args.freeze_epochs == args.epochs
+    if args.freeze_epochs < 0 or args.unfrozen_epochs < 0:
+        raise SystemExit("--freeze-epochs and --unfrozen-epochs must both be >= 0")
+    # Derived, not supplied: see the note on the two phase lengths in `parse_args`. It is
+    # stamped into the wandb config and meta.json like any other setting, so the total is
+    # still recorded and still filterable.
+    args.epochs = args.freeze_epochs + args.unfrozen_epochs
+    if args.epochs < 1:
+        raise SystemExit("--freeze-epochs + --unfrozen-epochs must be >= 1")
+    frozen_baseline = args.unfrozen_epochs == 0
+    # Resolved here rather than at use, so the value that ran is the value provenance
+    # records -- a `null` in meta.json would be a config that cannot be replayed.
+    if args.head_lr_unfrozen is None:
+        args.head_lr_unfrozen = args.head_lr
 
     import os
     sweep_id = args.sweep_id or os.environ.get("WANDB_SWEEP_ID")
@@ -515,6 +614,12 @@ def main(argv=None):
                                                "pprop_edge": PPROP_EDGE,
                                                "train_ess": ess, **hardware()},
                          settings=wandb.Settings(start_method="thread"))
+        # These summaries are diagnostics -- the gap between `val/goal_metric.max` and the
+        # `final/*` keys written after the loop is exactly what final-epoch selection costs
+        # on this run. They are NOT the sweep objective: a bayes sweep optimising a `max`
+        # summary would be selecting the best epoch of each trial, i.e. early stopping on
+        # the validation fold it also reports, which is the bias the fixed epoch budget
+        # exists to avoid. `sweeps/*.yaml` optimises `final/goal_metric`.
         wandb.define_metric("val/goal_metric", summary="max")
         wandb.define_metric("val/ap_uniform", summary="max")
         wandb.define_metric("val/mse", summary="min")
@@ -598,14 +703,26 @@ def main(argv=None):
                     "trunk did not change after unfreezing. It is still effectively frozen "
                     "-- check that the optimizer holds a 'trunk' group.")
 
-    torch.save({"model_state": model.state_dict(),
-                "config": {k: (str(v) if isinstance(v, Path) else v)
-                           for k, v in vars(args).items() if not k.startswith("_")},
-                "norm_stats": norm_stats,
-                "objective_version": OBJECTIVE_VERSION,
-                "pprop_edge": PPROP_EDGE,
-                "val_goal_metric": val_metrics.get("goal_metric")},
-               out / "final.pt")
+    # The selected model is the FINAL epoch, so the number a sweep optimises has to be the
+    # final-epoch number. `run.summary` entries survive independently of the step-indexed
+    # history, so `final/goal_metric` is unambiguous no matter how many epochs a trial ran --
+    # which matters here because the epoch budget is itself swept.
+    if run is not None:
+        run.summary.update(log_prefixed("final", val_metrics))
+        run.summary["final/epoch"] = args.epochs
+
+    # 34 MB per model. A 250-trial sweep at 10 models a trial is ~85 GB of checkpoints that
+    # nothing reads, so `run_config.py` turns this off unless asked to keep them. The
+    # predictions below are what the pooled metrics actually need, and they are ~2 MB.
+    if args.save_checkpoint:
+        torch.save({"model_state": model.state_dict(),
+                    "config": {k: (str(v) if isinstance(v, Path) else v)
+                               for k, v in vars(args).items() if not k.startswith("_")},
+                    "norm_stats": norm_stats,
+                    "objective_version": OBJECTIVE_VERSION,
+                    "pprop_edge": PPROP_EDGE,
+                    "val_goal_metric": val_metrics.get("goal_metric")},
+                   out / "final.pt")
     # The substrate for pooled out-of-fold tail metrics (`src/pool_oof.py`). Predictions are
     # raw-scale so they need no norm_stats to interpret; the logits ride along because AP is
     # the classifier's metric and reconstructing it from the regression output would be a
@@ -651,8 +768,11 @@ def main(argv=None):
           f"{meta['total_minutes']:.1f} min")
     if run is not None:
         run.finish()
-    return 0
+    # The run directory, not an exit code: `run_config.py` trains a whole grid by calling this
+    # in-process and needs to know where each model landed. Failure is signalled by the
+    # SystemExit raisings above, never by a return value.
+    return out
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

@@ -37,7 +37,9 @@ def parse_args(argv=None):
 
 def load_runs(root):
     runs = []
-    for meta_path in sorted(root.glob("*/meta.json")):
+    # rglob, not glob: `run_config.py` nests a grid one level deeper, under the hyperparameter
+    # configuration it belongs to (outputs/<sweep_id>/<config_id>/<run_id>/meta.json).
+    for meta_path in sorted(root.rglob("meta.json")):
         meta = json.loads(meta_path.read_text())
         cfg, hw = meta.get("config", {}), meta.get("hardware", {})
         for h in meta["history"]:

@@ -19,11 +19,13 @@ DEFAULT_ROOT = "outputs"
 def resolve_run_dir(run_id, runs_dir=DEFAULT_ROOT):
     """Return the Path to `runs_dir`'s directory for `run_id`.
 
-    Prefers the nested layout `<runs_dir>/<sweep_id>/<run_id>`; falls back to the flat
-    `<runs_dir>/<run_id>`. Raises FileNotFoundError if neither exists.
+    Prefers a nested layout at any depth -- `<runs_dir>/<sweep_id>/<run_id>` and, since
+    `run_config.py` buckets a whole grid under one hyperparameter configuration,
+    `<runs_dir>/<sweep_id>/<config_id>/<run_id>`. Falls back to the flat `<runs_dir>/<run_id>`.
+    Raises FileNotFoundError if none exists.
     """
     runs_dir = Path(runs_dir)
-    hits = sorted(runs_dir.glob(f"*/{run_id}"))        # outputs/<sweep>/<run_id>
+    hits = sorted(p for p in runs_dir.rglob(str(run_id)) if p.is_dir())
     if hits:
         return hits[0]
     flat = runs_dir / run_id                           # pre-nesting fallback
