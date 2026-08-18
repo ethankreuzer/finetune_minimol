@@ -27,9 +27,10 @@ comparison for the fine-tuned arm. There is no `--epochs`; the total is
 
 THE LOSS
 --------
-`losses.combined_loss`: `w_cls * cls + huber + w_pair * pair + w_std * std`, with huber
-grounded at weight 1 as the only term anchoring the absolute pProp level. See `losses.py`
-for what changed in the port from `pProp_MLP` and why.
+`losses.combined_loss`: `w_cls * cls + huber + w_pair * pair + w_std * std + w_vic * vic`,
+with huber grounded at weight 1 as the only term anchoring the absolute pProp level. See
+`losses.py` for what changed in the port from `pProp_MLP` and why. `vic` regularises the
+exported 32-d bottleneck rather than the predictions and is **off by default**.
 
 `--weights` selects the per-sample weight vector, defaulting to `balanced` (two-group
 inverse frequency at pProp 3.5, a 104x ratio). **Weights are derived per fold, from that
@@ -80,8 +81,10 @@ from features import load_features                                          # no
 from head import DualHead                                                   # noqa: E402
 from losses import (PPROP_EDGE, binary_labels, build_sample_weights,         # noqa: E402
                     combined_loss, effective_sample_size, pairwise_distance_loss,
-                    std_match_loss, weighted_bce_loss, weighted_huber_loss)
-from metrics import enrichment_factor, flavoured_metrics, group_split_metrics  # noqa: E402
+                    std_match_loss, variance_covariance_loss, weighted_bce_loss,
+                    weighted_huber_loss)
+from metrics import (embedding_metrics, enrichment_factor, flavoured_metrics,  # noqa: E402
+                     group_split_metrics)
 from model import MiniMolRegressor                                          # noqa: E402
 from normalization import (NORM_STRATEGIES, compute_norm_stats,              # noqa: E402
                            denormalize_pprop, normalize_pprop)
@@ -167,9 +170,13 @@ def build_parser():
     # hyperparameter has no natural representation in Optuna or a wandb sweep config.
     p.add_argument("--n-layers", type=sweep_int, default=2, help="shared trunk depth (0 = none)")
     p.add_argument("--hidden-dim", type=sweep_int, default=1024)
-    p.add_argument("--cls-n-layers", type=sweep_int, default=1)
+    p.add_argument("--embed-dim", type=sweep_int, default=32,
+                   help="the exported bottleneck width; 32 is fixed by the downstream GP")
+    # 0 layers = a bare Linear on the bottleneck. Deliberate: it makes pProp linear in the
+    # exported embedding, which is the geometry a GP kernel wants. See head.DualHead.
+    p.add_argument("--cls-n-layers", type=sweep_int, default=0)
     p.add_argument("--cls-hidden-dim", type=sweep_int, default=256)
-    p.add_argument("--reg-n-layers", type=sweep_int, default=1)
+    p.add_argument("--reg-n-layers", type=sweep_int, default=0)
     p.add_argument("--reg-hidden-dim", type=sweep_int, default=256)
     p.add_argument("--head-norm", default="layer", help="'layer', 'batch' or 'none'")
     p.add_argument("--dropout", type=float, default=0.0, help="head dropout")
@@ -200,6 +207,13 @@ def build_parser():
     p.add_argument("--w-pair", type=float, default=7.486)
     p.add_argument("--w-std", type=float, default=0.7911)
     p.add_argument("--huber-delta", type=float, default=1.0513)
+    # Guards the exported bottleneck against collapsing onto a couple of directions.
+    # DEFAULT 0.0 = inert. `val/emb_effective_rank` is what decides whether to turn it on;
+    # shipping it disabled makes that a sweep value rather than a code change.
+    p.add_argument("--w-vic", type=float, default=0.0,
+                   help="weight on the variance/covariance term (0 = off)")
+    p.add_argument("--vic-gamma", type=float, default=1.0,
+                   help="target floor on each embedding dimension's std")
 
     p.add_argument("--subset", type=int, default=None,
                    help="use only N train and N val rows (smoke test)")
@@ -387,16 +401,20 @@ def train_one_epoch(model, loader, optimizer, device, cfg):
     multiplied.
     """
     model.train()
-    totals = {"loss": 0.0, "cls": 0.0, "huber": 0.0, "pair": 0.0, "std": 0.0}
+    totals = {"loss": 0.0, "cls": 0.0, "huber": 0.0, "pair": 0.0, "std": 0.0, "vic": 0.0}
     n_seen = 0
     for batch, y_norm, y_bin, w, _ in loader:
         batch = model.trunk.to_device(batch, device)
         y_norm, y_bin, w = y_norm.to(device), y_bin.to(device), w.to(device)
 
-        logits, pred = model(batch)
+        # `forward_with_embedding`, not `forward`: the variance/covariance term regularises
+        # the 32-d bottleneck, which `forward` discards. `z` is the exported artifact.
+        logits, pred, z = model.forward_with_embedding(batch)
         loss, terms = combined_loss(logits, pred, y_bin, y_norm, w,
                                     w_cls=cfg.w_cls, w_pair=cfg.w_pair,
-                                    w_std=cfg.w_std, huber_delta=cfg.huber_delta)
+                                    w_std=cfg.w_std, huber_delta=cfg.huber_delta,
+                                    embedding=z, w_vic=cfg.w_vic,
+                                    vic_gamma=cfg.vic_gamma)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -413,24 +431,41 @@ def train_one_epoch(model, loader, optimizer, device, cfg):
 
 @torch.no_grad()
 def predict(model, loader, device):
-    """Forward the whole loader. Returns normalized predictions, logits and row indices."""
+    """Forward the whole loader.
+
+    Returns normalized predictions, logits, row indices, and the `[N, embed_dim]` bottleneck.
+
+    The embeddings come out of the same pass rather than a second one: the trunk dominates
+    the cost, so re-running it just to collect `z` would roughly double evaluation time.
+    `model.eval()` makes dropout the identity, so this is exactly the vector an exported
+    model would emit for these molecules.
+    """
     model.eval()
-    preds, logits, rows = [], [], []
+    preds, logits, rows, embeddings = [], [], [], []
     for batch, _, _, _, idx in loader:
         batch = model.trunk.to_device(batch, device)
-        lo, pr = model(batch)
+        lo, pr, z = model.forward_with_embedding(batch)
         preds.append(pr.float().cpu().numpy())
         logits.append(lo.float().cpu().numpy())
         rows.append(idx.numpy())
-    return (np.concatenate(preds), np.concatenate(logits), np.concatenate(rows))
+        embeddings.append(z.float().cpu().numpy())
+    return (np.concatenate(preds), np.concatenate(logits), np.concatenate(rows),
+            np.concatenate(embeddings))
 
 
-def loss_terms_from_arrays(pred_norm, logits, y_norm, y_bin, w, cfg, device="cpu"):
-    """The four loss terms recomputed on a whole split, for reporting.
+def loss_terms_from_arrays(pred_norm, logits, y_norm, y_bin, w, cfg, device="cpu",
+                           embedding=None):
+    """The loss terms recomputed on a whole split, for reporting.
 
     `cls`, `huber` and `std` are exact and O(N). `pair` is O(N^2) so it is estimated on a
     fixed seeded subsample of `PAIR_EVAL_K` points -- fixed and seeded so the estimate is
     comparable across epochs and runs rather than adding its own noise to the curve.
+
+    `vic` is computed on the *same* subsample as `pair`, not on the whole split. That is not
+    a cost concern -- it is O(N*d^2) and would be cheap -- but a definitional one: the term
+    trains on batches of `--batch-size`, and its covariance estimate depends on the sample it
+    is measured over, so evaluating it on 66k rows would report a number the optimiser never
+    sees. Reusing the pair subsample keeps the reported value on a comparable footing.
     """
     t = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.float32, device=device)  # noqa: E731
     pred_t, logit_t, yn_t, yb_t, w_t = t(pred_norm), t(logits), t(y_norm), t(y_bin), t(w)
@@ -444,18 +479,29 @@ def loss_terms_from_arrays(pred_norm, logits, y_norm, y_bin, w, cfg, device="cpu
         huber = float(weighted_huber_loss(pred_t, yn_t, w_t, delta=cfg.huber_delta))
         pair = float(pairwise_distance_loss(pred_t[sub], yn_t[sub]))
         std = float(std_match_loss(pred_t, yn_t, w_t))
+        vic = (float(variance_covariance_loss(t(embedding)[sub], gamma=cfg.vic_gamma))
+               if embedding is not None else 0.0)
 
-    return {"cls": cls, "huber": huber, "pair": pair, "std": std,
-            "loss": cfg.w_cls * cls + huber + cfg.w_pair * pair + cfg.w_std * std,
-            "pair_eval_k": k}
+    out = {"cls": cls, "huber": huber, "pair": pair, "std": std,
+           "loss": (cfg.w_cls * cls + huber + cfg.w_pair * pair + cfg.w_std * std
+                    + cfg.w_vic * vic),
+           "pair_eval_k": k}
+    if embedding is not None:
+        out["vic"] = vic
+    return out
 
 
-def score_split(pred_norm, logits, rows, y_raw, w_loss, y_norm, cfg):
+def score_split(pred_norm, logits, rows, y_raw, w_loss, y_norm, cfg, embedding=None):
     """Every reported number for one split, on the raw pProp scale.
 
     Predictions are denormalized first -- see the module docstring. The weighting flavours
     are rebuilt here from *this split's* rows, so `balanced` reflects this fold's own group
     sizes rather than the dataset's.
+
+    `embedding` is the `[N, embed_dim]` bottleneck. It is optional so that `pool_oof.py` and
+    any other array-only consumer can still score a split without it, but when present it
+    contributes `emb_*` -- the only metrics here that score the exported artifact rather than
+    the predictions.
     """
     pred_raw = denormalize_pprop(pred_norm, cfg._norm_stats)
 
@@ -464,9 +510,11 @@ def score_split(pred_norm, logits, rows, y_raw, w_loss, y_norm, cfg):
     m.update(compute_objective(m))
     m.update(group_split_metrics(y_raw, pred_raw, group_edge=PPROP_EDGE))
     m.update(enrichment_factor(y_raw, logits))
+    if embedding is not None:
+        m.update(embedding_metrics(embedding))
     m.update(loss_terms_from_arrays(pred_norm, logits,
                                     y_norm[rows], binary_labels(y_raw, PPROP_EDGE),
-                                    w_loss[rows], cfg))
+                                    w_loss[rows], cfg, embedding=embedding))
     # Logged beside Pearson so a nan correlation is diagnosable rather than mysterious: a
     # model predicting a constant has zero variance and Pearson is undefined, which is a
     # real early-epoch possibility when 36% of rows sit below pProp 1.0.
@@ -583,6 +631,7 @@ def main(argv=None):
     model = MiniMolRegressor(
         MiniMolTrunk(),
         DualHead(hidden_dim=args.hidden_dim, n_layers=args.n_layers,
+                 embed_dim=args.embed_dim,
                  cls_hidden_dim=args.cls_hidden_dim, cls_n_layers=args.cls_n_layers,
                  reg_hidden_dim=args.reg_hidden_dim, reg_n_layers=args.reg_n_layers,
                  dropout=args.dropout, norm=args.head_norm),
@@ -646,9 +695,10 @@ def main(argv=None):
         train_secs = time.time() - started
 
         started = time.time()
-        val_pred_n, val_logits, val_rows = predict(model, val_loader, device)
+        val_pred_n, val_logits, val_rows, val_emb = predict(model, val_loader, device)
         val_metrics, val_pred_raw = score_split(val_pred_n, val_logits, val_rows,
-                                                y[val_rows], w, y_norm, args)
+                                                y[val_rows], w, y_norm, args,
+                                                embedding=val_emb)
         val_secs = time.time() - started
         peak_gb = (torch.cuda.max_memory_allocated() / 1e9) if device == "cuda" else 0.0
 
@@ -664,9 +714,9 @@ def main(argv=None):
         # selected model. Same throttle as pProp_MLP, for the same reason.
         if final:
             started = time.time()
-            tr_pred_n, tr_logits, tr_rows = predict(model, train_eval_loader, device)
+            tr_pred_n, tr_logits, tr_rows, tr_emb = predict(model, train_eval_loader, device)
             train_metrics, _ = score_split(tr_pred_n, tr_logits, tr_rows,
-                                           y[tr_rows], w, y_norm, args)
+                                           y[tr_rows], w, y_norm, args, embedding=tr_emb)
             row["train_eval_seconds"] = round(time.time() - started, 2)
             row.update(log_prefixed("train_eval", train_metrics))
 
@@ -730,6 +780,11 @@ def main(argv=None):
     np.save(out / "val_predictions.npy", val_pred_raw)
     np.save(out / "val_logits.npy", val_logits)
     np.save(out / "val_indices.npy", val_rows)
+    # The exported artifact itself, final-epoch, in the same row order as the three above.
+    # ~8 MB at [66296, 32] float32. This is what any downstream analysis of the embedding
+    # reads, and what makes `emb_effective_rank` checkable after the fact rather than only
+    # in the training log.
+    np.save(out / "val_embeddings.npy", val_emb.astype(np.float32))
 
     import graphium
     split_meta = load_meta(args.splits)

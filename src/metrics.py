@@ -253,6 +253,63 @@ def group_split_metrics(y_true_pprop, pred_pprop, group_edge=PPROP_EDGE):
     return out
 
 
+def embedding_metrics(embedding):
+    """Is the exported 32-d bottleneck actually 32-dimensional, or a scalar in 32 slots?
+
+    This is the only metric here that scores the *deliverable* rather than the predictions.
+    `head.DualHead`'s bottleneck is what gets deployed, frozen, as the input featurization for
+    a deep-kernel-learning GP; `goal_metric` says nothing about whether that vector is a
+    usable one.
+
+        emb_effective_rank  exp(entropy of the normalized covariance eigenvalues)
+        emb_top1_share      fraction of total variance on the single largest eigenvalue
+        emb_min_std         smallest per-dimension standard deviation
+
+    HOW TO READ `emb_effective_rank`. Eigenvalues of the d x d covariance measure how far the
+    molecules spread along each direction. Normalize them to sum to 1 and take exp(entropy):
+    one dominant eigenvalue gives ~1, all-equal gives d. So it answers "how many dimensions
+    are doing work" on the same scale as d itself, which plain matrix rank cannot -- a
+    dimension carrying pure numerical noise counts as full rank but contributes nothing.
+
+    For a 32-d export, roughly 15-25 is healthy. Around 2-4 is the predicted failure mode and
+    means the GP is receiving a restatement of predicted pProp: see
+    `losses.variance_covariance_loss`, which is the countermeasure and is disabled by default
+    until this number says otherwise. `emb_top1_share` near 1.0 is the same finding stated
+    more bluntly, and `emb_min_std` near 0 names a dimension that is simply dead.
+
+    Unsuffixed by design. The `_uniform`/`_balanced` flavour convention does not apply --
+    these describe the geometry of a representation, not performance under a reweighting of
+    the molecules, and there is no sense in which a covariance eigenspectrum is "balanced".
+    `group_split_metrics` and `enrichment_factor` set the precedent for self-describing keys.
+
+    Returns plain floats: `train.log_prefixed` silently drops anything else.
+    """
+    z = np.asarray(embedding, dtype=np.float64)
+    if z.ndim != 2 or z.shape[0] < 2 or z.shape[1] == 0:
+        return {"emb_effective_rank": np.nan, "emb_top1_share": np.nan,
+                "emb_min_std": np.nan, "emb_dim": int(z.shape[1]) if z.ndim == 2 else 0}
+
+    cov = np.cov(z, rowvar=False)
+    cov = np.atleast_2d(cov)
+    # eigvalsh, not eigvals: the covariance is symmetric, so this is both faster and free of
+    # the tiny imaginary parts the general solver returns and which would poison the entropy.
+    eigenvalues = np.linalg.eigvalsh(cov)
+    eigenvalues = np.clip(eigenvalues, 0.0, None)     # symmetric solver can emit -1e-18
+    total = eigenvalues.sum()
+
+    if total <= 0:                                    # every dimension constant
+        return {"emb_effective_rank": 1.0, "emb_top1_share": np.nan,
+                "emb_min_std": 0.0, "emb_dim": int(z.shape[1])}
+
+    p = eigenvalues / total
+    nonzero = p[p > 0]
+    entropy = float(-(nonzero * np.log(nonzero)).sum())
+    return {"emb_effective_rank": float(np.exp(entropy)),
+            "emb_top1_share": float(eigenvalues.max() / total),
+            "emb_min_std": float(np.sqrt(np.diag(cov)).min()),
+            "emb_dim": int(z.shape[1])}
+
+
 def enrichment_factor(y_true_pprop, scores, thresholds=EF_THRESHOLDS,
                       fractions=EF_FRACTIONS):
     """

@@ -9,7 +9,100 @@ on *why*; this file is authoritative on *what currently exists*.
 
 ---
 
-## State as of 2026-08-12
+## NEXT: what to run on rabelais
+
+**Nothing in the 2026-08-17/18 work has been run on real data.** It was written on a MacBook
+with no `.venv` and no `data/`, so only the parts that need neither (pure `torch.nn` shape and
+loss algebra, 17/17 checks) are verified. Everything below is unrun.
+
+```bash
+cd /home/ethan2/finetune_minimol && git pull
+VENV=/home/ethan2/finetune_minimol/.venv/bin/python
+```
+
+**1 — the two verification suites.** Fast, no training, and they gate everything else.
+
+```bash
+$VENV src/verify_trunk.py   -o verification.md            # expect 10/10
+$VENV src/verify_metrics.py -o verification_metrics.md    # expect 8/8
+```
+
+`verify_metrics` is the one at risk: the head was reshaped and a fifth loss term added, so its
+loss-parity check (`combined_loss` == exactly half `weighted_mse_loss`) and its freeze-assertion
+negative test are the checks that would catch a mistake. Parity was confirmed locally at
+`0.500000000000` with `w_vic=0`, but not against the real fixtures.
+
+**2 — smoke run.** Confirms the new artifact and metric appear at all.
+
+```bash
+$VENV src/train.py --freeze-epochs 1 --unfrozen-epochs 1 --subset 5000 --no-wandb
+```
+
+Check `val_embeddings.npy` exists at `[n_val, 32]` and `val/emb_effective_rank` is in
+`meta.json`'s `history`.
+
+**3 — THE MEASUREMENT. This is the point of the whole architecture change.**
+
+```bash
+$VENV src/train.py --fold 0 --seed 0
+```
+
+Read `emb_effective_rank` at the final epoch:
+
+| value | meaning | what to do |
+|---|---|---|
+| **15–25** | the architecture is sufficient on its own | leave `--w-vic 0`, go to step 5 |
+| **2–4** | the predicted collapse; the GP would receive a disguised scalar | do step 4 |
+
+Record the number here in CLAUDE.md either way — that is the repo convention, and this is the
+single most decision-relevant number outstanding.
+
+**4 — CONDITIONAL, only if step 3 comes back low.** A 1-D scan, not a sweep — see
+`reports/embedding_geometry.md` §9.2 for why `w_vic` cannot be swept against `goal_metric`.
+
+```bash
+for W in 0 0.003 0.01 0.03 0.1 0.3; do
+  $VENV src/train.py --fold 0 --seed 0 --w-vic $W --vic-gamma 0.5
+done
+```
+
+Note `--vic-gamma 0.5`, **not** the shipped default of 1.0 — see the open items below. Read off
+the `emb_effective_rank` vs `goal_metric` trade curve and pick a point on it.
+
+**5 — register the sweep.** Creates a real sweep on wandb.
+
+```bash
+wandb sweep --project finetune_minimol --entity ethan_personal sweeps/bayes_v2.yaml
+python -m wandb agent ethan_personal/finetune_minimol/<sweep_id>
+```
+
+**Do not do step 5 before step 3.** If the embedding collapses and `w_vic` must be non-zero,
+the loss changes and so does every `config_id` — a sweep launched first would be invalidated
+and its trials unusable. Steps 3–4 settle the architecture; the sweep explores hyperparameters
+within it.
+
+### Open items, deliberately not fixed
+
+Both are argued from measurement in `reports/embedding_geometry.md` §9. Neither is active
+today, because `--w-vic` defaults to `0.0`.
+
+1. **`--vic-gamma` defaults to 1.0 and should be 0.5.** Measured: a healthy bottleneck's
+   per-dimension std is **0.585** post-LayerNorm+GELU, so the `gamma=1.0` hinge fires
+   (`vic` = 0.421) even at effective rank 30.78/32. At 0.5 it reads 0.0057 — correctly inert —
+   and loses ~1% sensitivity at true collapse. Pass `--vic-gamma 0.5` explicitly until the
+   default is changed.
+2. **`sweeps/bayes_v2.yaml` calls `w_vic` "the most important axis in the file".** That is
+   wrong. `vic` trades prediction quality for embedding quality, so a sweep maximising
+   `goal_metric` drives it to 0 regardless of collapse. It is a constrained 1-D choice
+   (step 4), not a sweep axis.
+
+Also note: `run_config.py` forces `--no-save-checkpoint`, so **sweep trials leave no weights on
+disk.** The winning configuration must be re-run with `--keep-checkpoints` before anything can
+be exported to the downstream DKL project.
+
+---
+
+## State as of 2026-08-18
 
 | Piece | Status |
 |---|---|
@@ -25,7 +118,11 @@ on *why*; this file is authoritative on *what currently exists*.
 | Compute profile / benchmarks | **done** — `src/benchmark.py`, `reports/compute_profile.md` |
 | 5×2 grid runner / SLURM | `scripts/run_grid.sbatch` exists; sweep driver not started |
 | Config-level runner (1 config = 1 wandb run) | **done, verified 2026-08-13** — `src/run_config.py` |
-| Hyperparameter sweep (wandb bayes) | **config written 2026-08-13, not yet launched** — `sweeps/bayes_v1.yaml` |
+| Hyperparameter sweep (wandb bayes) | `bayes_v1` ran as test sweep `c63i6zoh` (6 of 9 trials finished). **`sweeps/bayes_v2.yaml` written 2026-08-17, not launched** |
+| pProp_MLP range transfer | **done, 2,247 runs analysed** — `reports/pprop_mlp_transfer.md`, `reports/pprop_mlp_transfer.py` |
+| 32-d embedding head (the deliverable) | **built 2026-08-17, 17/17 local checks; NOT yet run on real data** — `head.DualHead` |
+| Embedding geometry term (`--w-vic`) | **implemented, inert by default** — `losses.variance_covariance_loss`, `reports/embedding_geometry.md` |
+| `emb_effective_rank` on real data | **NOT MEASURED — this is the next thing to do.** See the runbook at the top |
 | Layer-wise freeze/unfreeze | **not started, deferred 2026-08-13** — see "Deferred: layer-wise freeze/unfreeze" |
 
 The trunk reproduces frozen MiniMol embeddings **exactly** (max|Δ| = 0.000e+00 over 64×512),
@@ -34,8 +131,7 @@ moves trunk weights. Two further tensors are unreachable inside graphium itself 
 rw_pos dead norm" below. `verification.md` reads `OVERALL: PASS`.
 
 Commit `c00bc4e` tracks the env (`pyproject.toml` + `uv.lock`), the trunk, the feature cache
-code and training, so `git clone` + `uv sync` reproduces on TamIA. Everything from the loss /
-metrics / objective port onward is still uncommitted.
+code and training, so `git clone` + `uv sync` reproduces on TamIA.
 
 ---
 
@@ -120,7 +216,7 @@ src/
 
   trunk.py / model.py / head.py      the trainable trunk, the two-group optimizer, DualHead
   train.py                           one fold, one seed  <- the entry point
-  losses.py                          4-term loss + the three weighting flavours
+  losses.py                          5-term loss (vic off by default) + the weighting flavours
   metrics.py                         AP / correlation / error / enrichment, all suffixed
   objective.py                       goal_metric + the derived OBJECTIVE_VERSION
   normalization.py                   --pprop-norm; ported verbatim
@@ -249,6 +345,62 @@ these splits**. That is the only honest baseline for the fine-tuned arm — `pPr
 numbers were measured on different data and a different partition, and cannot be quoted
 against these.
 
+### The deliverable is a 32-d embedding, not a predictive model
+
+**Settled 2026-08-17.** This repo produces a function `SMILES → R³²`, deployed **frozen** into
+a separate generative + active-learning project, where a **deep-kernel-learning GP** trains
+its own network on top of the 32-d input. MiniMol is never trained again downstream. Training
+happens here; there it is fixed.
+
+That inverts what "good" means. `goal_metric` scores the *predictions*, and the predictions
+are not the product — they are a training signal for the representation. Treat `goal_metric`
+as a proxy and `emb_*` as the thing being optimised.
+
+The head is `512 → 1024 → 1024 → **32** → {Linear(32→1) cls, Linear(32→1) reg}`, **1,611,938
+params** (measured). Three choices follow from the deliverable rather than from accuracy:
+
+- **The bottleneck is shared, not per-task.** The deliverable is one vector; a per-task
+  bottleneck would be shaped by a single objective, discarding the auxiliary-classifier
+  argument in `head.py` that is the classifier's whole justification.
+- **The task heads are linear** (`--cls-n-layers 0 --reg-n-layers 0`). This makes "pProp is
+  linear in the exported embedding" literally true, which is the geometry an RBF/Matérn kernel
+  wants. Deeper branches would likely score better on `goal_metric` while letting the
+  bottleneck encode the target in a shape a GP reads poorly.
+- **The export point is the output of `head.shared`** — post-LayerNorm, post-GELU, the exact
+  tensor the linear heads consume. Exporting the pre-activation would make the target
+  linear-*after*-GELU, which is not the property above. Dropout is identity under `eval()`.
+
+**The risk this design manages, and the number that decides it.** Regression and
+"pProp ≥ 3.5" are near-collinear — the same axis, the second with its gradient concentrated at
+the boundary — so the *supervised* signal reaching the bottleneck is close to rank-1, and
+weight decay shrinks whatever else the other ~30 dimensions might hold. The predicted failure
+is effective rank 2–4 of 32, which would hand the GP a disguised scalar: distance between
+molecules would reduce to difference in predicted pProp, so two unrelated compounds with equal
+predicted score become indistinguishable and the posterior variance stops tracking genuine
+ignorance — which is the entire mechanism active learning runs on.
+
+`val/emb_effective_rank` is therefore logged every epoch (`metrics.embedding_metrics`:
+`exp(entropy)` of the covariance eigenspectrum, so it reads on the same scale as 32).
+**Roughly 15–25 is healthy; 2–4 is the failure.** `val_embeddings.npy` is written per run so
+it is checkable after the fact. **Not yet measured — take this number first.**
+
+The countermeasure is `--w-vic`, a VICReg-style variance + covariance penalty on the `[B, 32]`
+matrix (`losses.variance_covariance_loss`). It adds no target; it forbids dimensions from
+being flat or duplicating each other, letting the trunk's own chemical variation occupy them.
+**Default 0.0 — inert**, so enabling it is a sweep value rather than a code change. Verified on
+synthetic geometry: 0.011 on isotropic 32-d, **14.4 on rank-1**.
+
+`emb_*` is deliberately **not** in `OBJECTIVE_SPEC` — adding it would re-stamp
+`OBJECTIVE_VERSION` and make every scored run un-poolable. It is a reported diagnostic, like
+`enrichment_factor`.
+
+**Not built yet:** `src/export.py`. Note the head is trivially portable but the trunk is not —
+reconstructing it needs graphium 2.4.7, the minimol 1.3.4 wheel, and `trunk.py`'s exact
+construction ordering, so the downstream project must vendor `trunk.py`/`head.py`/`model.py`
+or put this `src/` on `sys.path`. Also note `run_config.py` forces `--no-save-checkpoint`, so
+**sweep runs have no weights on disk** — the winning config must be re-run with
+`--keep-checkpoints` before anything can be exported.
+
 ### The task is joint, and binary at pProp ≥ 3.5
 
 `head.DualHead` puts a **classification logit** and a **regression scalar** on one shared MLP
@@ -264,8 +416,11 @@ existed solely to demote those 46 artifacts, has nothing left to do. It is porte
 ### The loss — `src/losses.py`
 
 ```
-loss = w_cls · cls  +  huber  +  w_pair · pair  +  w_std · std
+loss = w_cls · cls  +  huber  +  w_pair · pair  +  w_std · std  +  w_vic · vic
 ```
+
+`vic` is the bottleneck's anti-collapse term and is **off by default** (`--w-vic 0.0`) — see
+"The deliverable" above. The four terms below are the ones that were swept.
 
 Huber is **grounded at weight 1** — the only term anchoring the absolute pProp level, so the
 other three are measured against it and only its `delta` is swept. Three deliberate
@@ -536,12 +691,13 @@ Ambiguous in the supervisor's guidance, and worth resolving with him before writ
    axis entirely — edge features rather than node depth. Always frozen, unfrozen last, or on
    the same axis?
 4. **Does the frozen bottom ever unfreeze**, or stay frozen for the whole run?
-5. **How does this interact with the deliverable?** *If* the product is a pProp-specific 32-d
-   embedding (raised 2026-08-13, not yet confirmed with the supervisor — his head-sizing
-   advice assumed otherwise), then freezing 14 of 16 GNN blocks leaves the representation
-   mostly pretrained, which argues for unfreezing more; feature distortion (LP-FT, Kumar et
-   al. 2022) argues for less. That trade-off is a research question, not an implementation
-   detail.
+5. **How does this interact with the deliverable?** **Settled 2026-08-17 — the product IS a
+   pProp-specific 32-d embedding** (see "The deliverable" below). Freezing 14 of 16 GNN blocks
+   leaves the representation mostly pretrained, which argues for unfreezing more; feature
+   distortion (LP-FT, Kumar et al. 2022) and the fact that a generative loop will query novel
+   chemistry argue for less. That trade-off is a research question, not an implementation
+   detail — and it should be decided on `emb_*` over held-out clusters, not on `goal_metric`,
+   because `goal_metric` scores the predictions and the predictions are not the product.
 
 ### Metrics — `src/metrics.py`, `src/objective.py`
 
@@ -622,6 +778,8 @@ seed, 5 epochs, no tail metrics.
 - **The loss is weighted, defaulting to `balanced`** (`weighted_mse`, normalised by `w.sum()`
   so the loss scale does not move when a scheme is swapped in). Never replace it with a bare
   `.mean()` — see NOTES §1.
+- `val_embeddings.npy` (`[n_val, 32]`, ~8 MB) is written per run beside the predictions — the
+  exported artifact itself, final-epoch, in the same row order.
 - `val_predictions.npy` + `val_indices.npy` are written per run, so pooled out-of-fold tail
   metrics need no re-running.
 - Pearson is `nan` when predictions are constant; `val/pred_std` is logged beside it so that

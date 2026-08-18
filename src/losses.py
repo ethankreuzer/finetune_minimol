@@ -330,18 +330,78 @@ def std_match_loss(pred, target_pprop, sample_weights=None):
     return (wstd(pred) - wstd(target_pprop)) ** 2
 
 
+def variance_covariance_loss(embedding, gamma=1.0):
+    """Keep the exported bottleneck from collapsing onto a handful of directions.
+
+        L = mean_j relu(gamma - std(z_j))  +  mean_{i != j} cov(z)_{ij} ** 2
+
+    The variance and covariance halves of VICReg (Bardes, Ponce & LeCun, 2022), without its
+    invariance term -- there is no second view here, so the only job is non-degeneracy.
+
+    WHY THIS EXISTS. `head.DualHead`'s bottleneck is the artifact this repo ships, and the
+    only gradient reaching it comes from two near-collinear outputs: regression on pProp, and
+    classification at pProp >= 3.5, which is the same axis with its gradient concentrated at
+    the boundary. So the *supervised* signal is close to rank-1, nothing asks the remaining
+    ~30 dimensions to carry anything, and weight decay actively shrinks them. The predicted
+    failure is an embedding of effective rank 2-4 out of 32 -- a scalar in 32 slots.
+
+    That is fatal specifically for the downstream use. A deep-kernel-learning GP measures
+    molecule similarity by distance in this space; if 30 dimensions are flat, distance
+    degenerates into "difference in predicted pProp", so two structurally unrelated molecules
+    with equal predicted score become indistinguishable and the posterior variance stops
+    tracking genuine ignorance. Active learning is driven entirely by that variance.
+
+    This term adds no target. It forbids dimensions from being flat or from duplicating each
+    other, which lets the trunk's own chemical variation occupy them -- exactly the content a
+    kernel needs and pProp cannot supply.
+
+    Deliberately unweighted by `sample_weights`: this is a statement about the geometry of the
+    batch, not about the target distribution, and the class-balancing weights (104x) would
+    make the covariance estimate depend on a handful of tail molecules.
+
+    Cost is O(B * d^2) -- 1200 x 32^2 is ~1.2M multiply-adds, negligible beside the O(B^2)
+    pair term already in this loss.
+
+    `gamma` is the target floor on each dimension's standard deviation. With LayerNorm
+    immediately before the export point the natural scale is ~1, so 1.0 is the sensible
+    default rather than a tuned value.
+    """
+    z = embedding - embedding.mean(dim=0, keepdim=True)
+    n = z.shape[0]
+    if n < 2:                       # covariance is undefined; nothing to spread out
+        return z.sum() * 0.0        # keeps the graph connected, contributes nothing
+
+    std = torch.sqrt(z.var(dim=0, unbiased=True) + 1e-8)
+    variance = torch.relu(gamma - std).mean()
+
+    cov = (z.T @ z) / (n - 1)
+    off_diagonal = cov - torch.diag_embed(torch.diagonal(cov))
+    covariance = off_diagonal.pow(2).sum() / cov.shape[0]
+
+    return variance + covariance
+
+
 def combined_loss(logits, pred, target_binary, target_pprop, sample_weights,
-                  w_cls, w_pair, w_std, huber_delta):
-    """The four-term loss, and the per-term breakdown for logging.
+                  w_cls, w_pair, w_std, huber_delta, embedding=None, w_vic=0.0,
+                  vic_gamma=1.0):
+    """The five-term loss, and the per-term breakdown for logging.
 
-        loss = w_cls * cls + huber + w_pair * pair + w_std * std
+        loss = w_cls * cls + huber + w_pair * pair + w_std * std + w_vic * vic
 
-    Returns `(loss, terms)` where `terms` holds the four *unscaled* term values as floats.
+    Returns `(loss, terms)` where `terms` holds the *unscaled* term values as floats.
     Logging them unscaled is deliberate: it is the only way to see whether a swept weight
     is doing anything, since a term that has collapsed and a term whose weight is tiny look
     identical once multiplied.
 
-    `sample_weights` feeds `cls`, `huber` and `std`; `pair` is unweighted by design.
+    `sample_weights` feeds `cls`, `huber` and `std`; `pair` and `vic` are unweighted by
+    design, for different reasons -- see each function.
+
+    `w_vic` DEFAULTS TO 0.0, so the term is inert until switched on. That is the point: the
+    collapse it guards against is predicted but not yet measured here, and
+    `val/emb_effective_rank` is what decides whether to enable it. Shipping it disabled makes
+    that decision a sweep value rather than a code change plus a re-verification pass. It also
+    keeps the loss-parity check in `verify_metrics.py` meaningful -- with the other weights at
+    0 and a large `huber_delta`, this must still reduce to exactly half of `weighted_mse_loss`.
     """
     cls = weighted_bce_loss(logits, target_binary, sample_weights)
     huber = weighted_huber_loss(pred, target_pprop, sample_weights, delta=huber_delta)
@@ -351,4 +411,12 @@ def combined_loss(logits, pred, target_binary, target_pprop, sample_weights,
     loss = w_cls * cls + huber + w_pair * pair + w_std * std
     terms = {"cls": float(cls), "huber": float(huber),
              "pair": float(pair), "std": float(std)}
+
+    # Skipped entirely when there is no embedding to regularise, so callers that only have
+    # arrays (`train.loss_terms_from_arrays` on a split without saved embeddings) still work.
+    if embedding is not None:
+        vic = variance_covariance_loss(embedding, gamma=vic_gamma)
+        loss = loss + w_vic * vic
+        terms["vic"] = float(vic)
+
     return loss, terms

@@ -1,0 +1,53 @@
+{
+  "source_project": "ethan_personal/pprop-mlp-minimol-multitask",
+  "n_runs": 11784,
+  "runs_per_sweep": {
+    "9okf022y": 1441,
+    "j6z4dh1u": 877,
+    "nihehqst": 9466
+  },
+  "comparable_sweeps": [
+    "j6z4dh1u",
+    "9okf022y"
+  ],
+  "excluded_sweeps": [
+    "nihehqst"
+  ],
+  "columns": [
+    "run_id",
+    "sweep",
+    "state",
+    "created",
+    "pprop_norm",
+    "split_dir",
+    "seed",
+    "init_lr",
+    "epochs",
+    "batch_size",
+    "dropout",
+    "weight_decay",
+    "huber_delta",
+    "w_cls",
+    "w_pair",
+    "w_std",
+    "hidden_dim",
+    "n_layers",
+    "cls_hidden_dim",
+    "cls_n_layers",
+    "reg_hidden_dim",
+    "reg_n_layers",
+    "val/goal_metric",
+    "val/ap_star",
+    "val/pearson_star",
+    "val/mae_skill_star",
+    "val/pearson",
+    "val/weighted_mae"
+  ],
+  "argv": [
+    "reports/pprop_mlp_transfer.py",
+    "--fetch",
+    "--csv",
+    "reports/pprop_mlp_runs.csv"
+  ],
+  "git_commit": "591262a8e332efc52a5668cae7c47ea170562615"
+}

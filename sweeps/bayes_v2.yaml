@@ -1,0 +1,394 @@
+# Bayesian hyperparameter sweep over the two-phase fine-tuning schedule.
+#
+#   wandb sweep --project finetune_minimol --entity ethan_personal sweeps/bayes_v2.yaml
+#   python -m wandb agent ethan_personal/finetune_minimol/<sweep_id>
+#
+# WHAT CHANGED FROM bayes_v1, AND WHY
+# -----------------------------------
+# v1's ranges were built by centring on pProp_MLP's single best run (`zfs9n2ln`, goal_metric
+# 1.4483 -- the run whose four loss values are `train.py`'s defaults today) and widening a
+# decade each way. `reports/pprop_mlp_transfer.md` replaces that one-point prior with the
+# population behind it: 2,247 comparable runs from `pprop-mlp-minimol-multitask`.
+#
+# The result is 8 swept dimensions instead of 11, and four tightened ranges. Every change
+# below cites the measurement that motivated it; `reports/pprop_mlp_transfer.py` reprints
+# every one of those tables from `reports/pprop_mlp_runs.csv`.
+#
+# THE TRANSFER IS NOT UNIFORM, and the citations say which kind each is:
+#   - `head_lr` is a DIRECT regime match. Phase 1 here *is* pProp_MLP's setting -- a random
+#     head on a frozen 512-d MiniMol embedding, cosine to 1e-8, z-scored target, same loss.
+#   - the loss weights transfer in Z-UNITS only (NOTES §12.3), which is weaker.
+#   - `weight_decay`'s null result came from a FROZEN trunk and may simply not apply here.
+#     See the caveat on its pin below -- it is the least safe change in this file.
+# Nothing about `trunk_lr`, `head_lr_unfrozen` or the freeze schedule transfers at all;
+# those ranges are unchanged from v1 and remain this repo's own problem.
+#
+# ONE TRIAL = ONE CONFIGURATION = ONE wandb RUN
+# ---------------------------------------------
+# The program is `src/run_config.py`, not `src/train.py`. It trains every (fold, seed) in
+# `fold_list` x `seed_list` and logs them as a *single* run: per-model curves, a per-model
+# table, the across-model mean and standard deviation, and the pooled out-of-fold tail
+# metrics. The runs table therefore gets one row per configuration, which is the only way
+# "which hyperparameters are best" has a sortable answer.
+#
+# `fold_list` / `seed_list` below is the CHEAP SEARCH setting -- one model per trial, ~4 min
+# on an H100. Widening to "0,1,2,3,4" x "0,1" makes every trial the full 5x2 grid (~40 min)
+# and is a yaml edit, not a code change. The run *shape* is identical either way, so a cheap
+# search trial and a full confirmation are comparable rows in one table.
+#
+# WHAT IS BEING OPTIMISED
+# -----------------------
+# `final/goal_metric_mean` -- the mean over models of each model's FINAL-epoch goal_metric.
+#
+# NOT the best epoch: `agg/val/goal_metric_mean` carries `summary="max"`, and optimising
+# that would be early stopping on the same validation fold the run reports, which is exactly
+# the bias the fixed epoch budget exists to avoid. Both are logged so the gap stays visible.
+# pProp_MLP puts a number on that gap: over its top 20 runs, best-minus-final was a median
+# of 0.0019 (mean 0.0025, max 0.0065), and 20/20 peaked before their last epoch at a median
+# of 77% through the schedule. So the bias is real, small, and worth paying.
+#
+# NOT the pooled out-of-fold score either, though it is the more honest tail estimate (100
+# potent molecules against 20 per fold): pooling is undefined unless a seed holds all five
+# folds, so it would not exist for a cheap search trial. It is logged as `pooled/*` whenever
+# it does exist, and it is the number to report from the winning configuration.
+#
+# The epoch budget is itself swept, so trials have different lengths. That is only sound
+# because selection is at the final epoch and both phases anneal to `--eta-min`: every
+# trial is scored on a settled model, whatever its budget.
+
+program: src/run_config.py
+method: bayes
+
+metric:
+  name: final/goal_metric_mean
+  goal: maximize
+
+# The interpreter must be the repo venv -- `python` on a TamIA compute node is not it.
+# `${args}` expands to one `--<key>=<value>` per swept parameter, spelled with underscores;
+# `train.py:dashed` normalises those to the dashed CLI, and `run_config.py` reuses it.
+# `--wandb-tags` is `nargs="*"`, so it goes LAST: anywhere earlier it would compete with
+# `${args}` for the tokens that follow it. Everything else is pinned in `parameters` rather
+# than written here, so each flag appears on the command line exactly once -- spelling one
+# in both places would leave argparse silently taking whichever came last.
+command:
+  - ${env}
+  - /home/ethan2/finetune_minimol/.venv/bin/python
+  - ${program}
+  - ${args}
+  - --wandb-tags
+  - sweep
+  - bayes_v2
+
+# No `early_terminate`. Hyperband prunes on the intermediate value, which systematically
+# penalises long-anneal schedules -- a 40-epoch cosine is far from its best at epoch 5 while
+# an 8-epoch one is nearly done. The schedule length is the axis being swept, so pruning on
+# it would decide the sweep before it started. pProp_MLP's history confirms the premise: its
+# top runs peaked at a median of 77% through their schedule, so an intermediate value read
+# early is not a ranking signal.
+
+parameters:
+
+  # -- which models each trial trains ------------------------------------------------------
+  # THE COST DIAL. "0" x "0" is one model per trial (~4 min); "0,1,2,3,4" x "0,1" is the full
+  # 5x2 grid (~40 min) and makes every trial a low-variance estimate over the whole dataset.
+  # Search cheap, confirm wide: re-run the winning configuration by hand with the full lists,
+  # which lands in the SAME output bucket (config_id ignores the fold and seed lists) and
+  # reuses the models already trained.
+  #
+  # SPELL THESE AS COMMA-SEPARATED STRINGS, NOT YAML LISTS. A yaml list reaches the agent as
+  # `--fold_list=[0, 1]`, which the shell splits into two tokens and argparse rejects with
+  # `unrecognized arguments: 1]`. A quoted string arrives as one token; `run_config.int_list`
+  # reads the integers out of it and also accepts `--fold-list 0 1` when typed by hand.
+  fold_list:
+    value: "0"
+  seed_list:
+    value: "0"
+
+  # -- the schedule: the supervisor's #1 and #2 priorities -----------------------------
+  # Log-spaced because 1 -> 2 epochs is a far bigger change than 20 -> 21. `q: 1` rounds to
+  # integers, and emits them as floats (3.0), which `train.py:sweep_int` accepts.
+  #
+  # `unfrozen_epochs` UNCHANGED from v1 -- the two-phase structure has no pProp_MLP analog,
+  # so nothing transfers onto that axis. `freeze_epochs` is a different story: phase 1 IS
+  # pProp_MLP's regime, and its range moved 1-10 -> 2-30. See below.
+  #
+  # `freeze_epochs` MOVED 1-10 -> 3-20. Phase 1 trains a random head on a frozen MiniMol
+  # embedding, which is exactly what pProp_MLP did for its whole run, so "how long does that
+  # take" is measurable rather than a guess. Its `nihehqst` sweep is the only one that swept
+  # epochs down to 1 (the other two start at 20). Per phase length L, against that sweep's
+  # own best -- and note `effective` is L-1, because the last epoch of any phase anneals to
+  # `eta_min` and trains at ~zero lr:
+  #      L   effective    max    % of best    p95
+  #      1       0      -0.1554    -39%     -0.214
+  #      2       1       0.0005      0.1%   -0.206   <- one effective epoch, NO rank signal
+  #      3       2       0.1786     44.9%   -0.045
+  #      4       3       0.2601     65.4%    0.091
+  #      5       4       0.3323     83.5%    0.161
+  #     10       9       0.3593     90.3%    0.245
+  #     15      14       0.3683     92.6%    0.235
+  #     20      19       0.3124     78.5%    0.241
+  #     30      29       0.2681     67.4%    0.208
+  #
+  # READ THE p95 COLUMN, NOT max: these are bayes draws, so the run count and the quality of
+  # the other hyperparameters differ per L, and a single-run maximum is noisy. p95 rises to
+  # ~0.245 by L=10 and is flat to slightly declining thereafter.
+  #
+  # Hence BOTH bounds moved, in opposite directions from v1. The floor is 3 because L<=2 is
+  # measurably dead -- v1's floor of 1 was below the curve entirely. The ceiling is 20, not
+  # v1's 10 (short of saturation) and not 30 (past where p95 stops improving). The residual
+  # ~8% of draws at L=3 is deliberate: it keeps a probe on the short end so the sweep can
+  # still discover that a brief phase 1 suffices here, which is exactly what the
+  # counter-argument below predicts and what `nihehqst` cannot settle for a two-phase run.
+  #
+  # `nihehqst` is EXCLUDED from every other table in this file -- different objective
+  # revision, `split_6`, `pprop_norm=none`, and a goal_metric scale that does not overlap the
+  # others. It is admissible here because this reads the SHAPE within one sweep, never a
+  # level across sweeps. The structural match is good: each of those runs anneals a full
+  # cosine over its own length, so a 2-epoch run is a COMPLETE 2-epoch schedule rather than
+  # the first two epochs of a long one -- which is exactly how `scheduled_lr` treats phase 1.
+  #
+  # WHAT v1 ACTUALLY SAMPLED, which the log spacing makes non-obvious. Under
+  # `q_log_uniform_values` on [1, 10] the modal draw is 2 at 22.2%, with P(1) = 17.6%; and
+  # since a length-2 phase equals a length-1 phase, ~40% of v1 trials handed phase 2 a head
+  # trained for ONE effective epoch -- a head with no rank signal at all. Sampling mass for
+  # the candidate ranges, which is why 3-20 was chosen over the alternatives:
+  #     range    P(L<=2, dead)   P(L<=3, <=45%)   P(L>=10, saturated)
+  #     1-10  (v1)    39.8%           54.4%               2.2%
+  #     2-30           8.2%           20.7%              42.5%
+  #     3-20  (v2)     0.0%            8.1%              39.2%
+  #     4-20           0.0%            0.0%              46.3%
+  #
+  # COUNTER-ARGUMENT, recorded because it is not settled. Phase 1's job may be narrower than
+  # convergence: the head is not frozen afterwards -- it keeps training through phase 2 on a
+  # restarted cosine -- so phase 1 only has to make the head non-random enough that its
+  # gradient does not distort the pretrained features (LP-FT, Kumar et al. 2022). "Non-random"
+  # may need far fewer epochs than "converged", and the fold-0 prototype's first unfrozen
+  # epoch went val MSE 0.2430 -> 0.1896, which is the opposite of a distortion collapse. The
+  # range is deliberately wide enough to let the sweep answer this rather than assume it.
+  #
+  # WHY WIDENING IS CHEAP: a frozen epoch costs ~2x less than an unfrozen one (32 s vs 65 s,
+  # CLAUDE.md) because autograd builds no graph through the trunk. v1 was stingy on the cheap
+  # axis and generous on the expensive one, which is backwards.
+  #
+  # AND WHY YOU CANNOT SEE THIS IN A SINGLE RUN: phase 1 anneals to `eta_min` whatever its
+  # length, so its own curve ALWAYS plateaus and always looks converged. "Phase 1 was too
+  # short" is only visible by comparing across `freeze_epochs` values -- which is likely why
+  # the default of 5 has stayed untested despite being flagged as the first measurement to
+  # take. Do not read a flat phase-1 curve as evidence the phase was long enough.
+  #
+  # NOTE ON READING THE RESULT -- REVISED. v1 said `goal_metric` is "close to monotone in
+  # budget", so a winner on the boundary meant the range was too narrow and should be
+  # widened. pProp_MLP measured that premise and it does not hold. Best-achievable
+  # `goal_metric` by epoch budget: 20-35 -> 1.4463, 35-50 -> 1.4483, 50-70 -> 1.4468,
+  # 70-101 -> 1.4468. The CEILING IS FLAT. What rises with budget is the HIT RATE --
+  # P(within 0.005 of the global best) goes 0.7% -> 0.9% -> 0.5% -> 2.6%, and p90 goes
+  # 1.4329 -> 1.4385.
+  #
+  # So a longer schedule buys ROBUSTNESS, not a higher peak: it makes a given draw of the
+  # other hyperparameters more likely to land near the ceiling, rather than raising the
+  # ceiling. Read a winner pinned at `unfrozen_epochs = 40` as expected behaviour, NOT as
+  # evidence the range was the binding constraint. Widening to 80 would double per-trial
+  # cost for a ceiling pProp says is already reached. Widen only if the evidence is a
+  # *rising ceiling* across the range, which is a different observation and one this repo
+  # has not yet made for itself.
+  #
+  # AND ON READING SHORT PHASES: each phase anneals to `eta_min` on its LAST epoch, so that
+  # epoch trains at ~zero lr. A length-2 phase is therefore a length-1 phase with a no-op
+  # appended (verified: identical val metrics at both epochs). `freeze_epochs = 2` in a
+  # result means 1.
+  freeze_epochs:
+    distribution: q_log_uniform_values
+    min: 3
+    max: 20
+    q: 1
+  unfrozen_epochs:
+    distribution: q_log_uniform_values
+    min: 3
+    max: 40
+    q: 1
+
+  # -- learning rates: one peak per phase per group ------------------------------------
+  # Three, not two: the head has its own peak in each phase. `head_lr` is the phase-1 peak
+  # (a random head, so it can be large); `head_lr_unfrozen` is the phase-2 peak, restarted
+  # when the trunk unfreezes and expected lower. `trunk_lr` exists only in phase 2.
+  #
+  # `head_lr` NARROWED 1e-2 -> 3e-3, and this is the best-evidenced change in the file.
+  # Phase 1 is not merely *analogous* to pProp_MLP's setting, it IS that setting: a randomly
+  # initialised head reading a frozen 512-d MiniMol embedding, one cosine to eta_min 1e-8,
+  # z-scored target, same four-term loss. Its `init_lr` is therefore this exact knob.
+  # P(within 0.005 of the global best) over 2,247 runs, by band:
+  #     5e-5 - 1.5e-4   n=387   1.6%   p90 1.4368
+  #     1.5e-4 - 3e-4   n=385   2.6%   p90 1.4387
+  #     3e-4 - 6e-4     n=484   2.3%   p90 1.4395
+  #     6e-4 - 1.2e-3   n=498   0.2%   p90 1.4351
+  #     1.2e-3 - 3.1e-3 n=493   0.0%   p90 1.4276
+  # Zero of 493 runs above 1.2e-3 came near the best, and the p90 penalty there is 0.012 --
+  # roughly 6x the cost of final-epoch selection. Two independent sweeps agree. v1's decade
+  # from 1e-3 to 1e-2 was almost entirely dead range.
+  #
+  # WHY 3e-3 AND NOT THE 1.5e-3 THE TABLE IMPLIES -- two hedges, both deliberate. First, the
+  # regimes differ in schedule LENGTH: phase 1 here is 1-10 epochs against pProp_MLP's
+  # 20-100, and a short cosine can genuinely want a higher peak, which is the one way this
+  # otherwise-direct transfer could fail. Second, sweep c63i6zoh's best trial of six used
+  # head_lr 2.4e-3; n=6 is not evidence, but excluding your own current best on a borrowed
+  # prior is not a trade worth making. 3e-3 is also exactly where pProp_MLP's own search
+  # stopped -- both its sweeps declared `init_lr` max 0.003 -- so this ceiling sits on the
+  # edge of the evidence rather than past it.
+  #
+  # `head_lr_unfrozen` and `trunk_lr` UNCHANGED. Neither has a pProp_MLP analog -- there was
+  # no second phase and no trunk. One weak consistency check only: the head is warm rather
+  # than random at the phase-2 restart, so its peak should sit at or below `head_lr`, and
+  # this range already does.
+  head_lr:
+    distribution: log_uniform_values
+    min: 1.0e-4
+    max: 3.0e-3
+  head_lr_unfrozen:
+    distribution: log_uniform_values
+    min: 1.0e-5
+    max: 1.0e-3
+  trunk_lr:
+    distribution: log_uniform_values
+    min: 1.0e-6
+    max: 3.0e-4
+
+  # -- regularization -------------------------------------------------------------------
+  # `dropout` MOVED 0-0.3 -> 0.05-0.35. Both ends changed, for opposite reasons. The bottom:
+  # the <0.08 bin is the single worst region measured on any axis -- regret 0.0171 and p95
+  # 1.4263, against p95 ~1.443 everywhere above it. Near-zero dropout is not neutral, it is
+  # actively bad, and v1 sampled it. The top: pProp_MLP's best band ran 0.17-0.38, so v1's
+  # ceiling of 0.30 clipped good territory.
+  #
+  # NOTE this makes `train.py`'s `--dropout` default of 0.0 the worst value pProp_MLP ever
+  # measured. That default is deliberately NOT changed here -- moving a `train.py` default
+  # re-hashes every `config_id` and orphans the existing output buckets -- but it matters
+  # for any run driven by hand rather than by this sweep, the frozen baseline especially.
+  #
+  # CAVEAT on both: pProp_MLP's head carried the entire model (13.9M params against a frozen
+  # trunk), so it needed more regularisation than a head that is 2.1M params in front of a
+  # trainable 7.9M-param trunk. The floor at 0.05 is the safe part of this change; if the
+  # sweep pushes hard against it, that is a real signal and not a range artefact.
+  dropout:
+    distribution: uniform
+    min: 0.05
+    max: 0.35
+
+  # -- loss term weights, in z-units ------------------------------------------------------
+  # These transfer because both repos train huber/pair/std against a z-scored target
+  # (NOTES §12.3, `pProp_MLP/src/sweep_train.py:460-465`), so they are in z-units and survive
+  # the change of pProp distribution. That argument covers the loss terms only -- it says
+  # nothing about head size, which does NOT transfer.
+  #
+  # One confound checked rather than assumed. `batch_size` is pinned at 1200 here while
+  # pProp_MLP swept it 1000-10000, so a prior taken from its runs is only valid if these
+  # optima are batch-independent. Best-achievable `w_pair` rises with `w_pair` in all three
+  # batch bands (1000-1600 / 1600-2600 / 2600-10000) and the `init_lr` degradation above
+  # 5e-4 appears in all three too. Neither optimum moves with batch, so pinning the batch
+  # does not invalidate either transfer.
+  #
+  # `w_cls` NARROWED 5.0 -> 1.0. Bad only below ~0.014, then a plateau -- but the wider of
+  # the two pProp sweeps searched 0.1-4 and found Spearman -0.178 (p=1.1e-11) against
+  # goal_metric, i.e. the TOP of that range is actively harmful. Its top-5% sat at a median
+  # of 0.134. v1's 1.0-5.0 stretch is the region both sweeps rejected.
+  #
+  # `w_cls` IS THE WEAKEST OF THE THREE TRANSFERS and the one to distrust first: this repo's
+  # `cls` term is binary BCE where pProp_MLP's was 4-class CE. `losses.weighted_bce_loss`
+  # normalises by `sample_weights.sum()` specifically to preserve `w_cls`'s units across that
+  # change (verified equal to `CrossEntropyLoss(weight=...)` on 2 classes), but the class
+  # ratio is also 104x here against a scheme that retained 18.5% there. Units preserved,
+  # regime not.
+  #
+  # `w_pair` NARROWED 30.0 -> 10.0. The apparent "higher is better" is a plateau, not a
+  # trend: p95 is flat at 1.4424-1.4439 from w_pair 0.57 all the way to 10, and only the
+  # bottom two bins are genuinely bad (regret 0.0093 and 0.0068 below 0.215). 10 is also
+  # where pProp_MLP's search actually stopped, so v1's 10-30 was extrapolation past the
+  # evidence rather than a wider prior. The floor stays at 1.0, comfortably inside the
+  # plateau.
+  w_cls:
+    distribution: log_uniform_values
+    min: 0.05
+    max: 1.0
+  w_pair:
+    distribution: log_uniform_values
+    min: 1.0
+    max: 10.0
+
+  # -- PINNED THIS ROUND: three axes pProp_MLP measured as noise -------------------------
+  # Each was swept in v1 and is pinned here at its `train.py` default, so pinning changes no
+  # behaviour relative to a trial that happened to draw that value -- it only stops bayes
+  # spending trials on an axis with nothing to find. Max regret is the most `goal_metric` you
+  # give up by restricting to any single band of the axis; for scale, final-epoch selection
+  # alone costs 0.0019, so all three are at or below the noise floor.
+  #
+  #   huber_delta   max regret 0.0046 over 0.10 - 4.98   (816 runs, 8 bins)
+  #   w_std         max regret 0.0046 over 0.005 - 1.0
+  #   weight_decay  max regret 0.0045 over 1e-6 - 9.5e-2  -- flat across SIX decades
+  #
+  # `weight_decay` IS THE LEAST SAFE CHANGE IN THIS FILE, and it should be the first thing
+  # unpinned if the sweep disappoints. pProp_MLP's null result was measured with a FROZEN
+  # trunk, where weight decay reached only the head. Here it is the main thing restraining a
+  # 7.9M-parameter pretrained trunk from drifting off its initialisation, which is a
+  # mechanism its runs could not have observed at all. Reopen it if the trunk drifts far from
+  # its pretrained weights, if the frozen baseline (`--unfrozen-epochs 0`) matches or beats
+  # the fine-tuned arm, or if the winner's val/train gap widens with `unfrozen_epochs`. Note
+  # `MiniMolRegressor.param_groups` already accepts a separate `trunk_weight_decay`, which is
+  # the sharper knob if this does reopen -- it has no CLI flag yet.
+  #
+  # Pinned as constants rather than deleted so `config_id` still records them explicitly and
+  # a v1 run and a v2 run at the same values land in the same bucket.
+  huber_delta:
+    value: 1.0513
+  w_std:
+    value: 0.7911
+  weight_decay:
+    value: 0.01
+
+  # -- DELIBERATELY NOT SWEPT -------------------------------------------------------------
+  # Every one of these is reachable from the CLI; each is fixed for a stated reason, and the
+  # reason is the thing to revisit, not the value.
+  #
+  #   embed_dim
+  #       PINNED AT 32, and not a free parameter: the downstream deep-kernel-learning GP
+  #       expects a 32-d input. This is the artifact the repo ships, not a tuning knob.
+  #   cls_n_layers, reg_n_layers
+  #       PINNED AT 0, i.e. a bare Linear on the bottleneck. This makes pProp linear in the
+  #       exported embedding, which is the geometry an RBF/Matern kernel wants. Deeper
+  #       branches would likely score better on `goal_metric` while letting the bottleneck
+  #       encode the target in a shape a GP reads poorly -- and `goal_metric` is a proxy
+  #       here, not the product. Sweeping these means re-opening that trade deliberately.
+  #   head shape above the bottleneck (n_layers, hidden_dim)
+  #       NOW UNBLOCKED. v1 and the first draft of v2 deferred all head shape pending
+  #       "whether the 32-d bottleneck is shared (one exportable embedding) or per-head".
+  #       That question is ANSWERED (2026-08-17): the bottleneck is shared, because the
+  #       deliverable is one vector and a per-task bottleneck would be shaped by one
+  #       objective only. The stack ABOVE the bottleneck is now an ordinary sweep axis --
+  #       add `n_layers` and `hidden_dim` here when you want them, nothing blocks it.
+  #   w_vic
+  #       The variance/covariance penalty guarding the bottleneck against collapsing onto a
+  #       couple of directions (`losses.variance_covariance_loss`). Left at its default of
+  #       0.0 -- inert -- until `val/emb_effective_rank` says it is needed. If that number
+  #       comes back at 2-4 out of 32, this becomes the most important axis in the file;
+  #       if it comes back at 15-25, it stays off. Do not sweep it before reading it.
+  #
+  #       pProp_MLP wanted a BIG head -- regret 0.0132 at n_layers 1-2 and 0.0079 at
+  #       hidden_dim < 783, with its winner at 13.9M params, 1.76x the trunk. That does NOT
+  #       transfer (NOTES §12.3): it needed the capacity because the frozen embedding left
+  #       the MLP to do all the learning. It does carry one warning for THIS repo, though --
+  #       `--unfrozen-epochs 0` reproduces exactly that frozen regime, so the baseline run
+  #       inherits pProp_MLP's head-size sensitivity while using a 2,105,346-param head,
+  #       6.6x smaller than the one it tuned. See `reports/pprop_mlp_transfer.md` §7.
+  #   batch_size
+  #       1200 is argued twice over -- throughput (reports/compute_profile.md) and tail
+  #       variance (~11.4 positives per batch vs 2.4 at 256). Sweeping it would also change
+  #       the effective lr scale and confound every lr axis above. pProp_MLP independently
+  #       agrees on the value: flat best-achievable from 1000 to 3800, regret 0.0070 above.
+  #   weights, pprop_norm
+  #       `balanced` and `zscore` are settled decisions (CLAUDE.md), and both change what the
+  #       loss and the reported metrics *mean*, so a sweep over them compares incomparables.
+  #       pProp_MLP swept `pprop_norm` and preferred `zscore` (median 1.4283 vs 1.4211 for
+  #       `none`), which corroborates the settled choice without reopening it.
+  #   eta_min, lr_schedule
+  #       1e-8 and `cosine` define the annealing that makes final-epoch selection valid.
+  #   fold, seed
+  #       Pinned above as constant `value` parameters. Varying them measures data and
+  #       optimisation variance, which is what the 5x2 grid is for.
