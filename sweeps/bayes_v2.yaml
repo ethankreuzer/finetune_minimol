@@ -40,9 +40,17 @@
 # -----------------------
 # `final/goal_metric_mean` -- the mean over models of each model's FINAL-epoch goal_metric.
 #
-# NOT the best epoch: `agg/val/goal_metric_mean` carries `summary="max"`, and optimising
-# that would be early stopping on the same validation fold the run reports, which is exactly
-# the bias the fixed epoch budget exists to avoid. Both are logged so the gap stays visible.
+# NOT the best epoch: optimising the best epoch would be early stopping on the same
+# validation fold the run reports, which is exactly the bias the fixed epoch budget exists
+# to avoid.
+#
+# CORRECTION 2026-08-18. This used to read "`agg/val/goal_metric_mean` carries
+# `summary="max"` ... both are logged so the gap stays visible". That is NO LONGER TRUE:
+# `run_config.init_wandb` declares `summary="max"` on `final/goal_metric_mean` instead, and
+# the per-epoch aggregate no longer carries a max summary, so the best-epoch value is not
+# surfaced as a summary field. The per-epoch curve itself is still logged
+# (`agg/goal_metric_mean`), so the gap remains recoverable from the chart or from
+# `aggregate.json` -- it just is not one number in the runs table any more.
 # pProp_MLP puts a number on that gap: over its top 20 runs, best-minus-final was a median
 # of 0.0019 (mean 0.0025, max 0.0065), and 20/20 peaked before their last epoch at a median
 # of 77% through the schedule. So the bias is real, small, and worth paying.
@@ -103,6 +111,14 @@ parameters:
     value: "0"
   seed_list:
     value: "0"
+
+  # Pinned, not left to `--wandb-project`'s default. `run_config.init_wandb` calls
+  # `wandb.init(project=args.wandb_project)`, so if this disagrees with the project given to
+  # `wandb sweep` the sweep lives in one project while its runs land in another. That bit
+  # bayes_v1 on rabelais and is spelled out here so it cannot recur. It does not move
+  # `config_id`, which excludes every wandb argument.
+  wandb_project:
+    value: "finetune_minimol"
 
   # -- the schedule: the supervisor's #1 and #2 priorities -----------------------------
   # Log-spaced because 1 -> 2 epochs is a far bigger change than 20 -> 21. `q: 1` rounds to

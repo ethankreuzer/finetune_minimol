@@ -75,7 +75,7 @@ from train import dashed, sweep_int                                       # noqa
 # see one fold diverge from the others. `pred_std` is here because Pearson is nan when
 # predictions are constant, and this is what makes that diagnosable rather than mysterious.
 CURVE_METRICS = ("goal_metric", "ap_uniform", "pearson_uniform", "mae_uniform",
-                 "mse", "loss", "pred_std")
+                 "mse", "loss", "pred_std", "emb_effective_rank")
 
 # The run summary, as `final/<name>_{mean,std}`. Deliberately absent: `ap_star`, which is
 # *identical* to `ap_uniform` by definition (OBJECTIVE_SPEC); four of the six enrichment
@@ -89,7 +89,12 @@ SUMMARY_METRICS = (
     "mae_group_lt", "mae_group_ge", "pearson_group_ge", "spearman_group_ge",
     "ef_p3.5_top0.01", "ef_p5.0_top0.01",
     "pred_std",
-    "loss", "cls", "huber", "pair", "std",
+    "loss", "cls", "huber", "pair", "std", "vic",
+    # The deliverable, not the predictions. `goal_metric` says nothing about whether the
+    # exported 32-d vector is usable, so these have to survive the curation above or the
+    # one number the head was reshaped to produce never reaches wandb -- it would sit in
+    # aggregate.json only. See reports/embedding_geometry.md.
+    "emb_effective_rank", "emb_top1_share", "emb_min_std",
 )
 
 # Constants, not measurements: identical in every epoch of every run because they describe
@@ -97,7 +102,7 @@ SUMMARY_METRICS = (
 # four-way summary, which is where ~140 of the original ~380 keys went.
 CONSTANT_METRICS = ("n", "n_positive", "n_group_lt", "n_group_ge", "group_edge",
                     "base_rate_uniform", "base_rate_balanced",
-                    "mae_ref_uniform", "mae_ref_balanced", "pair_eval_k")
+                    "mae_ref_uniform", "mae_ref_balanced", "pair_eval_k", "emb_dim")
 
 # `train.py` flags the driver does not expose at all: it sets `--fold`, `--seed` and `--out`
 # per model, and owns the checkpoint decision through `--keep-checkpoints`.
