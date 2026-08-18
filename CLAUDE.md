@@ -92,9 +92,13 @@ form. Note `--vic-gamma 0.5`, **not** the shipped default of 1.0 — see the ope
 | 0.3 | 9.46 | 0.216 | 0.9882 | 0.8707 |
 
 **The scan does not reach the 15–25 target at any tested value.** Rank rises clearly only at
-0.1 and 0.3 (both trajectories had flattened by epoch 20, so these are settled values, not
-truncated climbs); 9.46 at `w_vic=0.3` is the best of the six and is roughly a 3.3× improvement
-over baseline, but is still well short of healthy. The four values from 0 to 0.03 do not form a
+0.1 and 0.3; 9.46 at `w_vic=0.3` is the best of the six and is roughly a 3.3× improvement
+over baseline, but is still well short of healthy. **These are not converged values** — at
+`w_vic=0.3` rank was still climbing at epoch 20 (8.85 → 9.11 → 9.32 → 9.39 → 9.46), and the
+apparent flattening is the cosine reaching `eta_min`, not convergence. (An earlier version of
+this file read that flattening as "settled values, not truncated climbs" — wrong, and it
+matters: **`unfrozen_epochs` is itself a rank lever**, and `bayes_v2` sweeps it 3–40, so 9.46
+is a floor at this budget rather than a ceiling on `w_vic=0.3`.) The four values from 0 to 0.03 do not form a
 monotone curve (2.85 → 2.53 → 3.32 → 2.25) — **confirmed as scatter, not signal**, by a seed-1
 check at `w_vic ∈ {0, 0.03}` (`outputs/wvic_scan/seed1_check/`): seed 1 gives rank **1.32** at
 `w_vic=0` and **1.33** at `w_vic=0.03` — indistinguishable from each other, and both below
@@ -115,20 +119,42 @@ with `w_vic` — which contradicts `reports/embedding_geometry.md` §7's predict
 decimals across all six runs; the entire spread in `goal_metric` is riding on `ap_uniform`,
 which is a tail metric over ~620 positives in one fold — noisy at this scale, per the same
 argument CLAUDE.md makes for pooling out-of-fold. Read this as "no detected cost within the
-noise of one fold/seed," not as "0.3 is free" — the latter invites pushing `w_vic` past the
-range `reports/embedding_geometry.md` §7 argues against (≥1, where the geometry term would
-outweigh the rest of the loss combined).
+noise of one fold/seed," not as "0.3 is free". Note also that `goal_metric` is the wrong
+instrument for this test: `pearson_uniform` moves only 0.002 across all six runs while
+`ap_uniform` spans 0.237–0.306, so a cost stated in `goal_metric` is unfalsifiable at this
+noise level. Use `pearson_uniform` with an explicit margin instead.
 
-**This reopens the architecture question rather than closing it.** `w_vic` alone, within the
-range the loss-balance argument permits, cannot lift a linear-head bottleneck from ~2.8 to
-15–25 — consistent with the mechanism (task heads read the embedding through one effectively
-1-D projection; a content-agnostic variance penalty is fighting weight decay for every other
-dimension). Untried levers, each a real decision rather than a default to reach for: lower
-weight decay (the thing actively shrinking the orthogonal directions), `--vic-gamma` above 0.5
-(0.5 was chosen to be inert at healthy rank, not to drive rank up), or accepting a lower target
-than 15–25 if 9–10 effective dimensions turns out to be enough for the downstream GP kernel —
-a question for the DKL project, not this one. **Step 5 should not run until one of these is
-chosen and re-measured.**
+**Why 0.3 was the top of the scan, and why that bound was wrong.** The range came from
+`reports/embedding_geometry.md` §7, which argued `w_vic ≥ 1` would let the geometry term
+outweigh the rest of the loss. **Measured, that is false by ~60×**: §7 estimated `vic ≈ 28` at
+collapse from *synthetic unit-scale rank-1* data, but real runs read `val/vic` = **0.409**
+(seed 0, `w_vic=0`), **0.537** (seed 1), 0.191 (`w_vic=0.3`). At the real operating scale
+`w_vic=1.0` contributes ~9% of a ~4.6 loss, not 600%, and at `w_vic=0.3` the term is ~1.2%.
+**`w_vic ∈ {1, 3, 10}` are legitimately testable and were never tried.**
+
+**This reopens the architecture question rather than closing it — but the loss is not yet
+exhausted.** Two mechanism claims that shaped the earlier reading have since been falsified,
+both recorded in `reports/embedding_collapse_experiment.md` §P6:
+
+- **Weight decay is not the collapse mechanism.** AdamW's decoupled decay shrinks by `lr·wd`
+  per step: head `1e-3 · 0.01 = 1e-5` over 4,420 steps = **4.3% total**; trunk **0.33%**
+  (cosine roughly halves both). A 2–4% shrink cannot erase 30 dimensions. The likelier
+  shrinker is **LayerNorm** — it normalises across the 32 dims *within each row*, so one
+  dominant pre-activation divides every other dim down, which is exactly the baseline std
+  profile (0.934 → 0.017). Earlier text here and in `losses.py` / `head.py` /
+  `embedding_geometry.md` §2 asserts the weight-decay mechanism; treat those as stale.
+- **The `vic` term is underpowered as a whole, not mis-balanced.** Its variance and covariance
+  halves measure comparably (ratio 1.3–2.4), and the variance hinge is **not** saturated —
+  28 of 32 dims sit below `gamma` even at `w_vic=0.3`. So the fix is more total force, not a
+  re-weighting of the two halves.
+
+Untried levers, in the order the evidence supports: **raise `w_vic` to 1–10** (the bound that
+forbade this is falsified), `--vic-gamma` above 0.5 but only where force is adequate (γ is a
+scale target, not a strength knob — it does not change the hinge's gradient), longer
+`unfrozen_epochs` (rank had not converged), or accepting a lower target than 15–25 if ~10
+effective dimensions is enough for the downstream GP — a question for the DKL project, not this
+one. `reports/embedding_collapse_experiment.md` is the replicated experiment that settles this.
+**Step 5 should not run until it does.**
 
 **5 — register the sweep.** Creates a real sweep on wandb.
 
@@ -144,8 +170,12 @@ within it.
 
 **Update 2026-08-18: step 4 ran and did not settle the architecture.** The scan above tops
 out at rank 9.46/32, short of the 15–25 target — see step 4's results. Step 5 is blocked, not
-on running step 4, but on choosing and re-measuring one of the untried levers step 4 surfaced
-(weight decay, `--vic-gamma`, or accepting a lower target).
+on running step 4, but on the replicated experiment in
+**`reports/embedding_collapse_experiment.md`**, which is the plan and progress log for settling
+the loss configuration. Its highest-value untried lever is simply **`w_vic` at 1–10**: the §7
+bound that forbade that range is falsified (see step 4's results). Weight decay is *not* on the
+list — it is arithmetically inert here (§P6.3) — which is exactly the kind of dead end the
+experiment exists to avoid re-running.
 
 ### Open items, deliberately not fixed
 
@@ -188,7 +218,8 @@ be exported to the downstream DKL project.
 | pProp_MLP range transfer | **done, 2,247 runs analysed** — `reports/pprop_mlp_transfer.md`, `reports/pprop_mlp_transfer.py` |
 | 32-d embedding head (the deliverable) | **built 2026-08-17, 17/17 local checks; NOT yet run on real data** — `head.DualHead` |
 | Embedding geometry term (`--w-vic`) | **implemented, inert by default** — `losses.variance_covariance_loss`, `reports/embedding_geometry.md` |
-| `emb_effective_rank` on real data | **Measured 2026-08-18: 2.78/32 at default. Step 4's `w_vic` scan (0–0.3) tops out at 9.46/32 — short of the 15–25 target, no measurable `goal_metric` cost. Architecture question reopened, step 5 blocked.** See the runbook at the top |
+| `emb_effective_rank` on real data | **Measured 2026-08-18: 2.78/32 at default. Step 4's `w_vic` scan (0–0.3) tops out at 9.46/32 — short of 15–25, no measurable `goal_metric` cost. Step 5 blocked.** The `w_vic ≤ 0.3` bound is falsified (real `vic` ≈ 0.41, not 28), so 1–10 is untried. See the runbook and **`reports/embedding_collapse_experiment.md`** |
+| Replicated loss experiment | **planned, not started 2026-08-18** — `reports/embedding_collapse_experiment.md` is the plan *and* the progress log; update its checkboxes as steps complete |
 | Layer-wise freeze/unfreeze | **not started, deferred 2026-08-13** — see "Deferred: layer-wise freeze/unfreeze" |
 
 The trunk reproduces frozen MiniMol embeddings **exactly** (max|Δ| = 0.000e+00 over 64×512),
@@ -439,7 +470,11 @@ params** (measured). Three choices follow from the deliverable rather than from 
 **The risk this design manages, and the number that decides it.** Regression and
 "pProp ≥ 3.5" are near-collinear — the same axis, the second with its gradient concentrated at
 the boundary — so the *supervised* signal reaching the bottleneck is close to rank-1, and
-weight decay shrinks whatever else the other ~30 dimensions might hold. The predicted failure
+nothing asks the other ~30 dimensions to carry anything. (This file used to say weight decay
+shrinks them. **Measured, it does not** — at `lr·wd = 1e-5` the head shrinks 4.3% and the trunk
+0.33% over a whole run. The likelier shrinker is LayerNorm, which normalises across the 32 dims
+within each row, so one dominant dimension divides the rest down. See
+`reports/embedding_collapse_experiment.md` §P6.3.) The predicted failure
 is effective rank 2–4 of 32, which would hand the GP a disguised scalar: distance between
 molecules would reduce to difference in predicted pProp, so two unrelated compounds with equal
 predicted score become indistinguishable and the posterior variance stops tracking genuine

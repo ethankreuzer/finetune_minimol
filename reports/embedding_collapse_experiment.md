@@ -31,7 +31,7 @@ VENV=/home/ethan2/finetune_minimol/.venv/bin/python
 | P4 | `w_vic` scan, 6 values | `[x]` | tops out at **9.46/32**, no measurable `goal_metric` cost |
 | P5 | Seed-1 discriminator | `[x]` | low-`w_vic` scatter is **noise**; baseline as bad as **1.32** |
 | P6 | Zero-GPU forensics (4 findings) | `[x]` | **§7 ceiling falsified; weight decay is not the mechanism** |
-| S0 | Stage 0 — doc corrections + code | `[ ]` | — |
+| S0 | Stage 0 — doc corrections + code | `[~]` | S0.1 `CLAUDE.md` corrected; docstrings + code pending |
 | S1 | Stage 1 — the screen (24 runs) | `[ ]` | — |
 | S2 | Stage 2 — dose / refine (16 runs) | `[ ]` | — |
 | S3 | Stage 3 — transferability (12 runs) | `[ ]` | — |
@@ -190,16 +190,23 @@ at seed-1 baseline is the "disguised scalar" failure stated numerically.
 
 ## `[ ]` S0 — Stage 0: corrections and code (no GPU, ~1 h)
 
-- `[ ]` **S0.1 Record P6 in `CLAUDE.md` and correct three stale claims.** Do this first — these
-  are results in their own right and two contradict the repo.
-  - `reports/embedding_geometry.md` §7 — the `w_vic ≤ 0.3` ceiling (falsified by P6.1).
-  - The weight-decay mechanism claim in `CLAUDE.md`, `src/losses.py`
-    (`variance_covariance_loss` docstring), `src/head.py`, and `embedding_geometry.md` §2
-    (falsified by P6.3).
-  - `CLAUDE.md`'s line that the 0.1/0.3 trajectories "had flattened by epoch 20, so these are
-    settled values, not truncated climbs". They were still climbing (8.85 → 9.11 → 9.32 → 9.39
-    → 9.46); the flattening is the **cosine reaching `eta_min`**, not convergence.
-    **`unfrozen_epochs` is itself a rank lever**, and `bayes_v2` sweeps it 3–40.
+- `[~]` **S0.1 Record P6 and correct the stale claims.** `CLAUDE.md` **done 2026-08-18**; the
+  source-file docstrings remain.
+  - `[x]` `CLAUDE.md` — all three claims corrected: the falsified §7 `w_vic ≤ 0.3` ceiling
+    (now states real `vic` ≈ 0.41 vs the synthetic 28, and that 1–10 is untried), the
+    weight-decay mechanism (now gives the 4.3% / 0.33% arithmetic and names LayerNorm as the
+    likelier shrinker, in both the step-4 section and "The risk this design manages"), and the
+    "settled values, not truncated climbs" line (now states rank was still climbing at epoch 20
+    and that `unfrozen_epochs` is itself a rank lever). Also added: `pearson_uniform` is the
+    right damage instrument, not `goal_metric`; the state table points here.
+  - `[ ]` `src/losses.py` — `variance_covariance_loss` docstring asserts "weight decay actively
+    shrinks them".
+  - `[ ]` `src/head.py` — same claim in the `DualHead` docstring.
+  - `[ ]` `reports/embedding_geometry.md` §2 (weight-decay mechanism) and §7 (the `w_vic ≤ 0.3`
+    ceiling, and its "expect a visible `goal_metric` cost at 0.3" prediction).
+
+  Deferred deliberately: the three source files are touched by S0.2 anyway, so correcting the
+  docstrings in the same commit as the `--w-cov` change keeps one reviewable diff per file.
 
 - `[ ]` **S0.2 Two CLI flags, in ONE commit.** Every new `train.py` flag re-hashes every
   `config_id` (`run_config.mirror_train_arguments` copies the whole parser), so all CLI
