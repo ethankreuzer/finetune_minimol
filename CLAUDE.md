@@ -57,17 +57,78 @@ Read `emb_effective_rank` at the final epoch:
 Record the number here in CLAUDE.md either way — that is the repo convention, and this is the
 single most decision-relevant number outstanding.
 
+**Measured 2026-08-18, fold 0 seed 0, full 20-epoch run (5 frozen + 15 unfrozen), default
+architecture (`--w-vic 0`):** final `val/emb_effective_rank` = **2.78** (of 32), `emb_top1_share`
+= 0.633, `emb_min_std` = 0.0128. Per-epoch: 1.74 → 2.31 → 2.07 → 2.98 → 2.97 (freeze boundary) →
+1.40 → 1.66 → 1.80 → 1.95 → 2.00 → 2.16 → 2.31 → 2.51 → 2.63 → 2.76 → 2.77 → 2.82 → 2.80 → 2.78 →
+2.78. Final `val goal_metric` 0.9707. **This is the predicted collapse, not the healthy range —
+step 4 is required.** Run at `outputs/_no_sweep/fold0_seed0/`
+(`objective_version v1-binary3.5-c917327f`, `split_sha256 3ef97e78a85d…`).
+
 **4 — CONDITIONAL, only if step 3 comes back low.** A 1-D scan, not a sweep — see
 `reports/embedding_geometry.md` §9.2 for why `w_vic` cannot be swept against `goal_metric`.
 
 ```bash
 for W in 0 0.003 0.01 0.03 0.1 0.3; do
-  $VENV src/train.py --fold 0 --seed 0 --w-vic $W --vic-gamma 0.5
+  $VENV src/train.py --fold 0 --seed 0 --w-vic $W --vic-gamma 0.5 --out outputs/wvic_scan/w${W//./_}
 done
 ```
 
-Note `--vic-gamma 0.5`, **not** the shipped default of 1.0 — see the open items below. Read off
-the `emb_effective_rank` vs `goal_metric` trade curve and pick a point on it.
+**`--out` is not optional here** — without it every value in the loop writes to the same default
+directory (`outputs/_no_sweep/fold0_seed0`) and each run clobbers the last, so only the final
+value's artifacts survive. Discovered running this scan 2026-08-18; the loop above is the fixed
+form. Note `--vic-gamma 0.5`, **not** the shipped default of 1.0 — see the open items below.
+
+**Measured 2026-08-18, fold 0 seed 0, full 20-epoch runs, all six `--w-vic` values**
+(`--vic-gamma 0.5`, `outputs/wvic_scan/`):
+
+| `w_vic` | `emb_effective_rank` | `emb_top1_share` | `goal_metric` | `pearson_uniform` |
+|---|---|---|---|---|
+| 0 | 2.85 | 0.624 | 0.9598 | 0.8706 |
+| 0.003 | 2.53 | 0.664 | 0.9860 | 0.8710 |
+| 0.01 | 3.32 | 0.549 | 0.9609 | 0.8705 |
+| 0.03 | 2.25 | 0.685 | 1.0065 | 0.8703 |
+| 0.1 | 4.35 | 0.421 | 0.9851 | 0.8710 |
+| 0.3 | 9.46 | 0.216 | 0.9882 | 0.8707 |
+
+**The scan does not reach the 15–25 target at any tested value.** Rank rises clearly only at
+0.1 and 0.3 (both trajectories had flattened by epoch 20, so these are settled values, not
+truncated climbs); 9.46 at `w_vic=0.3` is the best of the six and is roughly a 3.3× improvement
+over baseline, but is still well short of healthy. The four values from 0 to 0.03 do not form a
+monotone curve (2.85 → 2.53 → 3.32 → 2.25) — **confirmed as scatter, not signal**, by a seed-1
+check at `w_vic ∈ {0, 0.03}` (`outputs/wvic_scan/seed1_check/`): seed 1 gives rank **1.32** at
+`w_vic=0` and **1.33** at `w_vic=0.03` — indistinguishable from each other, and both below
+seed 0's numbers for the same two settings. Seed-to-seed spread (1.32–2.85) exceeds the
+apparent `w_vic` effect across 0–0.03 within a seed, so that part of the curve carries no
+information as measured.
+
+**Consequence: the baseline collapse is worse than the single fold-0/seed-0 number suggested.**
+Seed 1's uncorrected embedding (`w_vic=0`) has `emb_top1_share` = 0.932 — 93% of variance in
+one direction, below even the 2–4 "predicted failure" band, closer to a true scalar than the
+2.78–2.85 seed-0 runs showed. The 0.1 and 0.3 results above (rank 4.35, 9.46) are each a single
+seed and have not been checked for the same seed sensitivity — treat them as directional, not
+confirmed, until replicated.
+
+`goal_metric` shows **no measurable cost** across the whole range — 0.9598 to 1.0065, no trend
+with `w_vic` — which contradicts `reports/embedding_geometry.md` §7's prediction of "a visible
+`goal_metric` cost" at 0.3. `pearson_uniform` and (not shown) `mae_uniform` are flat to three
+decimals across all six runs; the entire spread in `goal_metric` is riding on `ap_uniform`,
+which is a tail metric over ~620 positives in one fold — noisy at this scale, per the same
+argument CLAUDE.md makes for pooling out-of-fold. Read this as "no detected cost within the
+noise of one fold/seed," not as "0.3 is free" — the latter invites pushing `w_vic` past the
+range `reports/embedding_geometry.md` §7 argues against (≥1, where the geometry term would
+outweigh the rest of the loss combined).
+
+**This reopens the architecture question rather than closing it.** `w_vic` alone, within the
+range the loss-balance argument permits, cannot lift a linear-head bottleneck from ~2.8 to
+15–25 — consistent with the mechanism (task heads read the embedding through one effectively
+1-D projection; a content-agnostic variance penalty is fighting weight decay for every other
+dimension). Untried levers, each a real decision rather than a default to reach for: lower
+weight decay (the thing actively shrinking the orthogonal directions), `--vic-gamma` above 0.5
+(0.5 was chosen to be inert at healthy rank, not to drive rank up), or accepting a lower target
+than 15–25 if 9–10 effective dimensions turns out to be enough for the downstream GP kernel —
+a question for the DKL project, not this one. **Step 5 should not run until one of these is
+chosen and re-measured.**
 
 **5 — register the sweep.** Creates a real sweep on wandb.
 
@@ -80,6 +141,11 @@ python -m wandb agent ethan_personal/finetune_minimol/<sweep_id>
 the loss changes and so does every `config_id` — a sweep launched first would be invalidated
 and its trials unusable. Steps 3–4 settle the architecture; the sweep explores hyperparameters
 within it.
+
+**Update 2026-08-18: step 4 ran and did not settle the architecture.** The scan above tops
+out at rank 9.46/32, short of the 15–25 target — see step 4's results. Step 5 is blocked, not
+on running step 4, but on choosing and re-measuring one of the untried levers step 4 surfaced
+(weight decay, `--vic-gamma`, or accepting a lower target).
 
 ### Open items, deliberately not fixed
 
@@ -122,7 +188,7 @@ be exported to the downstream DKL project.
 | pProp_MLP range transfer | **done, 2,247 runs analysed** — `reports/pprop_mlp_transfer.md`, `reports/pprop_mlp_transfer.py` |
 | 32-d embedding head (the deliverable) | **built 2026-08-17, 17/17 local checks; NOT yet run on real data** — `head.DualHead` |
 | Embedding geometry term (`--w-vic`) | **implemented, inert by default** — `losses.variance_covariance_loss`, `reports/embedding_geometry.md` |
-| `emb_effective_rank` on real data | **NOT MEASURED — this is the next thing to do.** See the runbook at the top |
+| `emb_effective_rank` on real data | **Measured 2026-08-18: 2.78/32 at default. Step 4's `w_vic` scan (0–0.3) tops out at 9.46/32 — short of the 15–25 target, no measurable `goal_metric` cost. Architecture question reopened, step 5 blocked.** See the runbook at the top |
 | Layer-wise freeze/unfreeze | **not started, deferred 2026-08-13** — see "Deferred: layer-wise freeze/unfreeze" |
 
 The trunk reproduces frozen MiniMol embeddings **exactly** (max|Δ| = 0.000e+00 over 64×512),
