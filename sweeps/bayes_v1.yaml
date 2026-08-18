@@ -75,9 +75,15 @@ parameters:
   # `unrecognized arguments: 1]`. A quoted string arrives as one token; `run_config.int_list`
   # reads the integers out of it and also accepts `--fold-list 0 1` when typed by hand.
   fold_list:
-    value: "0"
+    value: "0,1"
   seed_list:
     value: "0"
+
+  # The project is pinned here, not left to `--wandb-project`'s default: `wandb.init` is
+  # called with an explicit project, so without this the sweep would live in one project and
+  # its runs would land in another.
+  wandb_project:
+    value: "finetuning_minimol_rabelais"
 
   # -- the schedule: the supervisor's #1 and #2 priorities -----------------------------
   # Log-spaced because 1 -> 2 epochs is a far bigger change than 20 -> 21. `q: 1` rounds to

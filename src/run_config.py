@@ -64,6 +64,41 @@ from objective import OBJECTIVE_VERSION                                   # noqa
 from pool_oof import load_runs, pool_from_runs                            # noqa: E402
 from train import dashed, sweep_int                                       # noqa: E402
 
+# -- what reaches wandb ---------------------------------------------------------------
+#
+# `metrics.flavoured_metrics` produces 47 metrics. Logged as a per-epoch curve per model, a
+# per-epoch mean and std, and a four-way summary, that was ~380 keys for two models and would
+# have been ~750 at 5x2 -- a workspace nobody can find anything in. `aggregate.json` still
+# holds **everything**; these lists govern only what is shipped to wandb.
+
+# Per-epoch curves, for both `models/*` and `agg/*`. Enough to watch a run converge and to
+# see one fold diverge from the others. `pred_std` is here because Pearson is nan when
+# predictions are constant, and this is what makes that diagnosable rather than mysterious.
+CURVE_METRICS = ("goal_metric", "ap_uniform", "pearson_uniform", "mae_uniform",
+                 "mse", "loss", "pred_std")
+
+# The run summary, as `final/<name>_{mean,std}`. Deliberately absent: `ap_star`, which is
+# *identical* to `ap_uniform` by definition (OBJECTIVE_SPEC); four of the six enrichment
+# factors, since at two folds the p5.0 ones ride on ~20 molecules and only mean something
+# pooled; and `_min`/`_max`, which over two models are just the two values restated.
+SUMMARY_METRICS = (
+    "goal_metric", "goal_term_cls", "goal_term_reg",
+    "ap_uniform", "ap_balanced",
+    "pearson_uniform", "pearson_balanced", "spearman_uniform",
+    "mae_uniform", "mae_balanced", "mae_skill_uniform", "mae_skill_balanced", "mse",
+    "mae_group_lt", "mae_group_ge", "pearson_group_ge", "spearman_group_ge",
+    "ef_p3.5_top0.01", "ef_p5.0_top0.01",
+    "pred_std",
+    "loss", "cls", "huber", "pair", "std",
+)
+
+# Constants, not measurements: identical in every epoch of every run because they describe
+# the split, not the model. Logged **once** each as `data/*` rather than as a curve and a
+# four-way summary, which is where ~140 of the original ~380 keys went.
+CONSTANT_METRICS = ("n", "n_positive", "n_group_lt", "n_group_ge", "group_edge",
+                    "base_rate_uniform", "base_rate_balanced",
+                    "mae_ref_uniform", "mae_ref_balanced", "pair_eval_k")
+
 # `train.py` flags the driver does not expose at all: it sets `--fold`, `--seed` and `--out`
 # per model, and owns the checkpoint decision through `--keep-checkpoints`.
 NOT_EXPOSED = {"fold", "seed", "out", "save_checkpoint"}
@@ -292,9 +327,19 @@ def aggregate(runs_meta, expect_folds, y_all, runs_loaded):
     return per_epoch, per_model, final, pooled, pooled_skipped
 
 
-def log_to_wandb(args, bucket, cid, histories, per_epoch, per_model, final,
-                 pooled, pooled_skipped):
-    """One run. Per-model curves, the aggregate curve, one table, and the summary."""
+def init_wandb(args, bucket, cid):
+    """Open the run **before** any training starts.
+
+    This used to happen after every model had trained, and that was a bug with two faces.
+    The wandb agent pre-creates the run and hands us its id; until `wandb.init` runs, nothing
+    heartbeats it, so wandb marked any trial longer than its stale timeout as **crashed**
+    while it was still training happily. The state resolved itself when the late `init`
+    attached at the end -- but a genuine crash leaves exactly the same stalled stub, so
+    "crashed" carried no information either way. Initialising first makes the SDK's
+    background thread heartbeat throughout, so crashed means crashed.
+
+    The second face was that a 40-minute trial showed nothing at all until it ended.
+    """
     import os
     import wandb
 
@@ -307,38 +352,59 @@ def log_to_wandb(args, bucket, cid, histories, per_epoch, per_model, final,
                              "config_id": cid,
                              "fold_list": args.fold_list, "seed_list": args.seed_list,
                              "sweep_id": os.environ.get("WANDB_SWEEP_ID"),
-                             "objective_version": OBJECTIVE_VERSION,
-                             "n_models": final["n_models"]})
-    wandb.define_metric("agg/val/goal_metric_mean", summary="max")
+                             "objective_version": OBJECTIVE_VERSION})
 
-    # One `log` call per epoch carrying every model's value *and* the aggregate, so all the
-    # series share a step axis and a single chart can show ten curves against their mean.
-    by_epoch = defaultdict(dict)
-    for label, history in histories.items():
-        for h in history:
-            by_epoch[h["epoch"]].update(
-                {f"models/{label}/{k}": v for k, v in h.items()
-                 if k.startswith("val/") and isinstance(v, (int, float))})
+    # `epoch` as an explicit step metric, rather than `run.log(..., step=)`. Models finish one
+    # at a time and each replays its own epochs 1..N, so the global `_step` axis would run
+    # backwards at every model boundary and wandb would drop the writes. A custom step metric
+    # has no monotonicity requirement.
+    wandb.define_metric("epoch")
+    wandb.define_metric("models/*", step_metric="epoch")
+    wandb.define_metric("agg/*", step_metric="epoch")
+    wandb.define_metric("final/goal_metric_mean", summary="max")
+    return run
+
+
+def log_model_curve(run, label, history):
+    """One model's curves, logged as soon as that model finishes rather than at the end."""
+    if run is None:
+        return
+    for h in history:
+        row = {f"models/{label}/{k}": h[f"val/{k}"] for k in CURVE_METRICS
+               if isinstance(h.get(f"val/{k}"), (int, float))}
+        if row:
+            run.log({**row, "epoch": h["epoch"]})
+
+
+def finish_wandb(run, per_epoch, per_model, final, pooled, pooled_skipped):
+    """The aggregate curve, the per-model table, and the curated summary."""
+    import wandb
+
     for entry in per_epoch:
-        row = by_epoch[entry["epoch"]]
-        row.update({f"agg/val/{k}": v for k, v in entry.items()
-                    if k not in ("epoch", "n_models")})
-        row["agg/n_models"] = entry["n_models"]
-    for epoch in sorted(by_epoch):
-        run.log(by_epoch[epoch], step=epoch)
+        row = {f"agg/{k}_{stat}": entry[f"{k}_{stat}"]
+               for k in CURVE_METRICS for stat in ("mean", "std")
+               if f"{k}_{stat}" in entry}
+        run.log({**row, "epoch": entry["epoch"]})
 
-    # Logged once and unstepped: a table logged against a step collides with the
-    # step-indexed series above.
+    # Logged once and unstepped: a table logged against a step collides with the series
+    # above. It carries the *full* per-model metric set -- the trimming above is about what
+    # is worth a chart, and a table row costs nothing to widen.
     columns = ["model", *sorted(next(iter(per_model.values())))]
     table = wandb.Table(columns=columns)
     for label, m in sorted(per_model.items()):
         table.add_data(label, *[m.get(c) for c in columns[1:]])
     run.log({"models/table": table})
 
-    summary = {f"final/{k}": v for k, v in final.items()}
+    summary = {f"final/{k}_{stat}": final[f"{k}_{stat}"]
+               for k in SUMMARY_METRICS for stat in ("mean", "std")
+               if f"{k}_{stat}" in final}
+    summary["final/n_models"] = final["n_models"]
+    # Split descriptors, once each rather than as a curve and a four-way summary. Averaged
+    # over models because the per-fold counts differ slightly (643 vs 619 positives).
+    summary.update({f"data/{k}": final[f"{k}_mean"] for k in CONSTANT_METRICS
+                    if f"{k}_mean" in final})
     for label, m in pooled.items():
-        summary.update({f"pooled/{label}/{k}": v for k, v in m.items()
-                        if isinstance(v, (int, float))})
+        summary.update({f"pooled/{label}/{k}": m[k] for k in SUMMARY_METRICS if k in m})
     summary["pooled/available"] = bool(pooled)
     if pooled_skipped:
         summary["pooled/skipped"] = json.dumps(pooled_skipped)
@@ -357,12 +423,16 @@ def main(argv=None):
         if not bucket.is_dir():
             raise SystemExit(f"--aggregate-only {bucket} is not a directory")
         print(f"aggregate-only: {bucket}")
+        run = None if args.no_wandb else init_wandb(args, bucket, cid)
     else:
         cid = args.config_id or config_id(args)
         import os
         sweep_id = args.sweep_id or os.environ.get("WANDB_SWEEP_ID")
         bucket = Path(args.outputs_root) / (sweep_id or "_no_sweep") / cid
         bucket.mkdir(parents=True, exist_ok=True)
+
+        # Opened before the first model, not after the last -- see `init_wandb`.
+        run = None if args.no_wandb else init_wandb(args, bucket, cid)
 
         pairs = [(f, s) for s in args.seed_list for f in args.fold_list]
         print(f"config {cid}: {len(pairs)} models "
@@ -374,6 +444,10 @@ def main(argv=None):
                 continue
             print(f"[{n}/{len(pairs)}] fold {fold} seed {seed}", flush=True)
             train.main(child_argv(args, fold, seed, out))
+            # Straight after the model that produced them, so a long trial shows progress
+            # instead of nothing until it ends.
+            meta = json.loads((out / "meta.json").read_text())
+            log_model_curve(run, f"f{fold}s{seed}", meta["history"])
 
     # Read back what was written. The offline path (`pool_oof.py`) reads the same files, so
     # the two cannot report different numbers for the same directory.
@@ -410,10 +484,13 @@ def main(argv=None):
     for label, problems in pooled_skipped.items():
         print(f"  pooled {label}: NOT POOLED -- " + "; ".join(problems))
 
-    if not args.no_wandb:
-        run_id = log_to_wandb(args, bucket, cid, histories, per_epoch, per_model, final,
-                              pooled, pooled_skipped)
-        print(f"wandb run {run_id}")
+    if run is not None:
+        # In --aggregate-only there was no training loop to log curves from, so replay them
+        # here. In the training path they are already up, and re-logging would double them.
+        if args.aggregate_only is not None:
+            for label, history in histories.items():
+                log_model_curve(run, label, history)
+        print(f"wandb run {finish_wandb(run, per_epoch, per_model, final, pooled, pooled_skipped)}")
     print(f"wrote {bucket / 'aggregate.json'}")
     return bucket
 
