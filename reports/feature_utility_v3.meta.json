@@ -1,0 +1,20 @@
+{
+  "script": "src/feature_utility.py",
+  "argv": [
+    "--runs",
+    "outputs/rank_v1",
+    "outputs/rank_v3",
+    "--cells",
+    "A_base",
+    "D_w3",
+    "L_nonorm",
+    "M_nonorm_w3",
+    "-o",
+    "reports/feature_utility_v3.csv"
+  ],
+  "fold": 0,
+  "n_per_half": 10000,
+  "seed": 20260819,
+  "knn_k": 20,
+  "n_runs": 13
+}

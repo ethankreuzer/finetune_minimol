@@ -168,14 +168,18 @@ the loss changes and so does every `config_id` — a sweep launched first would 
 and its trials unusable. Steps 3–4 settle the architecture; the sweep explores hyperparameters
 within it.
 
-**Update 2026-08-18: step 4 ran and did not settle the architecture.** The scan above tops
-out at rank 9.46/32, short of the 15–25 target — see step 4's results. Step 5 is blocked, not
-on running step 4, but on the replicated experiment in
-**`reports/embedding_collapse_experiment.md`**, which is the plan and progress log for settling
-the loss configuration. Its highest-value untried lever is simply **`w_vic` at 1–10**: the §7
-bound that forbade that range is falsified (see step 4's results). Weight decay is *not* on the
-list — it is arithmetically inert here (§P6.3) — which is exactly the kind of dead end the
-experiment exists to avoid re-running.
+**Update 2026-08-19: the collapse is solved, and step 4's own conclusion is superseded.**
+Step 4's scan topped out at 9.46/32 and read as a dead end. It was not — it simply never
+tested the range P6.1 had already made legal. The replicated S1 screen (24 runs, 8 cells x 3
+seeds) takes effective rank from **2.25 to ~30 of 32 at `w_vic ∈ {3, 10}`**, with both damage
+guards resolving their margins and no escalation trigger firing. **Everything in step 4's
+tables below is still accurate as measurement and wrong as conclusion** — read it as the
+scan that motivated the experiment, not as the state of play.
+
+**All results now live in one generated file: `reports/embedding_collapse_results.md`**
+(`src/collapse_analysis.py --report`). `reports/embedding_collapse_experiment.md` keeps the
+design, the pre-registered rules and the open checkboxes. Step 5 remains blocked on S2–S3
+choosing and stress-testing the configuration to pin, not on whether the loss can work.
 
 ### Open items, deliberately not fixed
 
@@ -218,8 +222,8 @@ be exported to the downstream DKL project.
 | pProp_MLP range transfer | **done, 2,247 runs analysed** — `reports/pprop_mlp_transfer.md`, `reports/pprop_mlp_transfer.py` |
 | 32-d embedding head (the deliverable) | **built 2026-08-17, 17/17 local checks; NOT yet run on real data** — `head.DualHead` |
 | Embedding geometry term (`--w-vic`) | **implemented, inert by default** — `losses.variance_covariance_loss`, `reports/embedding_geometry.md` |
-| `emb_effective_rank` on real data | **Measured 2026-08-18: 2.78/32 at default. Step 4's `w_vic` scan (0–0.3) tops out at 9.46/32 — short of 15–25, no measurable `goal_metric` cost. Step 5 blocked.** The `w_vic ≤ 0.3` bound is falsified (real `vic` ≈ 0.41, not 28), so 1–10 is untried. See the runbook and **`reports/embedding_collapse_experiment.md`** |
-| Replicated loss experiment | **planned, not started 2026-08-18** — `reports/embedding_collapse_experiment.md` is the plan *and* the progress log; update its checkboxes as steps complete |
+| `emb_effective_rank` on real data | **Solved by the loss, 2026-08-19.** 2.78/32 at the default; **~30/32 at `w_vic ∈ {3, 10}`, `--vic-gamma 0.5`**, both damage guards non-inferior. Step 4's 9.46 ceiling was an artefact of never testing `w_vic > 0.3` — the bound forbidding it was falsified (real `vic` ≈ 0.41, not 28) |
+| Replicated loss experiment | **S0+S1 done, S2 running 2026-08-19; S3/S4 open.** Results: **`reports/embedding_collapse_results.md`** (generated, all stages). Design and checkboxes: `reports/embedding_collapse_experiment.md` |
 | Layer-wise freeze/unfreeze | **not started, deferred 2026-08-13** — see "Deferred: layer-wise freeze/unfreeze" |
 
 The trunk reproduces frozen MiniMol embeddings **exactly** (max|Δ| = 0.000e+00 over 64×512),

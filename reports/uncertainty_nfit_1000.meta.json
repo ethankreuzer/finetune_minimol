@@ -1,0 +1,21 @@
+{
+  "script": "src/uncertainty_probe.py",
+  "argv": [
+    "--cells",
+    "A_base",
+    "D_w3",
+    "--n-fit",
+    "1000",
+    "--n-per-half",
+    "5000",
+    "--no-acquisition",
+    "-o",
+    "reports/uncertainty_nfit_1000.csv"
+  ],
+  "fold": 0,
+  "n_per_half": 5000,
+  "n_fit": 1000,
+  "scaling": "raw",
+  "seed": 20260819,
+  "n_runs": 10
+}

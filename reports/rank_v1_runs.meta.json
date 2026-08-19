@@ -1,0 +1,55 @@
+{
+  "script": "src/emb_readout.py",
+  "argv": [
+    "--runs",
+    "outputs/rank_v1",
+    "-o",
+    "reports/rank_v1_runs.csv"
+  ],
+  "n_sample": 5000,
+  "sample_seed": 20260818,
+  "knn_k": 20,
+  "runs": [
+    "outputs/rank_v1/A_base/fold0_seed0",
+    "outputs/rank_v1/A_base/fold0_seed1",
+    "outputs/rank_v1/A_base/fold0_seed2",
+    "outputs/rank_v1/B_w0.3/fold0_seed0",
+    "outputs/rank_v1/B_w0.3/fold0_seed1",
+    "outputs/rank_v1/B_w0.3/fold0_seed2",
+    "outputs/rank_v1/C_w1/fold0_seed0",
+    "outputs/rank_v1/C_w1/fold0_seed1",
+    "outputs/rank_v1/C_w1/fold0_seed2",
+    "outputs/rank_v1/D_w3/fold0_seed0",
+    "outputs/rank_v1/D_w3/fold0_seed1",
+    "outputs/rank_v1/D_w3/fold0_seed2",
+    "outputs/rank_v1/E_w10/fold0_seed0",
+    "outputs/rank_v1/E_w10/fold0_seed1",
+    "outputs/rank_v1/E_w10/fold0_seed2",
+    "outputs/rank_v1/F_w3_g1/fold0_seed0",
+    "outputs/rank_v1/F_w3_g1/fold0_seed1",
+    "outputs/rank_v1/F_w3_g1/fold0_seed2",
+    "outputs/rank_v1/G_w3_drop/fold0_seed0",
+    "outputs/rank_v1/G_w3_drop/fold0_seed1",
+    "outputs/rank_v1/G_w3_drop/fold0_seed2",
+    "outputs/rank_v1/H_drop/fold0_seed0",
+    "outputs/rank_v1/H_drop/fold0_seed1",
+    "outputs/rank_v1/H_drop/fold0_seed2"
+  ],
+  "failed": [],
+  "folds_sampled": {
+    "0": [
+      106,
+      147,
+      221,
+      440,
+      510
+    ]
+  },
+  "provenance_triples": [
+    {
+      "objective_version": "v1-binary3.5-c917327f",
+      "split_sha256": "3ef97e78a85d445f24cd26732273488fb32e239c183f8d88ddc83de19026a091",
+      "input_sha256": "b4eb8c7815e2aeedc43f8ce10f4ae218b2859290901c0f17d6dad10eec954c8f"
+    }
+  ]
+}

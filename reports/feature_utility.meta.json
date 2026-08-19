@@ -1,0 +1,12 @@
+{
+  "script": "src/feature_utility.py",
+  "argv": [
+    "-o",
+    "reports/feature_utility.csv"
+  ],
+  "fold": 0,
+  "n_per_half": 10000,
+  "seed": 20260819,
+  "knn_k": 20,
+  "n_runs": 19
+}
