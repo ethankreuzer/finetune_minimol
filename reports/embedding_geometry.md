@@ -10,6 +10,21 @@ implementation is `losses.variance_covariance_loss` and `metrics.embedding_metri
 **Status of the two problems in §9:** both are real, neither is fixed yet. `--w-vic` defaults
 to `0.0`, so nothing here is active in a run today.
 
+> **CORRECTED 2026-08-18, after the term was measured on real runs.** Two claims below were
+> derived before any embedding had been observed, and the observations contradict them.
+> Both corrections are marked inline where they occur, and the evidence is
+> `reports/embedding_collapse_experiment.md` P6.
+>
+> 1. **§7's ceiling — "the defensible range is `w_vic ∈ [0.003, 0.3]`; anything at or above 1
+>    is optimising the wrong thing" — is FALSE by roughly 60×.** It rested on `vic ≈ 28` at
+>    collapse, a figure taken from *synthetic unit-scale rank-1* data. Real collapsed runs read
+>    `val/vic` = **0.409** and **0.537**. `w_vic ∈ {1, 3, 10}` are legitimately testable.
+> 2. **§2's "weight decay shrinks it toward zero" is not the operative mechanism.** At
+>    `lr·wd = 1e-5` the head shrinks 4.3% over a whole run and the trunk 0.33% — too small to
+>    erase 30 dimensions. §3's own algebra names the likelier shrinker.
+>
+> §7's prediction of "a visible `goal_metric` cost" at `w_vic=0.3` also did not occur — see §7.
+
 ---
 
 ## Summary
@@ -75,8 +90,20 @@ The task heads are `Linear(32→1)`. Write their weight vectors `u_reg, u_cls �
 loss depends on `Z` **only** through the two scalar projections `Z·u_reg` and `Z·u_cls`.
 
 Any component of `Z` orthogonal to `span(u_reg, u_cls)` is therefore **exactly invisible to
-the loss**, and weight decay shrinks it toward zero. And because "pProp ≥ 3.5" is a threshold
-of pProp, `u_cls ≈ α·u_reg` — that span is closer to one-dimensional than two.
+the loss**. And because "pProp ≥ 3.5" is a threshold of pProp, `u_cls ≈ α·u_reg` — that span
+is closer to one-dimensional than two.
+
+> **CORRECTION 2026-08-18.** This paragraph used to continue "…and weight decay shrinks it
+> toward zero". Invisibility to the loss is right; weight decay as the shrinker is wrong.
+> AdamW's decoupled decay removes `lr·wd` of a weight per step, so at the shipped
+> `wd = 0.01` the head shrinks `1e-3·0.01·4,420 steps` = **4.3%** over a full run and the
+> trunk **0.33%** (cosine annealing roughly halves both). A 2–4% shrink cannot erase 30
+> dimensions. What invisibility to the loss actually buys is that those directions are
+> *unconstrained*, not that they are actively pulled down — and the thing that then pulls
+> them down is the LayerNorm of §3, which divides every dimension of a row by that row's own
+> spread, so one dominant pre-activation shrinks all 31 others. That is exactly the measured
+> baseline std profile: 0.934 at the top dimension, 0.017 at the bottom. §3 shows LayerNorm
+> cannot *fix* collapse; the same algebra shows it helps *cause* it.
 
 **With linear heads this argument is exact rather than heuristic**, which is worth being
 honest about: the linear heads were chosen to make pProp linear in the exported embedding
@@ -212,9 +239,39 @@ Measured at batch 1200 on realistic z-scored data (a Pearson-0.87 model, ~5% pos
 | `pair` | 0.572 | 7.486 | **4.28** |
 | `std` | ~0 | 0.7911 | ~0 |
 | **total without `vic`** | | | **≈ 4.6** |
-| `vic` | 0.4 healthy → 28 collapsed | `w_vic` | see below |
+| `vic` | 0.4 healthy → 28 collapsed *(synthetic; see below)* | `w_vic` | see below |
 
 ### What this implies for `w_vic`
+
+> **CORRECTION 2026-08-18 — the table below is wrong, and the range it derives is
+> falsified.** `vic ≈ 28 at collapse` came from *synthetic unit-scale rank-1* data. Real
+> collapsed runs read `val/vic` = **0.409** (fold 0 seed 0, `w_vic=0`, effective rank 2.85)
+> and **0.537** (seed 1, rank 1.32) — the hinge is `relu(γ − std)`, bounded by γ = 0.5 per
+> dimension, and the squared off-diagonal covariances of a *shrunken* embedding are tiny. The
+> table's contributions are therefore **~60× too large**. Measured at the real operating
+> scale:
+>
+> | `w_vic` | real contribution at collapse | share of the ≈4.6 rest-of-loss |
+> |---|---|---|
+> | 10 | ~4.1 | ~90% — the first value where geometry rivals accuracy |
+> | 3 | ~1.2 | ~27% |
+> | 1.0 | ~0.41 | ~9% |
+> | 0.3 | ~0.12 | ~2.7% |
+> | 0.1 | ~0.041 | ~0.9% |
+>
+> So the honest statement is the opposite of the original one: **`w_vic ∈ {1, 3, 10}` are
+> legitimately testable**, and the measured scan over `[0, 0.3]` topped out at effective rank
+> 9.46/32 against a 15–25 target precisely because the term was never given enough weight to
+> matter. `reports/embedding_collapse_experiment.md` S1 tests that range.
+>
+> The prediction of "**a visible `goal_metric` cost**" at `w_vic=0.3` also **did not occur**:
+> across the six-value scan `goal_metric` spans 0.9598–1.0065 with no trend, and
+> `pearson_uniform` moves 0.002 in total. That is not proof `0.3` is free — it is a
+> demonstration that `goal_metric` cannot detect a cost at this noise level, since its entire
+> spread rides on `ap_uniform` over ~620 positives in one fold. Damage should be judged on
+> `pearson_uniform` against an explicit margin.
+
+The original table, retained so the correction above is checkable:
 
 | `w_vic` | contribution at collapse | reading |
 |---|---|---|
@@ -225,8 +282,8 @@ Measured at batch 1200 on realistic z-scored data (a Pearson-0.87 model, ~5% pos
 | 0.01 | 0.28 | mild |
 | 0.003 | 0.08 | barely perceptible |
 
-So the defensible range is roughly **`w_vic ∈ [0.003, 0.3]`**. Anything at or above 1 is
-optimising the wrong thing.
+~~So the defensible range is roughly **`w_vic ∈ [0.003, 0.3]`**. Anything at or above 1 is
+optimising the wrong thing.~~ — falsified; see the correction above.
 
 ---
 

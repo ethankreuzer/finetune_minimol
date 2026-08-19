@@ -31,15 +31,17 @@ VENV=/home/ethan2/finetune_minimol/.venv/bin/python
 | P4 | `w_vic` scan, 6 values | `[x]` | tops out at **9.46/32**, no measurable `goal_metric` cost |
 | P5 | Seed-1 discriminator | `[x]` | low-`w_vic` scatter is **noise**; baseline as bad as **1.32** |
 | P6 | Zero-GPU forensics (4 findings) | `[x]` | **§7 ceiling falsified; weight decay is not the mechanism** |
-| S0 | Stage 0 — doc corrections + code | `[~]` | S0.1 `CLAUDE.md` corrected; docstrings + code pending |
-| S1 | Stage 1 — the screen (24 runs) | `[ ]` | — |
+| S0 | Stage 0 — doc corrections + code | `[x]` | flags landed (`d80ca10`), gate 11/11 + 8/8, readout reproduces P6.4 exactly |
+| S1 | Stage 1 — the screen (24 runs) | `[~]` | launched 2026-08-18 23:17 under `nohup scripts/run_rank_v1.sh` |
 | S2 | Stage 2 — dose / refine (16 runs) | `[ ]` | — |
 | S3 | Stage 3 — transferability (12 runs) | `[ ]` | — |
 | S4 | Deliverable — update `bayes_v2.yaml` | `[ ]` | — |
 
-**Open decision, unanswered:** how the stage boundaries are handled if the experiment runs
-unattended (see "Unattended execution" at the bottom). Nothing below S0 should start until
-that is settled.
+**Open decision, SETTLED 2026-08-18 — option 2, "S1 only, then stop".** S0 + S1 run, the
+readout and analysis are written to `reports/rank_v1_results.md`, and the experiment halts for
+review before S2. All three options run S1 identically, so the choice only binds at the S1->S2
+boundary; option 1 (coding the pre-registered rules) stays available later. Unattended runs
+write to `outputs/rank_v1/**` and `reports/rank_v1_*` only.
 
 ---
 
@@ -190,8 +192,7 @@ at seed-1 baseline is the "disguised scalar" failure stated numerically.
 
 ## `[ ]` S0 — Stage 0: corrections and code (no GPU, ~1 h)
 
-- `[~]` **S0.1 Record P6 and correct the stale claims.** `CLAUDE.md` **done 2026-08-18**; the
-  source-file docstrings remain.
+- `[x]` **S0.1 Record P6 and correct the stale claims.** All four done 2026-08-18.
   - `[x]` `CLAUDE.md` — all three claims corrected: the falsified §7 `w_vic ≤ 0.3` ceiling
     (now states real `vic` ≈ 0.41 vs the synthetic 28, and that 1–10 is untried), the
     weight-decay mechanism (now gives the 4.3% / 0.33% arithmetic and names LayerNorm as the
@@ -199,16 +200,21 @@ at seed-1 baseline is the "disguised scalar" failure stated numerically.
     "settled values, not truncated climbs" line (now states rank was still climbing at epoch 20
     and that `unfrozen_epochs` is itself a rank lever). Also added: `pearson_uniform` is the
     right damage instrument, not `goal_metric`; the state table points here.
-  - `[ ]` `src/losses.py` — `variance_covariance_loss` docstring asserts "weight decay actively
-    shrinks them".
-  - `[ ]` `src/head.py` — same claim in the `DualHead` docstring.
-  - `[ ]` `reports/embedding_geometry.md` §2 (weight-decay mechanism) and §7 (the `w_vic ≤ 0.3`
-    ceiling, and its "expect a visible `goal_metric` cost at 0.3" prediction).
+  - `[x]` `src/losses.py` — the "weight decay actively shrinks them" claim is replaced by the
+    4.3% / 0.33% arithmetic and LayerNorm; the measured 2.78 / 1.32 are recorded; `gamma` is
+    documented as a scale target, not a strength knob.
+  - `[x]` `src/head.py` — same correction in the `DualHead` docstring, plus the measured
+    ρ(emb_dist, |Δpred|) = 0.9986 that states the failure numerically.
+  - `[x]` `reports/embedding_geometry.md` — a correction banner in the header, §2's mechanism
+    corrected in place, and §7's ceiling table superseded by the measured one (real
+    contributions ~60× smaller; `w_vic ∈ {1,3,10}` testable). The original §7 table is retained
+    struck-through so the correction is checkable.
 
   Deferred deliberately: the three source files are touched by S0.2 anyway, so correcting the
   docstrings in the same commit as the `--w-cov` change keeps one reviewable diff per file.
 
-- `[ ]` **S0.2 Two CLI flags, in ONE commit.** Every new `train.py` flag re-hashes every
+- `[x]` **S0.2 Two CLI flags, in ONE commit.** Landed as `d80ca10`. `--w-cov` verified
+  bit-identical at its default (8.939805031 either way) and exactly linear in `w_cov`. Every new `train.py` flag re-hashes every
   `config_id` (`run_config.mirror_train_arguments` copies the whole parser), so all CLI
   additions must land before the sweep is registered.
   - `--trunk-weight-decay` (default `None`): argparse at `src/train.py:194`, pass through at
@@ -227,16 +233,27 @@ at seed-1 baseline is the "disguised scalar" failure stated numerically.
   > `w_vic`, surviving on the defaults. Do not make `embedding` required, do not reorder
   > positionals before it, do not move `w_vic`'s default off `0.0`. Keyword-only appends are safe.
 
-- `[ ]` **S0.3 Write `src/emb_readout.py`** (design under Analysis). Validate by reproducing
-  P6.4's table from runs already on disk.
+- `[x]` **S0.3 `src/emb_readout.py` written and validated.** It reproduces P6.4's table
+  *exactly* from the 9 runs on disk — rank 1.323/2.851/4.350/9.457, ρ(emb,1−T)
+  0.062/0.079/0.127/0.221, scalarness 0.999/0.920/0.730/0.525, control flat at 0.067–0.073.
+  8.6 s for 9 runs at n=2500. Adds `tanimoto_partial` (−0.091 at the seed-1 baseline: that
+  embedding carries *no* chemistry beyond pProp) and `knn20_jaccard` (0.013 → 0.048).
 
-- `[ ]` **S0.4 Gate:** `verify_trunk.py` → 10/10, `verify_metrics.py` → 8/8, plus a smoke run
+- `[x]` **S0.4 Gate passed:** `verify_trunk.py` → 10/10, `verify_metrics.py` → 8/8, plus a smoke run
   (`--subset 5000 --freeze-epochs 1 --unfrozen-epochs 1 --w-vic 1 --w-cov 1`) confirming
   `val/vic` moves and `meta.json["config"]` records both new flags.
+  **Measured:** `verify_trunk` **11/11** (the gate text above says 10/10; P1 already recorded
+  11 — the extra is `grad-flow-has-teeth`, not a regression), `verify_metrics` **8/8**, smoke
+  run `val/vic` 0.4423 → 0.4457 with `w_cov: 1.0` and `trunk_weight_decay: null` in
+  `meta.json["config"]`.
 
 ---
 
-## `[ ]` S1 — Stage 1: the screen (24 runs, ~2.2 h)
+## `[~]` S1 — Stage 1: the screen (24 runs, ~2.2 h)
+
+**Launched 2026-08-18 23:17 as `nohup bash scripts/run_rank_v1.sh`** — the loop below, made
+durable as a script (the plan's inline version dies with the SSH session). Logs:
+`/home/ethan2/logs/rank_v1_driver.log` (one line per run) and `rank_v1_gpu{0,1,2}.log`.
 
 A **randomized complete block design**: every cell on the same seeds `{0,1,2}`, fold 0.
 
