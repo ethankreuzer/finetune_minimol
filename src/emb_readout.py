@@ -58,6 +58,12 @@ MECHANICS THAT MATTER
   effective n is the molecule count. Run-to-run variability comes from the seed replicates,
   like every other number in this experiment.
 
+`knn20_jaccard` is **sample-size dependent** -- the 20 nearest of 5000 molecules is a tighter
+neighbourhood than the 20 nearest of 2500, so it falls as `--n-sample` rises (measured: 0.022 ->
+0.015 for the same run at 2500 and 5000). Compare it only across runs scored at the same
+`--n-sample`. The rank correlations are stable: the same run reads rho 0.079 / 0.079 and
+scalarness 0.920 / 0.924 at the two sizes.
+
 `knn20_jaccard` is reported beside the global rho because it is what a kernel actually uses:
 the mean overlap between each molecule's 20 nearest neighbours by ECFP and its 20 nearest by
 embedding. Global rho can be carried by the far tail of the distance distribution while the
@@ -199,7 +205,8 @@ class FoldReference:
 
 def structural_columns(ref, z_sample, pred_sample):
     """The Tanimoto readout for one run, against one fold's cached reference."""
-    emb_rank = rankdata(upper(euclidean_matrix(z_sample)))
+    emb_dist = euclidean_matrix(z_sample)          # 200 MB at n=5000; built once, used twice
+    emb_rank = rankdata(upper(emb_dist))
     pred = np.asarray(pred_sample, dtype=np.float64)
     pred_rank = rankdata(upper(np.abs(pred[:, None] - pred[None, :])))
 
@@ -211,7 +218,7 @@ def structural_columns(ref, z_sample, pred_sample):
     r_bc = rho(pred_rank, ref.dis_rank)               # the control
     denom = np.sqrt(max(1.0 - r_ab ** 2, 1e-12))
 
-    emb_knn = knn_sets(euclidean_matrix(z_sample), KNN_K, larger_is_closer=False)
+    emb_knn = knn_sets(emb_dist, KNN_K, larger_is_closer=False)
     return {"tanimoto_spearman": r_ac,
             "pred_tanimoto_spearman": r_bc,
             "scalarness": r_ab,

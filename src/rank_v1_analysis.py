@@ -190,20 +190,36 @@ def main(argv=None):
               4), ""]
 
     # ---- damage guards -------------------------------------------------------------
-    guards, guard_notes = {}, []
+    # Non-inferiority is a ONE-sided question ("is it not worse by more than the margin"),
+    # so the guards use a one-sided 95% bound. The response above stays two-sided, because
+    # "did rank move" is genuinely two-sided.
+    t_one = float(student_t.ppf(0.95, dfree))
+    guards = {}
     for metric, margin, direction in (("val/pearson_uniform", PEARSON_MARGIN, "higher_better"),
                                       ("val/mse", MSE_MARGIN, "lower_better"),
                                       ("val/goal_metric", None, "higher_better")):
         t2, m2, s2, _ = rcbd(d, metric)
-        c2 = contrasts(t2, m2, s2, n, t_crit)
+        c2 = contrasts(t2, m2, s2, n, t_one)
         guards[metric] = c2
+        half = t_one * s2 * np.sqrt(2 / n)
+        # A margin narrower than the half-width does not test "within the margin" -- it
+        # tests "indistinguishable from zero", which is a stricter question than the plan
+        # asked. Said out loud rather than left for a reader to derive from sigma.
+        resolution = "" if margin is None else (
+            f"  The one-sided half-width ({half:.5f}) is "
+            + (f"**wider than the margin ({margin})**, so this guard is effectively testing "
+               "'no detectable change at all', not 'within the margin' — a real cost smaller "
+               "than the margin would still fail it."
+               if half > margin else
+               f"narrower than the margin ({margin}), so the guard tests the margin as "
+               "intended."))
         L += [f"## Guard — `{metric}`", "",
-              f"Pooled sigma = {s2:.5f}; contrast half-width = "
-              f"{t_crit * s2 * np.sqrt(2 / n):.5f}."
+              f"Pooled sigma = {s2:.5f}; one-sided (95%) contrast half-width = {half:.5f}."
               + ("" if margin is None else
-                 f"  Non-inferiority margin **{margin}**, "
+                 f"  Non-inferiority margin **{margin}**: the "
                  f"{'lower' if direction == 'higher_better' else 'upper'} bound must stay "
-                 f"{'above -' if direction == 'higher_better' else 'below +'}{margin}."),
+                 f"{'above -' if direction == 'higher_better' else 'below +'}{margin}.")
+              + resolution,
               "", fmt(c2, ["delta", "lo", "hi", "per_seed"], 5), ""]
 
     def guard_pass(cell):
@@ -263,12 +279,20 @@ def main(argv=None):
           "| stds pile up **below** gamma | force-limited | raise `w_vic` |",
           "| stds sit **at** gamma, rank still low | covariance binding | raise `--w-cov` (or gamma) |",
           "| a stable subset stuck near 0.06 at every dose | GELU-dead dims | **architecture**, not loss |",
-          "", md_table(diag, index_label="cell"), ""]
+          "", md_table(diag, index_label="cell"),
+          "",
+          "`n_dims_below_0.5` is the column to read when cells disagree: the `emb_std_p*` "
+          "entries are means of per-run percentiles, which is not the percentile of the "
+          "pooled distribution, and `n_dims_below_gamma` uses each cell's own gamma so it is "
+          "not comparable across the gamma=1.0 cell.", ""]
 
     # ---- escalation triggers, evaluated mechanically -------------------------------
     strongest = means.idxmax()
     fires = []
-    sat = diag.loc[strongest, "n_dims_below_gamma"] <= 4
+    # `n_dims_below_0.5`, not `n_dims_below_gamma`: F_w3_g1 runs at gamma=1.0, so the
+    # per-run column would measure saturation against a different target than every other
+    # cell and make the trigger depend on which cell happened to be strongest.
+    sat = diag.loc[strongest, "n_dims_below_0.5"] <= 4
     dead = diag.loc[strongest, "n_dims_below_0.1"] >= 4
     if sat and dead and float(np.exp(means[strongest])) < 12:
         fires.append("at the strongest dose the hinge is saturated, a subset of dims is still "
