@@ -189,11 +189,17 @@ class DualHead(nn.Module):
     The bottleneck is also where this architecture is most likely to fail, and the reason
     `--w-vic` exists. Regression and "pProp >= 3.5" are near-collinear -- the same axis, the
     second with its gradient concentrated at the boundary -- so the *supervised* signal
-    arriving here is close to rank-1, and weight decay shrinks whatever the other ~30
-    dimensions might otherwise hold. An embedding whose effective rank is 2-4 of 32 would
-    hand the GP a disguised scalar, making its distances a restatement of predicted pProp and
-    its uncertainties meaningless on novel molecules. `val/emb_effective_rank` is logged every
-    epoch precisely so this is observed rather than assumed.
+    arriving here is close to rank-1, so nothing asks the other ~30 dimensions to hold
+    anything and the LayerNorm at the end of this very block divides them down -- it
+    normalises across the 32 dims *within each row*, so one dominant pre-activation shrinks
+    every other dim. (Earlier text here blamed weight decay. Falsified: at `lr * wd = 1e-5`
+    the head shrinks 4.3% over a whole run and the trunk 0.33%, which cannot erase 30
+    dimensions. See `reports/embedding_collapse_experiment.md` P6.3.) An embedding whose
+    effective rank is 2-4 of 32 hands the GP a disguised scalar, making its distances a
+    restatement of predicted pProp and its uncertainties meaningless on novel molecules.
+    MEASURED 2026-08-18: effective rank 2.78 at the default and 1.32 on another seed, with
+    rho(embedding distance, |delta predicted pProp|) = 0.9986 -- the failure, not the risk.
+    `val/emb_effective_rank` is logged every epoch precisely so this stays observed.
 
     `forward` returns `(logits, pred)`, both shaped `[B]`. `MiniMolRegressor` passes tuples
     through untouched.

@@ -330,10 +330,10 @@ def std_match_loss(pred, target_pprop, sample_weights=None):
     return (wstd(pred) - wstd(target_pprop)) ** 2
 
 
-def variance_covariance_loss(embedding, gamma=1.0):
+def variance_covariance_loss(embedding, gamma=1.0, *, w_cov=1.0):
     """Keep the exported bottleneck from collapsing onto a handful of directions.
 
-        L = mean_j relu(gamma - std(z_j))  +  mean_{i != j} cov(z)_{ij} ** 2
+        L = mean_j relu(gamma - std(z_j))  +  w_cov * mean_{i != j} cov(z)_{ij} ** 2
 
     The variance and covariance halves of VICReg (Bardes, Ponce & LeCun, 2022), without its
     invariance term -- there is no second view here, so the only job is non-degeneracy.
@@ -341,9 +341,19 @@ def variance_covariance_loss(embedding, gamma=1.0):
     WHY THIS EXISTS. `head.DualHead`'s bottleneck is the artifact this repo ships, and the
     only gradient reaching it comes from two near-collinear outputs: regression on pProp, and
     classification at pProp >= 3.5, which is the same axis with its gradient concentrated at
-    the boundary. So the *supervised* signal is close to rank-1, nothing asks the remaining
-    ~30 dimensions to carry anything, and weight decay actively shrinks them. The predicted
-    failure is an embedding of effective rank 2-4 out of 32 -- a scalar in 32 slots.
+    the boundary. So the *supervised* signal is close to rank-1 and nothing asks the remaining
+    ~30 dimensions to carry anything. The predicted failure is an embedding of effective rank
+    2-4 out of 32 -- a scalar in 32 slots. MEASURED 2026-08-18: 2.78 at the default, and as
+    low as 1.32 on another seed. The prediction was right.
+
+    An earlier version of this docstring named weight decay as what shrinks the unused
+    dimensions. That is FALSIFIED -- AdamW's decoupled decay shrinks by `lr * wd` per step,
+    so the head loses 1e-3 * 0.01 * 4,420 steps = 4.3% over a whole run and the trunk 0.33%,
+    and a 2-4% shrink cannot erase 30 dimensions. The likelier shrinker is the LayerNorm
+    immediately before the export point: it normalises across the 32 dims *within each row*,
+    so one dominant pre-activation divides every other dim down -- which is exactly the
+    measured baseline std profile (0.934 down to 0.017). See
+    `reports/embedding_collapse_experiment.md` P6.3.
 
     That is fatal specifically for the downstream use. A deep-kernel-learning GP measures
     molecule similarity by distance in this space; if 30 dimensions are flat, distance
@@ -364,7 +374,20 @@ def variance_covariance_loss(embedding, gamma=1.0):
 
     `gamma` is the target floor on each dimension's standard deviation. With LayerNorm
     immediately before the export point the natural scale is ~1, so 1.0 is the sensible
-    default rather than a tuned value.
+    default rather than a tuned value. Measured against a healthy bottleneck it is too high
+    -- per-dim std is 0.585 post-LayerNorm+GELU, so the hinge fires even at effective rank
+    30.78/32 -- which is why every run since 2026-08-18 passes `--vic-gamma 0.5` explicitly.
+    Note gamma is a *scale target, not a strength knob*: `relu(gamma - std)` has slope -1 for
+    every dim below gamma, so raising it moves the target without adding force.
+
+    `w_cov` reweights the covariance half against the variance half. DEFAULT 1.0 reproduces
+    the original term exactly. It is a knob rather than a constant because the two halves
+    become binding at different times: measured at collapse they are comparable (ratio
+    1.3-2.4) and the variance hinge is NOT saturated -- 28 of 32 dims sit below gamma even at
+    `w_vic=0.3` -- so today the fix is more total force, not a re-balance. Once `w_vic` is
+    large enough to drive every dim to gamma the hinge saturates, its gradient vanishes, and
+    covariance is the only half still pushing. See `reports/embedding_collapse_experiment.md`
+    P6.2.
     """
     z = embedding - embedding.mean(dim=0, keepdim=True)
     n = z.shape[0]
@@ -378,12 +401,12 @@ def variance_covariance_loss(embedding, gamma=1.0):
     off_diagonal = cov - torch.diag_embed(torch.diagonal(cov))
     covariance = off_diagonal.pow(2).sum() / cov.shape[0]
 
-    return variance + covariance
+    return variance + w_cov * covariance
 
 
 def combined_loss(logits, pred, target_binary, target_pprop, sample_weights,
                   w_cls, w_pair, w_std, huber_delta, embedding=None, w_vic=0.0,
-                  vic_gamma=1.0):
+                  vic_gamma=1.0, w_cov=1.0):
     """The five-term loss, and the per-term breakdown for logging.
 
         loss = w_cls * cls + huber + w_pair * pair + w_std * std + w_vic * vic
@@ -415,7 +438,7 @@ def combined_loss(logits, pred, target_binary, target_pprop, sample_weights,
     # Skipped entirely when there is no embedding to regularise, so callers that only have
     # arrays (`train.loss_terms_from_arrays` on a split without saved embeddings) still work.
     if embedding is not None:
-        vic = variance_covariance_loss(embedding, gamma=vic_gamma)
+        vic = variance_covariance_loss(embedding, gamma=vic_gamma, w_cov=w_cov)
         loss = loss + w_vic * vic
         terms["vic"] = float(vic)
 

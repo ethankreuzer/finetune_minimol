@@ -192,6 +192,12 @@ def build_parser():
     p.add_argument("--eta-min", type=float, default=1e-8,
                    help="cosine floor; 1e-8 matches the schedule these defaults came from")
     p.add_argument("--weight-decay", type=float, default=0.01)
+    # Decoupled AdamW decay is `lr * wd` per step, so one `--weight-decay` means very
+    # different things to the two groups: 4.3% total shrink on the head at lr 1e-3, 0.33%
+    # on the trunk at 1e-4 (reports/embedding_collapse_experiment.md P6.3). This splits
+    # them. None = follow --weight-decay, which is the historical behaviour exactly.
+    p.add_argument("--trunk-weight-decay", type=float, default=None,
+                   help="weight decay for the trunk group; defaults to --weight-decay")
     # Batch 1200 is doing double duty: throughput (reports/compute_profile.md measures the
     # fixed per-step overhead falling from 28% at 256 to ~9% at 1024) and tail variance
     # (~11.4 positives per batch instead of 2.4, so the up-weighted half of the loss is not
@@ -214,6 +220,13 @@ def build_parser():
                    help="weight on the variance/covariance term (0 = off)")
     p.add_argument("--vic-gamma", type=float, default=1.0,
                    help="target floor on each embedding dimension's std")
+    # 1.0 reproduces the term exactly as it was swept. Measured, the variance hinge is
+    # the binding half today (28/32 dims below gamma even at --w-vic 0.3), so this is
+    # insurance for the regime where enough force saturates the hinge and covariance
+    # becomes the only half still pushing. Landed now because every new train.py flag
+    # re-hashes every run_config `config_id`.
+    p.add_argument("--w-cov", type=float, default=1.0,
+                   help="weight on the covariance half of --w-vic's term")
 
     p.add_argument("--subset", type=int, default=None,
                    help="use only N train and N val rows (smoke test)")
@@ -414,7 +427,7 @@ def train_one_epoch(model, loader, optimizer, device, cfg):
                                     w_cls=cfg.w_cls, w_pair=cfg.w_pair,
                                     w_std=cfg.w_std, huber_delta=cfg.huber_delta,
                                     embedding=z, w_vic=cfg.w_vic,
-                                    vic_gamma=cfg.vic_gamma)
+                                    vic_gamma=cfg.vic_gamma, w_cov=cfg.w_cov)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -479,7 +492,8 @@ def loss_terms_from_arrays(pred_norm, logits, y_norm, y_bin, w, cfg, device="cpu
         huber = float(weighted_huber_loss(pred_t, yn_t, w_t, delta=cfg.huber_delta))
         pair = float(pairwise_distance_loss(pred_t[sub], yn_t[sub]))
         std = float(std_match_loss(pred_t, yn_t, w_t))
-        vic = (float(variance_covariance_loss(t(embedding)[sub], gamma=cfg.vic_gamma))
+        vic = (float(variance_covariance_loss(t(embedding)[sub], gamma=cfg.vic_gamma,
+                                              w_cov=cfg.w_cov))
                if embedding is not None else 0.0)
 
     out = {"cls": cls, "huber": huber, "pair": pair, "std": std,
@@ -643,7 +657,8 @@ def main(argv=None):
     # exist now, because param_groups drops an empty one and never adds it back.
     optimizer = torch.optim.AdamW(
         model.param_groups(trunk_lr=args.trunk_lr, head_lr=args.head_lr,
-                           weight_decay=args.weight_decay))
+                           weight_decay=args.weight_decay,
+                           trunk_weight_decay=args.trunk_weight_decay))
     names = {g.get("name") for g in optimizer.param_groups}
     if names != {"trunk", "head"}:
         raise SystemExit(f"optimizer has groups {names}, expected both 'trunk' and 'head'. "

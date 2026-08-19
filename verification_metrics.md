@@ -13,7 +13,7 @@
 | weighted std differs from unweighted | PASS |
 | freeze assertion has teeth | PASS |
 
-Ran in 6.9s under python 3.11.15, numpy 2.2.6, torch 2.6.0+cu124.
+Ran in 6.4s under python 3.11.15, numpy 2.2.6, torch 2.6.0+cu124.
 
 ---
 
