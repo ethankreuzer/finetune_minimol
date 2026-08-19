@@ -1,0 +1,14 @@
+{
+  "script": "src/trunk_pca_probe.py",
+  "argv": [
+    "--runs",
+    "outputs/ckpt_v4",
+    "-o",
+    "reports/trunk_pca.csv"
+  ],
+  "fold": 0,
+  "n_per_half": 10000,
+  "n_pca_fit": 20000,
+  "seed": 20260819,
+  "n_runs": 6
+}

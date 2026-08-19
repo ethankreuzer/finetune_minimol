@@ -47,6 +47,7 @@ $VENV src/collapse_analysis.py --csv reports/collapse_runs.csv --selftest   # S1
 | S2.5 | Featurizer utility probe (0 GPU-runs) | `[x]` | **U1/U2/U3 all pass at `D_w3`.** Fine-tuning beats frozen MiniMol-512 by 0.089 Spearman — but utility *falls* with `w_vic`; the term redistributes information rather than adding it |
 | S2.6 | GP uncertainty probe (0 GPU-runs) | `[x]` | **V1 PASS** (collapsed variance is uncorrelated with error; the fix repairs that, monotonically). **V2/V3 FAIL** — and the sparsity defence is falsified too |
 | S2.7 | Remove the export-point LayerNorm (6 runs) | `[x]` | **N1 FAILS — LayerNorm exonerated.** `D_w3` stands. Collapse is by *neglect*, not compression |
+| S2.8 | Bottleneck vs PCA of the fine-tuned trunk (6 runs) | `[x]` | **Bottleneck wins on every arm, config and seed.** PCA rejected; the 512->32 squeeze is not the cost |
 | S3 | Stage 3 — transferability (12 runs) | `[ ]` | — |
 | S4 | Deliverable — update `bayes_v2.yaml` | `[ ]` | — |
 

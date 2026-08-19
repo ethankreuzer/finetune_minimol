@@ -445,6 +445,61 @@ without relevance" finding argues the same way from the other end.
 
 ---
 
+{{S28}}
+
+### Reading S2.8 — the bottleneck earns its place, decisively
+
+**The learned bottleneck beats every PCA arm, in every config, on every seed.**
+
+| arm | `A_base` | `D_w3` |
+|---|---|---|
+| `emb32` (learned bottleneck) | **0.8714** | **0.8615** |
+| `trunk512_ft` (fine-tuned trunk, all 512) | 0.8475 | 0.8424 |
+| `trunkpca32` | 0.8470 | 0.8402 |
+| `trunkpca32_white` | 0.8270 | 0.8249 |
+| `pred1` (the model's own scalar) | 0.8343 | 0.8337 |
+
+*(held-out-cluster kNN Spearman)*
+
+**The 512 → 32 squeeze is not what costs anything.** `trunkpca32` ≈ `trunk512_ft` to within
+0.0005 — PCA does its job, and 32 components carry essentially everything the full 512 do for
+this task. The gap is entirely that **the trunk's raw representation is worse for pProp than
+the head's supervised bottleneck**, by +0.024 (`A_base`) and +0.021 (`D_w3`), positive on all
+six seeds.
+
+**On the tail the gap is not close.** `AP@3.5` reads 0.236 for `emb32` against 0.099 for
+`trunkpca32` at `A_base` — a factor of **2.4**. Note that `trunkpca32` scores *below* `pred1`
+(0.118) there: an unsupervised projection of the trunk is worse at retrieving potent molecules
+than simply reading the model's predicted score. Whatever the head learns, the trunk does not
+expose it to a distance-based probe.
+
+**Whitening hurts, as predicted.** `trunkpca32_white` loses another 0.020 against plain
+`trunkpca32` on kNN and is identical under ridge — which is exactly right, since whitening is an
+invertible linear rescaling that a linear probe undoes and a distance-based probe cannot. It
+buys effective rank **31.5, essentially the theoretical maximum**, and pays for it in skill. The
+low-variance directions it amplifies are noise.
+
+**The caveat raised before running was correct.** `trunkpca32`'s effective rank is **19.8–21.3,
+not 32.** PCA guarantees orthogonality, not an even spectrum, and the trunk's own 512-d output
+is variance-concentrated enough that the top-32 spectrum stays skewed.
+
+**And this is the third independent decoupling of rank from usefulness.** `A_base`'s
+`emb32` has effective rank **2.1** and beats `trunkpca32` at rank 19.8 and
+`trunkpca32_white` at rank 31.5 — on both bulk correlation and tail retrieval. Together with
+S2.5's dose curve (utility falls as `w_vic` raises rank) and S1's γ result (`F_w3_g1` bought
+rank by inflating scale), **effective rank has now failed as a proxy for featurizer quality in
+three unrelated ways.** It remains a valid detector of the *pathology* — S2.6's V1 shows a
+rank-2 embedding produces uncalibrated GP variance — but it must never again be read as "higher
+is better".
+
+**Verdict: keep the learned bottleneck.** The architecture alternative is rejected on the same
+evidence standard as the LayerNorm one. What survives from the earlier architecture list is the
+option neither of these tested: **supervised auxiliary targets**, which changes *what the
+bottleneck is asked to encode* rather than where the vector is taken from or how it is
+normalised.
+
+---
+
 ## Where this leaves the experiment
 
 **The loss question is settled.** `--w-vic 3 --vic-gamma 0.5 --w-cov 1` (the default `w_cov`)
