@@ -13,7 +13,7 @@
 | weighted std differs from unweighted | PASS |
 | freeze assertion has teeth | PASS |
 
-Ran in 6.4s under python 3.11.15, numpy 2.2.6, torch 2.6.0+cu124.
+Ran in 6.6s under python 3.11.15, numpy 2.2.6, torch 2.6.0+cu124.
 
 ---
 
@@ -98,7 +98,7 @@ An unweighted std term paired with a weighted huber would pull prediction spread
 ## PASS — freeze assertion has teeth
 
 with `set_trunk_trainable` neutered: died
-  freeze violated: trunk moved by 6.038e-04 (expected exactly 0) or the head did not move (6.019e-03). The schedule did no
+  freeze violated: trunk moved by 6.037e-04 (expected exactly 0) or the head did not move (6.019e-03). The schedule did no
 
 The trunk trains through the frozen phase when the freeze is a no-op, so `trunk_max_delta` is non-zero and the paired check fires. Confirms the assertion in `train.py` has teeth.
 

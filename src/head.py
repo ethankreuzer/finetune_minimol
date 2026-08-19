@@ -208,19 +208,33 @@ class DualHead(nn.Module):
     def __init__(self, in_dim=EMBED_DIM, hidden_dim=1024, n_layers=2, embed_dim=32,
                  cls_hidden_dim=256, cls_n_layers=0,
                  reg_hidden_dim=256, reg_n_layers=0,
-                 activation="gelu", dropout=0.0, norm="layer", bias=True):
+                 activation="gelu", dropout=0.0, norm="layer", bias=True,
+                 bottleneck_norm=None):
         super().__init__()
 
         _validate_dims((), dropout)          # range-checks dropout
         self.in_dim = int(in_dim)
 
-        # The bottleneck is just the last entry of the shared stack, so it goes through the
-        # same `Linear -> norm -> activation -> dropout?` block as everything else and needs
-        # no separate code path.
-        shared_dims = (int(hidden_dim),) * int(n_layers) + (int(embed_dim),)
-        layers, trunk_out = _mlp_blocks(self.in_dim, _validate_dims(shared_dims, dropout),
-                                        activation, dropout, norm, bias)
-        self.shared = nn.Sequential(*layers)
+        # The bottleneck goes through the same `Linear -> norm? -> activation -> dropout?`
+        # block as every other width, so it needs no separate code path -- but it is built by
+        # its own `_mlp_blocks` call so its NORM can differ from the hidden layers'.
+        #
+        # WHY THAT KNOB EXISTS. LayerNorm normalises across the `embed_dim` dimensions WITHIN
+        # EACH ROW, so a single dominant pre-activation divides every other dimension down.
+        # That is the mechanism `reports/embedding_collapse_experiment.md` P6.3 named as the
+        # likely cause of the measured collapse (per-dim std 0.934 -> 0.017), after showing
+        # weight decay is arithmetically inert here. `--w-vic` fights that normalisation with
+        # a penalty; `bottleneck_norm="none"` removes the cause instead. `None` means "same as
+        # `norm`", so the default is bit-identical to the pre-2026-08-19 architecture.
+        #
+        # The hidden layers keep their norm regardless: the collapse is a property of the
+        # exported 32-d tensor, and destabilising a 1024-wide stack is not part of the test.
+        self.bottleneck_norm = norm if bottleneck_norm is None else bottleneck_norm
+        hidden = _validate_dims((int(hidden_dim),) * int(n_layers), dropout)
+        layers, prev = _mlp_blocks(self.in_dim, hidden, activation, dropout, norm, bias)
+        neck, trunk_out = _mlp_blocks(prev, _validate_dims((int(embed_dim),), dropout),
+                                      activation, dropout, self.bottleneck_norm, bias)
+        self.shared = nn.Sequential(*(layers + neck))
         self.shared_out_dim = trunk_out
         self.embed_dim = trunk_out
 

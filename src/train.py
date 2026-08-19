@@ -179,6 +179,12 @@ def build_parser():
     p.add_argument("--reg-n-layers", type=sweep_int, default=0)
     p.add_argument("--reg-hidden-dim", type=sweep_int, default=256)
     p.add_argument("--head-norm", default="layer", help="'layer', 'batch' or 'none'")
+    p.add_argument("--bottleneck-norm", default=None,
+                   help="norm on the EXPORTED 32-d block only; defaults to --head-norm. "
+                        "'none' removes the LayerNorm that P6.3 names as the likely collapse "
+                        "mechanism -- it normalises across the 32 dims within each row, so one "
+                        "dominant dimension divides the rest down. Removes the cause where "
+                        "--w-vic penalises the symptom.")
     p.add_argument("--dropout", type=float, default=0.0, help="head dropout")
 
     p.add_argument("--head-lr", type=float, default=1e-3,
@@ -648,7 +654,8 @@ def main(argv=None):
                  embed_dim=args.embed_dim,
                  cls_hidden_dim=args.cls_hidden_dim, cls_n_layers=args.cls_n_layers,
                  reg_hidden_dim=args.reg_hidden_dim, reg_n_layers=args.reg_n_layers,
-                 dropout=args.dropout, norm=args.head_norm),
+                 dropout=args.dropout, norm=args.head_norm,
+                 bottleneck_norm=args.bottleneck_norm),
     ).to(device)
     counts = model.n_parameters()
     print(f"trunk {counts['trunk']:,} + head {counts['head']:,} = {counts['total']:,} params")
