@@ -1,0 +1,45 @@
+{
+  "input": "data/ampc_subset_331k.csv",
+  "input_abspath": "/home/ethan2/finetune_minimol/data/ampc_subset_331k.csv",
+  "input_sha256": "b4eb8c7815e2aeedc43f8ce10f4ae218b2859290901c0f17d6dad10eec954c8f",
+  "input_bytes": 29378084,
+  "rows": 331480,
+  "split_sha256": "3ef97e78a85d445f24cd26732273488fb32e239c183f8d88ddc83de19026a091",
+  "k": 5,
+  "fold_sizes": [
+    66296,
+    66296,
+    66296,
+    66296,
+    66296
+  ],
+  "clustering": {
+    "method": "sphere exclusion (rdkit LeaderPicker) + nearest centroid",
+    "dist_thresh": 0.65,
+    "n_clusters": 32254,
+    "pick_threads": 64
+  },
+  "fingerprint": {
+    "type": "morgan",
+    "radius": 2,
+    "fp_size": 2048
+  },
+  "fold_assignment": {
+    "method": "stratified LPT on whole clusters",
+    "strata": [
+      "pprop >= 5.0",
+      "pprop >= 3.5",
+      "remainder"
+    ],
+    "seed": 0
+  },
+  "n_generic_scaffolds": 54355,
+  "rdkit_version": "2024.03.5",
+  "numpy_version": "2.2.6",
+  "python_version": "3.10.14",
+  "git_commit": "b497d704a8682560b530f237fbcbac48feef90c1",
+  "argv": [
+    "src/split.py"
+  ],
+  "elapsed_sec": 151.2
+}

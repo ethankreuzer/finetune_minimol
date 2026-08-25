@@ -9,8 +9,23 @@ data/*
 !data/reference/
 !data/*.meta.json
 
-# Regenerable in ~2.5 min from src/split.py, and 112 MB.
-data/splits/
+# TRACKED from 2026-08-25, reversing the exclusion that used to sit here. The reason it was
+# excluded -- "regenerable in ~2.5 min from src/split.py" -- turned out not to hold: rdkit
+# shifts Morgan fingerprint details between releases, so regenerating on another machine
+# produces a DIFFERENT partition and a different split_sha256, which makes every number
+# incomparable. They therefore have to be copied rather than rebuilt, and once that is true
+# they may as well travel with the code.
+#
+# The repo now runs on TamIA as well as rabelais, and moving 141 MB by scp on every clone was
+# both error-prone and the slowest part of setting the cluster up. 141 MB is permanent history
+# growth; it is accepted deliberately. The largest single file, fingerprints.npy at 81 MB, is
+# under GitHub's 100 MB hard limit -- keep it that way.
+!data/ampc_subset_331k.csv
+!data/splits/
+
+# NOT tracked, and should not be: 4.5 GB, and genuinely regenerable in ~3.5 min from
+# src/featurize.py, which depends only on the CSV above rather than on an rdkit version.
+data/features/
 
 # Recreated by `uv sync` from the tracked pyproject.toml + uv.lock. ~5 GB with the CUDA
 # wheels, and it is platform-specific -- it must never travel to another cluster.
