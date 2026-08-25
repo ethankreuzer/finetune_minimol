@@ -60,11 +60,21 @@ wheels are built per `(python, torch, cuda)` triple and these are `cp311`):
 
 ```bash
 module load python/3.11
-module spider uv                 # some clusters provide it; if so, load it instead
-pip install --user uv            # otherwise
+
+# Install uv from Astral's standalone installer, NOT pip.
+curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 uv --version
 ```
+
+**Do not use `pip install uv` here.** Alliance's wheelhouse carries no `uv` wheel for their
+platform, so pip falls back to the source tarball (`uv-0.12.6.tar.gz`) — and **uv is written in
+Rust**, so that path tries to bootstrap a Rust toolchain and hangs at
+`Preparing metadata (pyproject.toml)`. The installer above fetches a prebuilt
+`uv-x86_64-unknown-linux-gnu` binary instead, which needs no compiler. Verified 2026-08-25.
+
+`module load python/3.11` is still needed — not for uv itself, but because this project pins
+`requires-python = "==3.11.*"` and uv needs a matching interpreter to build the venv against.
 
 ### Then sync — but move uv's cache off `$HOME` first
 
