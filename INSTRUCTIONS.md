@@ -141,7 +141,45 @@ built, and it depends on the CSV rather than on an rdkit version, so rebuilding 
 .venv/bin/python src/featurize.py
 ```
 
-Verify the splits arrived intact before training anything:
+### Verifying it worked
+
+`featurize.py` prints a rate (~1,700 mol/s) and exits 0, but exit 0 only means it did not crash.
+This checks the cache is complete, matches the tracked CSV, and actually loads:
+
+```bash
+.venv/bin/python - <<'EOF'
+import sys, json, pathlib
+sys.path.insert(0, "src")
+from features import load_features
+d = pathlib.Path("data/features/minimol_v1")
+m = json.loads((d / "meta.json").read_text())
+print("n_graphs     ", f"{m['n_graphs']:,}", " expect 331,480")
+print("input_sha256 ", m["input_sha256"][:16], " expect b4eb8c7815e2aeed")
+ds = load_features(d)                    # re-hashes the CSV and raises on mismatch
+print("loaded       ", f"{len(ds):,}", "graphs")
+g = ds[0]
+print("graph 0      ", g.num_nodes, "atoms, feat", tuple(g.feat.shape))
+assert m["n_graphs"] == len(ds) == 331480
+print("\nOK -- cache complete and matches the tracked CSV")
+EOF
+```
+
+Expected output, measured on rabelais:
+
+```
+n_graphs      331,480  expect 331,480
+input_sha256  b4eb8c7815e2aeed  expect b4eb8c7815e2aeed
+loaded        331,480 graphs
+graph 0       23 atoms, feat (23, 85)
+
+OK -- cache complete and matches the tracked CSV
+```
+
+`load_features` is the real test, not the printed numbers: it **re-hashes the source CSV and
+refuses to load if it changed**, which is what catches a cache built against a different subset.
+`graphs.pt` should also be about **4.8 GB** — a much smaller file means it stopped early.
+
+Verify the splits too, before training anything:
 
 ```bash
 grep split_sha256 data/splits/cluster_kfold_v1/meta.json     # must contain 3ef97e78a85d...
