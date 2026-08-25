@@ -1,7 +1,9 @@
 #!/bin/bash
 # Run a wandb sweep on TamIA: one whole-node job, four agents, one per GPU.
 #
-#   sbatch --account=<def-xxx> scripts/tamia_sweep_agent.sbatch <sweep_id>
+#   sbatch scripts/tamia_sweep_agent.sbatch <sweep_id>
+#
+# --account is set below from Ethan's allocation; `sbatch --account=...` overrides it.
 #
 # See INSTRUCTIONS.md for the full procedure. The three things this script assumes have
 # already happened: the venv exists, the data is on TamIA, and the sweep has been created
@@ -22,24 +24,42 @@
 # and named compute_profile.md as superseded. That was wrong; corrected 2026-08-25.
 
 #SBATCH --job-name=minimol_sweep
+#SBATCH --account=aip-yvesbrun
 #SBATCH --partition=gpubase_bynode_b2
 #SBATCH --time=12:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --exclusive
 #SBATCH --mem=0
-#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=48
+#SBATCH --gres=gpu:h100:4
 #SBATCH --output=sweep_%j.out
 #SBATCH --error=sweep_%j.out
 #SBATCH --open-mode=append
 #
-# --account is deliberately NOT set here: #SBATCH lines cannot read shell variables, so it
-#   comes from `sbatch --account=...` or from SBATCH_ACCOUNT in the environment.
-# --exclusive + --mem=0 ask for the whole node without naming its core count or memory, which
-#   is why neither has to be known in advance -- $SLURM_CPUS_ON_NODE supplies it at runtime.
-# --gres=gpu:4 is the standard Alliance form, but some clusters demand a type
-#   (--gres=gpu:h100:4). It is not guessed silently: check_allocation() below counts the GPUs
-#   actually visible and fails loudly if it did not get four. See INSTRUCTIONS.md section D.
+# MEASURED 2026-08-25, `sinfo -p gpubase_bynode_b2 -o '%c %m %G'`:
+#
+#   CPUS  MEMORY   GRES
+#   48    500000   gpu:h100:4(S:0-1)
+#   64    1000000  gpu:h200:8(S:0-1)
+#
+# TWO NODE TYPES, and they differ in GPU COUNT -- which is why AGENTS is derived from the GPUs
+# actually present rather than fixed at 4. On an h200 node, four agents would leave four of
+# eight GPUs idle inside a whole-node allocation.
+#
+# --gres=gpu:h100:4 pins to the 4-GPU type deliberately. The h200 nodes are faster per GPU
+#   (compute_profile.md §5 projects ~4.3x vs ~3.4x at batch 1024) but carry EIGHT, and a
+#   bayes sweep does not use parallelism well: past roughly 8-16 concurrent trials every trial
+#   is drawn from the same stale posterior and the search degenerates toward random
+#   (compute_profile.md §5). Four concurrent trials keeps the optimiser meaningful. To use
+#   h200 instead, change this to `gpu:h200:8` and --cpus-per-task to 64; everything else
+#   adapts on its own.
+# --cpus-per-task=48 matches the h100 nodes exactly. It is set rather than left to --exclusive
+#   because with --ntasks=1 a cgroup can otherwise bind the task to a single core, which would
+#   silently strangle the dataloaders. $SLURM_CPUS_ON_NODE is still what the worker count is
+#   computed from at runtime, so an h200 node needs no second edit here.
+# --account is set from Ethan's allocation and is still overridable: `sbatch --account=...`
+#   and SBATCH_ACCOUNT both take precedence over this line.
 # --output and --error are the same file on purpose: interleaved order is what makes a remote
 #   diagnosis possible. Per-agent logs are separate, which is the distinction that matters.
 
@@ -57,7 +77,7 @@ WANDB_PROJECT_="${WANDB_PROJECT_:-finetune_minimol}"
 PROXY="${PROXY:-}"                                  # e.g. http://proxy.example:3128
 NO_PROXY_="${NO_PROXY_:-localhost,127.0.0.1,.int.ets1.calculquebec.ca,.computecanada.ca}"
 
-AGENTS="${AGENTS:-4}"                               # one per GPU
+AGENTS="${AGENTS:-auto}"                            # auto = one per GPU actually present
 AGENT_COUNT="${AGENT_COUNT:-0}"                     # trials per agent; 0 = unbounded
 DRY_RUN="${DRY_RUN:-0}"                             # 1 = preflight + stage, launch nothing
 OUTPUTS_ROOT="${OUTPUTS_ROOT:-outputs/enc_v2}"
@@ -76,7 +96,7 @@ die()  { echo; echo "FATAL: $*" >&2; echo "  (see INSTRUCTIONS.md)" >&2; exit 1;
 log "=== validating inputs ==="
 
 [ -n "$SWEEP_ID" ] || die "no sweep id.
-  Usage: sbatch --account=<def-xxx> $0 <sweep_id>
+  Usage: sbatch $0 <sweep_id>
   Create the sweep on a LOGIN node first:
     wandb sweep --project $WANDB_PROJECT_ --entity <entity> sweeps/bayes_v1.yaml"
 
@@ -153,10 +173,15 @@ nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null
   Check the right form for this partition (some clusters need --gres=gpu:h100:4):
     sinfo -p gpubase_bynode_b2 -o '%c %m %G'"
 
-if [ "$GPUS" -lt "$AGENTS" ]; then
+# One agent per GPU, derived rather than assumed. gpubase_bynode_b2 holds both 4-GPU h100
+# nodes and 8-GPU h200 nodes, so a fixed 4 would idle half an h200 allocation.
+if [ "$AGENTS" = "auto" ]; then
+    AGENTS="$GPUS"
+    log "agents    $AGENTS (one per GPU present)"
+elif [ "$GPUS" -lt "$AGENTS" ]; then
     log "WARNING: asked for $AGENTS agents but only $GPUS GPU(s) visible -- reducing to $GPUS."
-    log "         TamIA is meant to allocate whole 4-GPU nodes; if this says 1, the --gres"
-    log "         form is wrong for this partition. See INSTRUCTIONS.md section D."
+    log "         Whole-node allocation should give 4 (h100) or 8 (h200). If this says 1, the"
+    log "         --gres form is wrong for this partition. See INSTRUCTIONS.md section D."
     AGENTS="$GPUS"
 fi
 

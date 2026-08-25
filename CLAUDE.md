@@ -637,10 +637,23 @@ requires the entity explicitly and refuses to start without it, rather than fall
 
 #### Two things about TamIA that change the job shape
 
-- **Whole-node allocation: a job must use all 4 GPUs** (`compute_profile.md` §5), and jobs are
-  expected to run ≥1 h. `scripts/run_grid.sbatch` — ten single-GPU array tasks of ~3 min — is the
-  shape that report says "does not map to TamIA at all". Hence one long job running **four agents,
-  one pinned per GPU**.
+- **Whole-node allocation** (`compute_profile.md` §5), jobs expected ≥1 h.
+  `scripts/run_grid.sbatch` — ten single-GPU array tasks of ~3 min — is the shape that report
+  calls one that "does not map to TamIA at all". Hence one long job running **one agent per GPU**.
+
+  **Measured 2026-08-25** (`sinfo -p gpubase_bynode_b2 -o '%c %m %G'`), correcting this file's
+  earlier "4 GPUs" as if it were universal — **the partition holds two node types**:
+
+  | type | CPUs | memory | GPUs |
+  |---|---|---|---|
+  | **h100** | 48 | 500 GB | **4** |
+  | h200 | 64 | 1000 GB | **8** |
+
+  So the agent count is **derived from the GPUs actually present**, not fixed — on an h200 node a
+  hardcoded 4 would idle half a whole-node allocation. The job pins `--gres=gpu:h100:4`
+  deliberately: h200 is faster per GPU (~4.3× vs ~3.4× projected at batch 1024) but carries
+  eight, and past roughly 8–16 concurrent trials a bayes sweep draws every trial from the same
+  stale posterior and degenerates toward random search. Account is `aip-yvesbrun`.
 - **Stage the feature cache to `$SLURM_TMPDIR`.** `train.py:620` calls `load_features()` inside
   `main()` and `run_config.py` calls `train.main()` per model, so the **4.5 GB cache is re-read
   every trial**. The "1.0 s to load" figure in this file was measured on warm local disk; from a

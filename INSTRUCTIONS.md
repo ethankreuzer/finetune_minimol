@@ -33,9 +33,12 @@ mistake you notice a day later.
 
 Everything here runs on a **login** node. Compute nodes cannot download anything.
 
+**Put this in project space, not `$HOME`.** The venv is ~6 GB and the feature cache 4.5 GB,
+which will crowd a home quota. Your project space is `~/links/projects/aip-yvesbrun`.
+
 ```bash
-git clone <repo-url> ~/finetune_minimol
-cd ~/finetune_minimol
+git clone <repo-url> ~/links/projects/aip-yvesbrun/finetune_minimol
+cd ~/links/projects/aip-yvesbrun/finetune_minimol
 git checkout encoder-vn
 
 UV_HTTP_TIMEOUT=3600 uv sync --extra dev        # ~1 h; the timeout is mandatory, see CLAUDE.md
@@ -59,8 +62,9 @@ grep -c 'cu13\|cuda-toolkit' uv.lock          # must print 0
 
 ```bash
 # from rabelais
-scp     /home/ethan2/finetune_minimol/data/ampc_subset_331k.csv  <you>@tamia:~/finetune_minimol/data/
-scp -r  /home/ethan2/finetune_minimol/data/splits                <you>@tamia:~/finetune_minimol/data/
+DEST=ethankrz@tamia1:~/links/projects/aip-yvesbrun/finetune_minimol/data/
+scp     /home/ethan2/finetune_minimol/data/ampc_subset_331k.csv  "$DEST"
+scp -r  /home/ethan2/finetune_minimol/data/splits                "$DEST"
 
 # on TamIA, once the venv exists (~3.5 min)
 .venv/bin/python src/featurize.py
@@ -98,21 +102,31 @@ design rests on.
 
 ---
 
-## D. Node shape — confirm the GPU request form
+## D. Node shape — already measured, nothing to do
 
-```bash
-sinfo -p gpubase_bynode_b2 -o '%c %m %G'     # cores, memory, gres per node
-scontrol show node <one gpubase node>
-```
+Measured 2026-08-25, `sinfo -p gpubase_bynode_b2 -o '%c %m %G'`:
 
-The script asks for `--gres=gpu:4 --exclusive --mem=0`. Two of those need nothing from you:
-`--exclusive` and `--mem=0` claim the whole node without naming its core count or memory, and the
-script reads the real numbers at runtime from `$SLURM_CPUS_ON_NODE`.
+| type | CPUs | memory | GPUs |
+|---|---|---|---|
+| **h100** | 48 | 500 GB | **4** |
+| h200 | 64 | 1000 GB | **8** |
 
-**`--gres=gpu:4` is the one that might be wrong** — some Alliance clusters require a type, e.g.
-`--gres=gpu:h100:4`. If the `%G` column shows a type, edit the `#SBATCH --gres=` line in
-`scripts/tamia_sweep_agent.sbatch` to match. You do not have to get this right by inspection: the
-script counts the GPUs it actually received and warns or fails if it did not get four.
+The directives are set from this and need no edit: `--account=aip-yvesbrun`,
+`--gres=gpu:h100:4`, `--cpus-per-task=48`, `--exclusive`, `--mem=0`.
+
+**Two things worth knowing about why.**
+
+*The partition holds two node types with different GPU counts.* The script therefore starts **one
+agent per GPU actually present**, rather than a fixed four — on an h200 node a hardcoded 4 would
+leave half of a whole-node allocation idle. Worker counts follow: 11 per agent on h100
+(48 cores ÷ 4), 7 on h200 (64 ÷ 8), both derived at runtime.
+
+*h100 is pinned deliberately, despite h200 being faster per GPU* (`compute_profile.md` §5 projects
+~4.3× vs ~3.4× at batch 1024). h200 nodes carry **eight** GPUs, and a bayes sweep does not use
+parallelism well — past roughly 8–16 concurrent trials, every trial is drawn from the same stale
+posterior and the search degenerates toward random. Four concurrent trials keeps the optimiser
+meaningful. **To switch to h200 anyway:** change `--gres` to `gpu:h200:8` and `--cpus-per-task` to
+`64`. Nothing else needs touching.
 
 ---
 
@@ -139,11 +153,13 @@ running compute there is against Alliance policy.
 Two short jobs. **Do not submit the real one until both pass.**
 
 ```bash
-export SBATCH_ACCOUNT=<def-xxx>
-export WANDB_API_KEY=<key>
-export WANDB_ENTITY_=<entity>
+export WANDB_API_KEY=<key from step A>
+export WANDB_ENTITY_=<your Mila entity>
 export PROXY=http://<host>:<port>
 ```
+
+`--account=aip-yvesbrun` is already in the script, so it does not need exporting. Override it for
+a different allocation with `sbatch --account=...`, which takes precedence.
 
 ### F1 — dry run: proxy, allocation, staging *(~3 min, launches nothing)*
 
