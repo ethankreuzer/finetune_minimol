@@ -161,7 +161,7 @@ Two short jobs. **Do not submit the real one until both pass.**
 
 ```bash
 export WANDB_API_KEY=<key from step A>
-export WANDB_ENTITY_=<your Mila entity, from step A>
+export WANDB_ENTITY_=ethan-kreuzer-mila   # optional: already the default
 ```
 
 That is the whole set. `--account=aip-yvesbrun` is already in the script (override with

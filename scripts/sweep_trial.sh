@@ -28,7 +28,13 @@ cd "$REPO"
 
 # Each is applied only if the environment set it, so running this by hand -- or from an agent
 # on a machine that stages nothing -- falls back to run_config.py's own defaults.
+# --wandb-entity must be passed as a FLAG. Exporting WANDB_ENTITY is NOT enough:
+# run_config.py:351 calls wandb.init(entity=args.wandb_entity), and an explicit entity=
+# argument overrides the environment variable (verified 2026-08-25). Since --wandb-entity
+# still defaults to `ethan_personal`, the env var alone would have left every run trying to
+# write into the OLD account -- a permissions failure under the new key.
 exec "$VENV" src/run_config.py \
+    ${MINIMOL_ENTITY:+--wandb-entity "$MINIMOL_ENTITY"} \
     ${MINIMOL_FEATURES:+--features "$MINIMOL_FEATURES"} \
     ${MINIMOL_SPLITS:+--splits "$MINIMOL_SPLITS"} \
     ${MINIMOL_CSV:+--csv "$MINIMOL_CSV"} \

@@ -70,7 +70,7 @@ set -uo pipefail
 
 REPO="${REPO:-${SLURM_SUBMIT_DIR:-$PWD}}"
 VENV="${VENV:-$REPO/.venv/bin/python}"
-WANDB_ENTITY_="${WANDB_ENTITY_:-}"                 # the NEW Mila-email entity
+WANDB_ENTITY_="${WANDB_ENTITY_:-ethan-kreuzer-mila}"  # the Mila-email entity
 WANDB_PROJECT_="${WANDB_PROJECT_:-finetune_minimol}"
 
 # OPTIONAL override. Normally left empty: `module load httpproxy` below sets the proxy
@@ -296,6 +296,9 @@ if [ "$DRY_RUN" != "0" ]; then
 fi
 
 export WANDB_ENTITY="$WANDB_ENTITY_"
+# Also passed as a flag by the wrapper -- the env var alone loses to wandb.init()'s
+# explicit entity= argument, whose default is the OLD account.
+export MINIMOL_ENTITY="$WANDB_ENTITY_"
 export WANDB_PROJECT="$WANDB_PROJECT_"
 # The agent spawns run_config.py, which reads these for every trial. Passing the data paths
 # through the environment rather than the sweep yaml keeps the yaml machine-independent --
