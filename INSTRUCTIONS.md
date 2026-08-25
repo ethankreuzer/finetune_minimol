@@ -106,40 +106,33 @@ orphans the compiled PyG extensions:
 grep -c 'cu13\|cuda-toolkit' uv.lock          # must print 0
 ```
 
-### The data — `git clone` brings none of it
+### The data — most of it comes with the clone
 
 | what | size | how |
 |---|---|---|
-| `data/ampc_subset_331k.csv` | 29 MB | **copy** from rabelais |
-| `data/splits/cluster_kfold_v1/` | 112 MB | **copy** from rabelais |
-| `data/features/minimol_v1/` | 4.5 GB | **regenerate on TamIA** |
+| `data/ampc_subset_331k.csv` | 29 MB | **tracked** — arrives with `git clone` |
+| `data/splits/cluster_kfold_v1/` | 112 MB | **tracked** — arrives with `git clone` |
+| `data/features/minimol_v1/` | 4.5 GB | **regenerate on TamIA**, one command |
 
-`tamia1` is the login node's *internal* name and does not resolve off-cluster — use
-`tamia.alliancecan.ca` (verified 2026-08-25: `tamia1` fails with "Temporary failure in name
-resolution", `tamia.alliancecan.ca` → 132.219.137.35). No leading `~/` on the remote path: scp
-is already relative to your home there, and a quoted tilde is passed through literally.
+Tracked as of 2026-08-25 — there is **no `scp` step any more**. Only the feature cache has to be
+built, and it depends on the CSV rather than on an rdkit version, so rebuilding it is safe:
 
 ```bash
-# from rabelais
-DEST=ethankrz@tamia.alliancecan.ca:links/projects/aip-yvesbrun/ethankrz/finetune_minimol/data/
-scp     /home/ethan2/finetune_minimol/data/ampc_subset_331k.csv  "$DEST"
-scp -r  /home/ethan2/finetune_minimol/data/splits                "$DEST"
-
 # on TamIA, once the venv exists (~3.5 min)
 .venv/bin/python src/featurize.py
 ```
 
-**Copy the splits; do not regenerate them.** `src/split.py` would rebuild them in ~2.5 min, but
-Morgan fingerprint details shift between rdkit releases, so a rebuild under a different rdkit
-produces a *different* partition and every number stops being comparable to what was measured
-here. Verify they survived the trip:
+Verify the splits arrived intact before training anything:
 
 ```bash
 grep split_sha256 data/splits/cluster_kfold_v1/meta.json     # must contain 3ef97e78a85d...
 ```
 
-If that hash differs, stop — you are about to train on a different partition than everything
-else in this project.
+**Never regenerate the splits.** `src/split.py` would rebuild them in ~2.5 min and it is
+tempting, but Morgan fingerprint details shift between rdkit releases, so a rebuild under a
+different rdkit produces a *different* partition — and every number stops being comparable to
+what was measured on rabelais. That is precisely why they are tracked rather than rebuilt. If
+the hash above differs, stop.
 
 ---
 

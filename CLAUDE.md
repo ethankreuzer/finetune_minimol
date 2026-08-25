@@ -68,8 +68,9 @@ Three things that decide whether this works, each with its own section below or 
 1. **TamIA compute nodes have no internet.** The route out is `module load httpproxy`, under
    a new wandb account on Ethan's Mila email. Without it `wandb agent` blocks rather than
    failing — see the correction under "The sweep".
-2. **`git push` carries no data.** The CSV and splits must be copied (141 MB) and the 4.5 GB
-   feature cache regenerated there. `INSTRUCTIONS.md` §B.
+2. **A clone is now self-sufficient except for the feature cache.** The CSV and the splits are
+   tracked as of 2026-08-25; only `src/featurize.py` (~3.5 min) has to run there.
+   `INSTRUCTIONS.md` §B.
 3. **The sweep saves no weights.** `run_config.py:238` forces `--no-save-checkpoint`, and the
    MiniMol-layer analysis is post-hoc on a trained model — so **the winner must be re-run with
    `--keep-checkpoints`** or there is nothing to extract features from. `INSTRUCTIONS.md` §I.
@@ -986,11 +987,21 @@ Full list in NOTES §9. The ones that bite hardest:
   rdkit 2024.03.5; `minimol_ft` will carry a different one. This is why
   `fingerprints.npy` is persisted rather than recomputed, and why `meta.json` records the
   version.
-- **`data/` is 1.5 GB and untracked.** `data/splits/cluster_kfold_v1/` alone is 112 MB.
-  `.gitignore` excludes `data/*` wholesale and un-ignores exactly two things: `data/reference/`
-  (the frozen MiniMol embeddings `verify_trunk.py` checks against, a few hundred KB, useless
-  unless it travels with the code) and `data/*.meta.json`. Splits are regenerable in ~2.5 min
-  from `src/split.py`, which is why they are not tracked.
+- **`data/` is 1.5 GB, and since 2026-08-25 about 141 MB of it is tracked.** `.gitignore`
+  excludes `data/*` wholesale and un-ignores: `data/reference/` (the frozen MiniMol embeddings
+  `verify_trunk.py` checks against), `data/*.meta.json`, **`data/ampc_subset_331k.csv`** (29 MB)
+  and **`data/splits/cluster_kfold_v1/`** (112 MB).
+
+  The splits used to be excluded as "regenerable in ~2.5 min from `src/split.py`". **That
+  reasoning was wrong**: rdkit shifts Morgan fingerprint details between releases, so a rebuild
+  on another machine yields a different partition and a different `split_sha256` — see the
+  Morgan footgun below, which this file already stated two sections away from the claim it
+  contradicted. They must be copied, so they are tracked. Accepted cost: 141 MB of permanent
+  history. `fingerprints.npy` is 81 MB, under GitHub's 100 MB hard limit — keep it that way.
+
+  **`data/features/minimol_v1/` stays untracked** and has its own `.gitignore` rule: 4.5 GB, and
+  genuinely regenerable, because `src/featurize.py` depends on the CSV rather than on an rdkit
+  version.
 
 ---
 
