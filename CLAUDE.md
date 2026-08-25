@@ -13,6 +13,13 @@ and its 512-d output, measured against the pinned stack. Read it before touching
 
 ## What this branch is, and what it is not
 
+**The question this branch exists to answer** (settled with Ethan 2026-08-25): do **features
+from different parts of MiniMol** carry pProp predictive ability, usable as components of the
+encoder? Today only one tensor is ever exported — the head's bottleneck, downstream of MiniMol's
+final 512-d readout. MiniMol has 16 GNN layers, a virtual node updated 15 times, and two
+positional encoders, none of which has ever been probed.
+`Minimol_architecture_overview.md` is the map of what is available to tap.
+
 The deliverable is still a molecular encoder, and its consumer is still the **deep-kernel-
 learning GP** in a colleague's downstream active-learning project. What ended on 2026-08-25 is
 the *contract* that shaped every earlier decision: that the product is specifically a frozen
@@ -40,44 +47,49 @@ came across as an available tool at its inert default `0.0`; the conclusion did 
 
 ## NEXT: what to run
 
-**The width scan — how many dimensions does the encoder actually need?** This is
-§8's open question 1 of the design document (`git show
-embedding-head-32d:reports/featurizer_design.md`), which that document names and does not
-settle, and it is the question this branch exists to ask.
+**Tune the hyperparameters on TamIA, then analyse MiniMol's internal features.** The branch's
+real question — settled with Ethan 2026-08-25 — is **whether features from different parts of
+MiniMol carry pProp predictive ability**, as components of the encoder. That analysis is only
+worth trusting if the model whose internals get probed is not badly configured, so a sweep comes
+first. It does not need to be rigorous.
 
-What is already known, both from the sealed arc: **R1 saturates early** — held-out-cluster kNN
-Spearman reaches 96% of its value by k=4 — while **R2, decodability of held-out structure
-against components retained, has never been measured at any width.** Those two curves together
-are the entire case for or against 32.
+**The full procedure is `INSTRUCTIONS.md`.** Read it there, not here — it is the runbook, and
+duplicating its steps into this file would guarantee the two drift.
 
 ```bash
-VENV=/home/ethan2/finetune_minimol/.venv/bin/python
-for D in 8 16 32 64 128; do
-  for S in 0 1 2; do
-    $VENV src/train.py --fold 0 --seed $S --embed-dim $D \
-      --out outputs/enc_v2/width_scan/d${D}/seed${S}
-  done
-done
-$VENV src/feature_utility.py --runs outputs/enc_v2/width_scan -o reports/width_r1.csv  # R1
-$VENV src/emb_readout.py     --runs outputs/enc_v2/width_scan -o reports/width_r2.csv  # R2
+# on a LOGIN node
+wandb sweep --project finetune_minimol --entity <mila_entity> sweeps/bayes_v1.yaml
+# then the gate, then the real job -- INSTRUCTIONS.md sections F and G
+sbatch --account=<def-xxx> scripts/tamia_sweep_agent.sbatch <sweep_id>
 ```
 
-**The `d${D}/seed${S}` nesting is not cosmetic.** `feature_utility.py:236` reads a run's *cell*
-as `d.parent.name`, so `--out .../d64/seed0` gives cell `d64` and the k-curve groups by width.
-Flattening it to `.../d64_seed0` makes every run's cell `width_scan` and the grouping collapses.
+Three things that decide whether this works, each with its own section below or in the runbook:
 
-**Pre-register the reading before running**, because the consumer is unchanged and you have
-evidence and a request, not authority:
+1. **TamIA compute nodes have no internet.** The route out is a Mila HTTP proxy, under a new
+   wandb account on Ethan's Mila email. Without it `wandb agent` blocks rather than failing —
+   see the correction under "The sweep".
+2. **`git push` carries no data.** The CSV and splits must be copied (141 MB) and the 4.5 GB
+   feature cache regenerated there. `INSTRUCTIONS.md` §B.
+3. **The sweep saves no weights.** `run_config.py:238` forces `--no-save-checkpoint`, and the
+   MiniMol-layer analysis is post-hoc on a trained model — so **the winner must be re-run with
+   `--keep-checkpoints`** or there is nothing to extract features from. `INSTRUCTIONS.md` §I.
 
-| outcome | reading | what to do |
-|---|---|---|
-| R2 saturates by 32, like R1 | 32 is generous; width is not the binding constraint | drop the width question, move to *what fills* the dimensions |
-| R2 still climbing at 32 | the bottleneck is discarding recoverable structure | a concrete, evidenced case to take to the DKL side |
-| R1 degrades below 32 but R2 flat | the two requirements disagree about width | report the exchange rate; the choice is the consumer's |
+**Still open: what the sweep should actually vary.** `bayes_v1.yaml` sweeps 10 axes (both phase
+lengths, three LR peaks, weight decay, dropout, four loss weights). Given "does not have to be
+too rigorous", a narrower schedule+LR sweep would converge in far fewer trials — bayes over 10
+dimensions is still early in its exploration at a few hundred trials. Settle this **before**
+creating the sweep, together with `fold_list`/`seed_list`: `"0"`/`"0"` makes a trial one model
+(~4 min projected) against ~40 min for the full 5×2, a 10× swing that sets `--count`.
 
-**If the answer comes back "32 stays", the scan is still not wasted** — it prices what 32 costs
-instead of assuming it is free. A prediction with no failure branch is the defect this project
-has already been bitten by once; write the branch down first.
+### Deferred: the width scan
+
+`--embed-dim` is a free variable (`train.py:173`) and its default of 32 is **inherited from the
+sealed 32-d arc, not chosen** — no measurement in this repo has ever compared it against another
+width. Scanning it against the R1 and R2 probes is `featurizer_design.md` §8's open question 1
+(`git show embedding-head-32d:reports/featurizer_design.md`). It was this branch's planned first
+experiment and is **superseded, not cancelled**: the MiniMol-feature question came first. Worth
+returning to, since R1 is known to saturate by k≈4–8 while R2 has never been measured at any
+width.
 
 ---
 
@@ -100,7 +112,10 @@ has already been bitten by once; write the branch down first.
 | Pooled out-of-fold tail metrics | **written, code path exercised; no real runs pooled yet** — `src/pool_oof.py` |
 | Compute profile / benchmarks | **done** — `src/benchmark.py`, `reports/compute_profile.md` |
 | Config-level runner (1 config = 1 wandb run) | **done, verified 2026-08-13** — `src/run_config.py` |
-| Width scan (the branch's first experiment) | **not started** — see "NEXT" above |
+| TamIA sweep infrastructure | **written 2026-08-25, not yet run on TamIA** — `scripts/tamia_sweep_agent.sbatch`, `scripts/sweep_trial.sh`, `INSTRUCTIONS.md`. Guards and preflight verified locally; the cluster itself is unexercised |
+| Hyperparameter tune (the branch's first experiment) | **not started** — see "NEXT" |
+| MiniMol-internal feature analysis | **not started, design pending.** Post-hoc on a trained model, so it needs a `--keep-checkpoints` re-run of the sweep winner |
+| Width scan | **deferred**, superseded by the above — see "Deferred: the width scan" |
 | Hyperparameter sweep (wandb bayes) | **blocked on the width question** — `sweeps/bayes_v1.yaml` is stale; `bayes_v2.yaml` was deliberately not imported |
 | R3 probe — GP uncertainty | **not imported.** Lives at `embedding-head-32d:src/uncertainty_probe.py`, repaired 2026-08-24; re-import if the width work needs an uncertainty reading |
 | `src/export.py` | **does not exist.** Nothing on disk is exportable — see "The export gap" |
@@ -217,9 +232,13 @@ src/
 sweeps/
   bayes_v1.yaml                      the wandb bayes sweep over the two-phase schedule
 scripts/
-  run_grid.sbatch                    the 5×2 grid as a SLURM array (gpu:1, NOT mps)
+  tamia_sweep_agent.sbatch           the TamIA sweep job: 4 agents, 1/GPU  <- the sweep entry
+  sweep_trial.sh                     one trial; what `wandb agent` execs
+  run_grid.sbatch                    the 5×2 grid as a SLURM array — LOCAL scheduler only,
+                                     does NOT map to TamIA (compute_profile.md §5)
   sample_gpu.sh                      nvidia-smi telemetry sampler
 reports/                             compute_profile.md + its evidence
+INSTRUCTIONS.md                      the TamIA runbook  <- the operational authority
 NOTES.md                             the reference document; §12 is the pProp_MLP translation
 Minimol_architecture_overview.md     SMILES -> 512-d, measured; read before touching trunk.py
 ```
@@ -590,23 +609,56 @@ what has been exercised.
 
 ### The sweep — `sweeps/bayes_v1.yaml`
 
-**Blocked, and its ranges are stale.** `bayes_v1.yaml` predates the bottleneck entirely, so it
-sweeps neither `--embed-dim` nor `--w-vic`. `bayes_v2.yaml` was deliberately **not** imported —
-its ranges and its "`w_vic` is the most important axis" framing both assume the 32-d pin.
-**Do not register a sweep before the width question is settled:** every `train.py` flag
-re-hashes every `config_id`, so a sweep launched first would have its trials invalidated by the
-architecture decision that follows. The mechanics below are still correct.
+**The operational procedure lives in `INSTRUCTIONS.md`, not here.** That file is the runbook —
+account setup, data transfer, the proxy, the gate, troubleshooting. This section is the *why*.
 
-wandb bayes, on TamIA (**`wandb agent` does work there** — confirmed 2026-08-13, superseding
-`reports/compute_profile.md`'s "a wandb sweep cannot run on TamIA", which is why this is wandb
-and not Optuna).
+**`bayes_v1.yaml`'s parameter ranges are stale.** It predates the bottleneck entirely, so it
+sweeps neither `--embed-dim` nor `--w-vic`. `bayes_v2.yaml` was deliberately **not** imported to
+this branch — its ranges and its "`w_vic` is the most important axis" framing both assume the
+32-d pin. Its *mechanics* below are correct and were repaired 2026-08-25; its *scope* is an open
+question (see NEXT).
+
+#### CORRECTED 2026-08-25: `wandb agent` does NOT work unaided on TamIA
+
+This section previously read "**`wandb agent` does work there** — confirmed 2026-08-13,
+superseding `reports/compute_profile.md`'s 'a wandb sweep cannot run on TamIA'". **That is
+false, and it had the supersession backwards.** `reports/compute_profile.md:331` was right:
+**TamIA's compute nodes have no direct internet**, and `wandb agent` must reach the wandb server
+to fetch each configuration.
+
+The failure mode is what makes this worth a correction rather than a footnote: without a route
+out, **`wandb agent` does not error — it blocks**, waiting for a config that never arrives, while
+the job looks healthy and burns its whole allocation.
+
+**The route that does work is a Mila HTTP proxy**, which Ethan can use as a Mila student, under a
+**new wandb account on his Mila email**. So the `ethan_personal` entity that `train.py:256` still
+defaults to is *not* the entity this sweep runs under — `scripts/tamia_sweep_agent.sbatch`
+requires the entity explicitly and refuses to start without it, rather than falling back.
+
+#### Two things about TamIA that change the job shape
+
+- **Whole-node allocation: a job must use all 4 GPUs** (`compute_profile.md` §5), and jobs are
+  expected to run ≥1 h. `scripts/run_grid.sbatch` — ten single-GPU array tasks of ~3 min — is the
+  shape that report says "does not map to TamIA at all". Hence one long job running **four agents,
+  one pinned per GPU**.
+- **Stage the feature cache to `$SLURM_TMPDIR`.** `train.py:620` calls `load_features()` inside
+  `main()` and `run_config.py` calls `train.main()` per model, so the **4.5 GB cache is re-read
+  every trial**. The "1.0 s to load" figure in this file was measured on warm local disk; from a
+  networked home with four agents contending it would dominate the run.
 
 ```bash
-wandb sweep --project finetune_minimol --entity ethan_personal sweeps/bayes_v1.yaml
-python -m wandb agent ethan_personal/finetune_minimol/<sweep_id>
+# on a LOGIN node -- compute nodes cannot create a sweep
+wandb sweep --project finetune_minimol --entity <mila_entity> sweeps/bayes_v1.yaml
+sbatch --account=<def-xxx> scripts/tamia_sweep_agent.sbatch <sweep_id>
 ```
 
-`program:` is **`src/run_config.py`**, so one trial is one configuration is one run.
+`program:` is **`scripts/sweep_trial.sh`**, a thin wrapper that execs `src/run_config.py` — so one
+trial is still one configuration is one run. The wrapper exists because a sweep is created **once**
+and then served by whatever agents attach to it, so the yaml must carry nothing machine-specific:
+it previously hardcoded `/home/ethan2/finetune_minimol/.venv/bin/python`, which does not exist on
+TamIA. The wrapper resolves the interpreter from its own location and adds the `$SLURM_TMPDIR`
+data paths, which do not exist when the sweep is created. **Its flags go before `"$@"`**, because
+`--wandb-tags` is `nargs="*"` and must stay last on the line.
 
 **The objective is `final/goal_metric_mean`** — the mean over models of each model's
 final-epoch `goal_metric`. Two things it is deliberately not:

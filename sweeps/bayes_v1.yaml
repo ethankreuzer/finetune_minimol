@@ -33,23 +33,31 @@
 # because selection is at the final epoch and both phases anneal to `--eta-min`: every
 # trial is scored on a settled model, whatever its budget.
 
-program: src/run_config.py
+# `scripts/sweep_trial.sh`, not `src/run_config.py` directly. The wrapper supplies the
+# interpreter and the job-local data paths -- see its header, and the command block below.
+program: scripts/sweep_trial.sh
 method: bayes
 
 metric:
   name: final/goal_metric_mean
   goal: maximize
 
-# The interpreter must be the repo venv -- `python` on a TamIA compute node is not it.
+# NO ABSOLUTE INTERPRETER PATH HERE, deliberately (changed 2026-08-25). This block used to
+# name /home/ethan2/finetune_minimol/.venv/bin/python, which does not exist on TamIA. A sweep
+# is created ONCE and then served by whatever agents attach to it, so anything machine-specific
+# written here makes the sweep unservable from a second machine. `scripts/sweep_trial.sh`
+# resolves the interpreter from its own location instead, and adds the data paths the running
+# job stages into $SLURM_TMPDIR -- a path that does not exist when the sweep is created.
+#
 # `${args}` expands to one `--<key>=<value>` per swept parameter, spelled with underscores;
 # `train.py:dashed` normalises those to the dashed CLI, and `run_config.py` reuses it.
 # `--wandb-tags` is `nargs="*"`, so it goes LAST: anywhere earlier it would compete with
-# `${args}` for the tokens that follow it. Everything else is pinned in `parameters` rather
-# than written here, so each flag appears on the command line exactly once -- spelling one
-# in both places would leave argparse silently taking whichever came last.
+# `${args}` for the tokens that follow it -- and it is why the wrapper puts its own flags
+# BEFORE "$@". Everything else is pinned in `parameters` rather than written here, so each
+# flag appears on the command line exactly once -- spelling one in both places would leave
+# argparse silently taking whichever came last.
 command:
   - ${env}
-  - /home/ethan2/finetune_minimol/.venv/bin/python
   - ${program}
   - ${args}
   - --wandb-tags
