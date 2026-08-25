@@ -233,6 +233,8 @@ export MINIMOL_CSV="$DATA_CSV"
 export MINIMOL_WORKERS="$WORKERS"
 export MINIMOL_OUTPUTS_ROOT="$OUTPUTS_ROOT"
 
+# `--count` is per AGENT -- verified from `wandb agent --help`: "Maximum number of runs this
+# agent will execute." So four agents at --count N run 4N trials in total, not N.
 COUNT_ARG=""
 [ "$AGENT_COUNT" -gt 0 ] && COUNT_ARG="--count $AGENT_COUNT"
 
@@ -243,16 +245,30 @@ pids=()
 for i in $(seq 0 $((AGENTS - 1))); do
     AGENT_LOG="logs/agent_${SLURM_JOB_ID:-local}_${i}.log"
     log "agent $i -> GPU $i -> $AGENT_LOG"
+    # --forward-signals is load-bearing, not tidiness. run_config.py trains by calling
+    # train.main() IN-PROCESS, so the trial is a child of the agent. Without this flag a TERM
+    # to the agent pid -- which is what the trap below sends, and what SLURM sends at the wall
+    # clock -- would kill the agent and leave the trial's python running, orphaned. wandb would
+    # then show that run as active forever. Verified present in this wandb:
+    #   `wandb agent --help` -> "-f, --forward-signals  Forward signals ... to child runs".
     CUDA_VISIBLE_DEVICES="$i" \
-    "$VENV" -m wandb agent $COUNT_ARG \
+    "$VENV" -m wandb agent --forward-signals $COUNT_ARG \
         "$WANDB_ENTITY_/$WANDB_PROJECT_/$SWEEP_ID" \
         > "$AGENT_LOG" 2>&1 &
     pids+=($!)
 done
 
-# Kill the whole group if SLURM signals the wall clock, so agents do not outlive the job and
-# leave trials marked running forever on the wandb side.
-trap 'log "signal received -- terminating agents"; kill "${pids[@]}" 2>/dev/null; wait; exit 143' TERM INT
+# SLURM sends TERM at the wall clock. Forward it to every agent, which (via
+# --forward-signals above) forwards it to the trial each is running, so nothing outlives the
+# job. `wait` after the kill lets them exit cleanly rather than being severed mid-write.
+cleanup() {
+    log "signal received -- terminating $AGENTS agent(s)"
+    kill -TERM "${pids[@]}" 2>/dev/null
+    wait 2>/dev/null
+    log "agents stopped"
+    exit 143
+}
+trap cleanup TERM INT
 
 log "all agents launched; waiting"
 rc=0

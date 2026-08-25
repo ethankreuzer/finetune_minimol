@@ -182,9 +182,18 @@ hardware nothing has ever run on.
 sbatch scripts/tamia_sweep_agent.sbatch <sweep_id>          # 12 h, b2, 4 agents
 ```
 
-Leave `AGENT_COUNT` unset for unbounded, or set it from F2's measured time:
-`AGENT_COUNT ≈ (11 h / trial_minutes)`, leaving an hour of margin so the wall clock does not kill
-a trial mid-flight.
+**Leaving `AGENT_COUNT` unset is the recommended option.** The agents then run until the wall
+clock, which the script handles cleanly: SLURM's TERM is forwarded to each agent and on to the
+trial it is running (`--forward-signals`), so nothing is orphaned and no run is left showing as
+active on wandb forever.
+
+If you do want to bound it, two things make a precise formula misleading:
+
+- **`--count` is per agent**, not per job (`wandb agent --help`: *"Maximum number of runs this
+  agent will execute"*). Four agents at `--count 50` is 200 trials, not 50.
+- **F2's timing is a floor, not an estimate.** It ran with `AGENTS=1` on an otherwise idle node.
+  Four concurrent agents contend for the same staged cache, page cache and CPU loaders, so the
+  real per-trial time will be *higher*. Round down generously — or just leave it unset.
 
 **After ~15 minutes, check that all four agents are working:**
 
