@@ -161,9 +161,26 @@ constructed MiniMolTrunk in 0.4s (featurization_n_jobs = -1)
 ```
 
 **If it sits at the warning for a few minutes, it is importing torch and graphium**, not hung —
-that is tens of thousands of small files off a Lustre filesystem and is slow the first time.
-Once `constructed MiniMolTrunk` appears you get a progress line with a live rate and ETA. On
-rabelais the whole thing is ~3.5 min at 1,745 mol/s over 128 cores; at 32 cores expect ~15 min.
+tens of thousands of small files off Lustre, slow the first time. Measured on TamIA: **85.6 s**
+to construct the trunk, against 0.4 s on rabelais. Once `constructed MiniMolTrunk` appears you
+get a progress line with a live rate and ETA. On rabelais the whole run is ~3.5 min at
+1,745 mol/s over 128 cores; at 32 cores expect ~15 min.
+
+**`Killed` right after `constructed MiniMolTrunk` means the login node's memory cap**, not a bug.
+Observed 2026-08-25. Peak usage is the ~4.8 GB of accumulated graphs plus per-worker overhead,
+which is well past a login node's per-user limit, and featurization is the first thing that
+allocates. This is the failure the `salloc` above prevents.
+
+Nothing is corrupted when that happens: `graphs.pt` is written only after every chunk completes,
+and `meta.json` after that, so a kill leaves the directory empty and `load_features` would refuse
+it regardless. Clear it and retry inside the allocation:
+
+```bash
+rm -rf data/features/minimol_v1
+```
+
+If it is still tight on memory, `--chunk 10000` (default 25,000) lowers the transient per call —
+it does not change the result, only peak usage and progress granularity.
 
 ### Verifying it worked
 
