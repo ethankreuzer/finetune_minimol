@@ -136,10 +136,34 @@ grep -c 'cu13\|cuda-toolkit' uv.lock          # must print 0
 Tracked as of 2026-08-25 — there is **no `scp` step any more**. Only the feature cache has to be
 built, and it depends on the CSV rather than on an rdkit version, so rebuilding it is safe:
 
+**Run it in a job, not on the login node.** It is CPU-only, but it spawns one worker per visible
+core (`featurization_n_jobs = -1`) and holds ~4.8 GB of graphs in memory before writing. Alliance
+enforces per-user CPU and memory caps on login nodes, and the memory ceiling is what kills it.
+
 ```bash
-# on TamIA, once the venv exists (~3.5 min)
+salloc --account=aip-yvesbrun --time=1:00:00 --cpus-per-task=32 --mem=64G
+
+# then, inside the allocation
+module load python/3.11
+cd ~/links/projects/aip-yvesbrun/ethankrz/finetune_minimol
 .venv/bin/python src/featurize.py
+exit
 ```
+
+(If `salloc` is rejected for want of a partition, `sinfo -s` lists what this cluster offers.)
+
+**What correct progress looks like.** The first output after the `pkg_resources` warning — which
+is benign, and is why `setuptools<81` is pinned — should be:
+
+```
+constructed MiniMolTrunk in 0.4s (featurization_n_jobs = -1)
+    50,000 /  331,480  (1,745 mol/s, eta  2.7 min)
+```
+
+**If it sits at the warning for a few minutes, it is importing torch and graphium**, not hung —
+that is tens of thousands of small files off a Lustre filesystem and is slow the first time.
+Once `constructed MiniMolTrunk` appears you get a progress line with a live rate and ETA. On
+rabelais the whole thing is ~3.5 min at 1,745 mol/s over 128 cores; at 32 cores expect ~15 min.
 
 ### Verifying it worked
 
