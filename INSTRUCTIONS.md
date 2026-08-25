@@ -36,13 +36,19 @@ cannot access — and it would fail *after* the preflight had already passed, de
 
 Everything here runs on a **login** node. Compute nodes cannot download anything.
 
-**Put this in project space, not `$HOME`.** The venv is ~6 GB and the feature cache 4.5 GB,
-which will crowd a home quota. Your project space is `~/links/projects/aip-yvesbrun`.
+**Put this in project space, not `$HOME`.** The venv is ~6 GB and the feature cache 4.5 GB, and
+Alliance home directories carry a **file-count** quota as well as a size one — a torch venv is
+tens of thousands of small files, which is the limit you hit first.
+
+Your personal space inside the group allocation is
+`/home/e/ethankrz/links/projects/aip-yvesbrun/ethankrz` (the trailing `ethankrz` is the standard
+`projects/<group>/<user>/` layout — the level above it is shared with the rest of the group, so
+do not clone there).
 
 ```bash
 git clone https://github.com/ethankreuzer/finetune_minimol.git \
-          ~/links/projects/aip-yvesbrun/finetune_minimol
-cd ~/links/projects/aip-yvesbrun/finetune_minimol
+          ~/links/projects/aip-yvesbrun/ethankrz/finetune_minimol
+cd ~/links/projects/aip-yvesbrun/ethankrz/finetune_minimol
 git checkout encoder-vn
 
 UV_HTTP_TIMEOUT=3600 uv sync --extra dev        # ~1 h; the timeout is mandatory, see CLAUDE.md
@@ -66,7 +72,7 @@ grep -c 'cu13\|cuda-toolkit' uv.lock          # must print 0
 
 ```bash
 # from rabelais
-DEST=ethankrz@tamia1:~/links/projects/aip-yvesbrun/finetune_minimol/data/
+DEST=ethankrz@tamia1:~/links/projects/aip-yvesbrun/ethankrz/finetune_minimol/data/
 scp     /home/ethan2/finetune_minimol/data/ampc_subset_331k.csv  "$DEST"
 scp -r  /home/ethan2/finetune_minimol/data/splits                "$DEST"
 
@@ -144,7 +150,7 @@ meaningful. **To switch to h200 anyway:** change `--gres` to `gpu:h200:8` and `-
 ## E. Create the sweep *(login node — compute nodes cannot)*
 
 ```bash
-cd ~/links/projects/aip-yvesbrun/finetune_minimol
+cd ~/links/projects/aip-yvesbrun/ethankrz/finetune_minimol
 export WANDB_API_KEY=<key from step A>
 wandb login
 
@@ -170,7 +176,7 @@ running compute there is against Alliance policy.
 Two short jobs. **Do not submit the real one until both pass.**
 
 ```bash
-cd ~/links/projects/aip-yvesbrun/finetune_minimol     # sbatch logs land in the cwd
+cd ~/links/projects/aip-yvesbrun/ethankrz/finetune_minimol     # sbatch logs land in the cwd
 export WANDB_API_KEY=<key from step A>
 ```
 
