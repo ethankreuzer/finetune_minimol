@@ -95,8 +95,27 @@ is also newer than the one that wrote this lock (0.11.7, `version = 1, revision 
 `--locked` is what turns any disagreement between them into an immediate error instead of an
 hour of downloading the wrong stack.
 
-Those exports are per-shell. Put them in `~/.bashrc`, or re-issue them each time — `uv sync`
-with the default cache dir is the one step that quietly puts 31 GB back in `$HOME`.
+### Make it stick across logins
+
+`module load` and `export` last only for the current shell. uv's installer usually appends a
+PATH line to `~/.bashrc` itself — check with `grep -n 'local/bin' ~/.bashrc` — but the rest does
+not persist. Add this once:
+
+```bash
+cat >> ~/.bashrc <<'EOF'
+
+# --- finetune_minimol ---
+export PATH="$HOME/.local/bin:$PATH"                                   # uv
+export UV_CACHE_DIR=~/links/projects/aip-yvesbrun/ethankrz/.uv-cache   # keep 31 GB off $HOME
+export UV_HTTP_TIMEOUT=3600                                            # 780 MB torch wheel
+EOF
+```
+
+**Deliberately not in `.bashrc`: `module load python/3.11`.** SLURM jobs source `.bashrc` too, and
+a module load there applies to every job you ever run, which is a good way to break an unrelated
+one later. `scripts/tamia_sweep_agent.sbatch` loads it itself (override with `PYTHON_MODULE=...`),
+so the job does not depend on your shell being set up a particular way. Load it by hand when you
+want to run `uv` or the venv interactively.
 
 **Audit the lock before trusting the env** — this is a standing rule in `CLAUDE.md`, not a
 formality; graphium declares no torch dependency, so a bad resolve silently installs CUDA 13 and

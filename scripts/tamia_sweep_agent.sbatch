@@ -70,6 +70,7 @@ set -uo pipefail
 
 REPO="${REPO:-${SLURM_SUBMIT_DIR:-$PWD}}"
 VENV="${VENV:-$REPO/.venv/bin/python}"
+PYTHON_MODULE="${PYTHON_MODULE:-python/3.11}"   # the module the venv was BUILT against
 WANDB_ENTITY_="${WANDB_ENTITY_:-ethan-kreuzer-mila}"  # the Mila-email entity
 WANDB_PROJECT_="${WANDB_PROJECT_:-finetune_minimol}"
 
@@ -94,6 +95,32 @@ die()  { echo; echo "FATAL: $*" >&2; echo "  (see INSTRUCTIONS.md)" >&2; exit 1;
 # Every one of these is cheap and happens before a single GPU-second is used. A 12-hour
 # allocation must never be spent discovering a typo.
 
+# ------------------------------------------------------------------ 0. environment modules
+# `module` is an Lmod shell FUNCTION, not a binary, and a non-login `#!/bin/bash` job does not
+# always inherit it. Source Lmod's init once here; both this step and the proxy step need it.
+ensure_lmod() {
+    command -v module >/dev/null 2>&1 && return 0
+    for init in /etc/profile.d/z-01-lmod.sh /etc/profile.d/modules.sh \
+                "${LMOD_PKG:-/nonexistent}/init/bash"; do
+        # shellcheck disable=SC1090
+        [ -r "$init" ] && . "$init" && log "sourced Lmod init from $init" && return 0
+    done
+    return 1
+}
+
+log "=== environment ==="
+if ensure_lmod; then
+    # LOAD THE PYTHON MODULE THE VENV WAS BUILT AGAINST. This is not optional on Alliance
+    # clusters: `.venv/bin/python` links against the module's interpreter and its shared
+    # libraries, so without the module loaded it can fail to start even though the file is
+    # present and executable. Checking `[ -x "$VENV" ]` alone would sail straight past that
+    # and the job would die on the first trial, after the proxy preflight had already passed.
+    module load "$PYTHON_MODULE" 2>/dev/null && log "module load $PYTHON_MODULE" \
+        || log "WARNING: could not load $PYTHON_MODULE -- continuing, the venv may still work"
+else
+    log "WARNING: no Lmod. Skipping module loads; fine off-cluster, suspicious on TamIA."
+fi
+
 log "=== validating inputs ==="
 
 [ -n "$SWEEP_ID" ] || die "no sweep id.
@@ -113,7 +140,18 @@ log "=== validating inputs ==="
 
 [ -d "$REPO" ]  || die "repo not found at $REPO (override with REPO=...)"
 [ -x "$VENV" ]  || die "venv interpreter not found at $VENV
-  Run \`uv sync\` on a LOGIN node first -- compute nodes cannot download packages."
+  Run \`uv sync --locked --extra dev\` on a LOGIN node first -- compute nodes cannot download."
+
+# Actually RUN it. The executable bit says nothing about whether the interpreter can start:
+# a venv built against a module python fails here, not at the -x test, when the module is
+# missing. One subprocess now beats discovering it inside the first trial.
+PYVER=$("$VENV" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>&1) \
+    || die "the venv interpreter will not run: $PYVER
+  Usually the python module the venv was built against is not loaded. This job loads
+  \`$PYTHON_MODULE\`; override with PYTHON_MODULE=... if the venv was built against another."
+[ "$PYVER" = "3.11" ] || die "venv is python $PYVER, expected 3.11.
+  pyproject pins requires-python = \"==3.11.*\" -- the PyG extension wheels are cp311."
+log "python    $PYVER (venv runs)"
 
 log "repo      $REPO"
 log "venv      $VENV"
@@ -134,16 +172,7 @@ export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v '/\.venv/bin$' | tr '\n' ':' 
 
 log "=== proxy ==="
 
-# `module` is an Lmod shell FUNCTION, not a binary. A non-login `#!/bin/bash` script does not
-# always inherit it, and `module: command not found` in a batch job is a classic way to lose an
-# allocation to something trivial. Source Lmod's init if the function is missing.
-if ! command -v module >/dev/null 2>&1; then
-    for init in /etc/profile.d/z-01-lmod.sh /etc/profile.d/modules.sh \
-                "${LMOD_PKG:-/nonexistent}/init/bash"; do
-        # shellcheck disable=SC1090
-        [ -r "$init" ] && . "$init" && log "sourced Lmod init from $init" && break
-    done
-fi
+ensure_lmod || true
 
 if [ -n "$PROXY" ]; then
     # Manual override, for a cluster without the module or to test a specific proxy.
