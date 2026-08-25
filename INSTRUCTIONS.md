@@ -114,9 +114,14 @@ grep -c 'cu13\|cuda-toolkit' uv.lock          # must print 0
 | `data/splits/cluster_kfold_v1/` | 112 MB | **copy** from rabelais |
 | `data/features/minimol_v1/` | 4.5 GB | **regenerate on TamIA** |
 
+`tamia1` is the login node's *internal* name and does not resolve off-cluster — use
+`tamia.alliancecan.ca` (verified 2026-08-25: `tamia1` fails with "Temporary failure in name
+resolution", `tamia.alliancecan.ca` → 132.219.137.35). No leading `~/` on the remote path: scp
+is already relative to your home there, and a quoted tilde is passed through literally.
+
 ```bash
 # from rabelais
-DEST=ethankrz@tamia1:~/links/projects/aip-yvesbrun/ethankrz/finetune_minimol/data/
+DEST=ethankrz@tamia.alliancecan.ca:links/projects/aip-yvesbrun/ethankrz/finetune_minimol/data/
 scp     /home/ethan2/finetune_minimol/data/ampc_subset_331k.csv  "$DEST"
 scp -r  /home/ethan2/finetune_minimol/data/splits                "$DEST"
 
