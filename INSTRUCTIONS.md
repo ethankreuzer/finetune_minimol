@@ -84,21 +84,28 @@ else in this project.
 
 ---
 
-## C. The proxy
+## C. The proxy — nothing for you to configure
 
-Get the Mila HTTP proxy host and port. Then, **on a login node**:
+**There is no host or port to find.** Alliance support's answer — *"just use `module load
+httpproxy`"* — is the whole mechanism: it is an Lmod module that sets `http_proxy` and
+`https_proxy` for you. The sbatch loads it and then checks the variables actually got set.
+
+**This is unrelated to your wandb account.** The account decides who owns the runs; the proxy
+decides whether the compute node can reach the internet at all. Creating the Mila account will
+not change anything about the proxy, and it does not need to.
+
+Optional sanity check on a **login** node:
 
 ```bash
-export PROXY=http://<host>:<port>
-https_proxy=$PROXY curl --max-time 25 -sS -o /dev/null -w '%{http_code}\n' https://api.wandb.ai/
+module spider httpproxy      # confirms the module exists on this cluster
 ```
 
-**Expect `404`.** That is success — the bare endpoint wants a path, and any HTTP response at all
-proves the route works. Do not expect `200`.
+You cannot usefully test the proxy from a login node — login nodes have internet regardless, so
+it would pass either way. **Whether it works from a compute node is what section F tests**, and
+that is the question the whole design rests on.
 
-A login node has internet regardless, so this only proves your proxy *syntax* is right. Whether
-the proxy works **from a compute node** is what section F tests, and it is the question the whole
-design rests on.
+If the module ever turns out not to exist, the script takes `PROXY=http://<host>:<port>` as a
+manual override — but you should not need it.
 
 ---
 
@@ -154,12 +161,12 @@ Two short jobs. **Do not submit the real one until both pass.**
 
 ```bash
 export WANDB_API_KEY=<key from step A>
-export WANDB_ENTITY_=<your Mila entity>
-export PROXY=http://<host>:<port>
+export WANDB_ENTITY_=<your Mila entity, from step A>
 ```
 
-`--account=aip-yvesbrun` is already in the script, so it does not need exporting. Override it for
-a different allocation with `sbatch --account=...`, which takes precedence.
+That is the whole set. `--account=aip-yvesbrun` is already in the script (override with
+`sbatch --account=...`), and the proxy comes from `module load httpproxy` inside the job — there
+is nothing to export for it.
 
 ### F1 — dry run: proxy, allocation, staging *(~3 min, launches nothing)*
 
@@ -170,6 +177,7 @@ DRY_RUN=1 sbatch --partition=gpubase_bynode_b1 --time=00:20:00 \
 
 Read `sweep_<jobid>.out`. It must show **all** of:
 
+- [ ] `module load httpproxy`, then non-empty `http_proxy` / `https_proxy` lines
 - [ ] `wandb API reachable through the proxy (HTTP ...)` ← **the one that matters**
 - [ ] `gpus 4`
 - [ ] `staged in <n>s -> /...` — not the `$SLURM_TMPDIR unset` warning
@@ -227,7 +235,9 @@ hide it.
 
 | symptom | cause | fix |
 |---|---|---|
-| Job runs, agent log empty, nothing on wandb | The proxy is not reaching wandb from the compute node. `wandb agent` does not error on this — it blocks forever. | The preflight should have caught it. If it passed and this still happens, the proxy allows the API check but not the agent's traffic — take it to Mila support. |
+| Job runs, agent log empty, nothing on wandb | The proxy is not reaching wandb from the compute node. `wandb agent` does not error on this — it blocks forever. | The preflight should have caught it. If it passed and this still happens, the proxy allows the API check but not the agent's traffic — take it to support. |
+| `neither http_proxy nor https_proxy is set after loading httpproxy` | The module loaded but exported nothing, or is named differently here. | `module spider httpproxy` on a login node. Worst case, set `PROXY=http://<host>:<port>` to bypass it. |
+| ``no `module` command available`` | Lmod's init was not found by the job. | The script probes the usual locations; if yours differs, `export LMOD_PKG=<path>` before `sbatch`. |
 | `FATAL:` in `sweep_<jobid>.out` | A guard fired before anything was spent. | The message names the missing variable. Nothing was wasted. |
 | Job rejected at `sbatch` | Bad `--account`, or the wrong `--gres` form for this partition. | Section D. `sacctmgr show user $USER` lists valid accounts. |
 | `gpus 1` warning in the log | `--gres=gpu:4` did not give four GPUs. | Section D — likely needs a GPU type. |

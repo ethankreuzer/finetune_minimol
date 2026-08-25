@@ -73,7 +73,8 @@ VENV="${VENV:-$REPO/.venv/bin/python}"
 WANDB_ENTITY_="${WANDB_ENTITY_:-}"                 # the NEW Mila-email entity
 WANDB_PROJECT_="${WANDB_PROJECT_:-finetune_minimol}"
 
-# The Mila HTTP proxy. Compute nodes reach the outside only through this.
+# OPTIONAL override. Normally left empty: `module load httpproxy` below sets the proxy
+# variables itself, so there is no host:port to supply. Set this only to bypass the module.
 PROXY="${PROXY:-}"                                  # e.g. http://proxy.example:3128
 NO_PROXY_="${NO_PROXY_:-localhost,127.0.0.1,.int.ets1.calculquebec.ca,.computecanada.ca}"
 
@@ -110,10 +111,6 @@ log "=== validating inputs ==="
   train.py:256 still defaults to 'ethan_personal', which is the OLD account, and a silent
   fallback would file this sweep's runs under it."
 
-[ -n "$PROXY" ] || die "PROXY is not set.
-  TamIA compute nodes have no direct internet (reports/compute_profile.md:331). Set the Mila
-  HTTP proxy, e.g.:  export PROXY=http://<host>:<port>"
-
 [ -d "$REPO" ]  || die "repo not found at $REPO (override with REPO=...)"
 [ -x "$VENV" ]  || die "venv interpreter not found at $VENV
   Run \`uv sync\` on a LOGIN node first -- compute nodes cannot download packages."
@@ -131,13 +128,62 @@ unset VIRTUAL_ENV_PROMPT
 export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v '/\.venv/bin$' | tr '\n' ':' | sed 's/:$//')
 
 # ------------------------------------------------------------------------------- 3. the proxy
+# TamIA compute nodes have no direct internet. The route out is the `httpproxy` MODULE, which
+# sets http_proxy/https_proxy itself -- there is no host:port to supply, and nothing to look
+# up. (Confirmed with Alliance support 2026-08-25: "just use `module load httpproxy`".)
 
-export http_proxy="$PROXY"  HTTP_PROXY="$PROXY"
-export https_proxy="$PROXY" HTTPS_PROXY="$PROXY"
-export no_proxy="$NO_PROXY_" NO_PROXY="$NO_PROXY_"
+log "=== proxy ==="
+
+# `module` is an Lmod shell FUNCTION, not a binary. A non-login `#!/bin/bash` script does not
+# always inherit it, and `module: command not found` in a batch job is a classic way to lose an
+# allocation to something trivial. Source Lmod's init if the function is missing.
+if ! command -v module >/dev/null 2>&1; then
+    for init in /etc/profile.d/z-01-lmod.sh /etc/profile.d/modules.sh \
+                "${LMOD_PKG:-/nonexistent}/init/bash"; do
+        # shellcheck disable=SC1090
+        [ -r "$init" ] && . "$init" && log "sourced Lmod init from $init" && break
+    done
+fi
+
+if [ -n "$PROXY" ]; then
+    # Manual override, for a cluster without the module or to test a specific proxy.
+    export http_proxy="$PROXY"  HTTP_PROXY="$PROXY"
+    export https_proxy="$PROXY" HTTPS_PROXY="$PROXY"
+    log "proxy set manually from \$PROXY: $PROXY"
+elif command -v module >/dev/null 2>&1; then
+    # NO PIPE HERE, and no command substitution. `module` is a shell function whose entire
+    # job is to export into the CALLING shell; a pipe would run it in a subshell and the
+    # exports would die with it. This was written as `module load httpproxy | sed ...` for
+    # prettier output and failed exactly that way -- the check below caught it. Its output
+    # goes straight to the job log, which is good enough.
+    log "module load httpproxy"
+    module load httpproxy || true
+else
+    die "no \`module\` command available and \$PROXY is not set.
+  TamIA compute nodes have no direct internet; the route out is \`module load httpproxy\`.
+  If Lmod is genuinely absent here, set PROXY=http://<host>:<port> to bypass this."
+fi
+
+# Whichever path we took, something must actually be set -- `module load` of a missing module
+# prints a warning and returns success in some Lmod configurations, so its exit status is not
+# evidence. This checks the outcome rather than the attempt.
+if [ -z "${http_proxy:-}${https_proxy:-}" ]; then
+    die "neither http_proxy nor https_proxy is set after loading httpproxy.
+  The module did not do what it should. Check \`module spider httpproxy\` on a login node,
+  or set PROXY=http://<host>:<port> explicitly."
+fi
+
+# Only supply no_proxy if the module did not; it knows the cluster's internal domains better
+# than this file does.
+if [ -z "${no_proxy:-}" ]; then
+    export no_proxy="$NO_PROXY_" NO_PROXY="$NO_PROXY_"
+fi
+
+log "http_proxy  ${http_proxy:-<unset>}"
+log "https_proxy ${https_proxy:-<unset>}"
+log "no_proxy    ${no_proxy:-<unset>}"
 
 log "=== proxy preflight ==="
-log "proxy     $PROXY"
 
 # Hard timeout, so an unreachable proxy fails in seconds rather than hanging. --max-time
 # bounds the whole request, not just the connect, which is the failure mode here.
@@ -153,7 +199,9 @@ case "$CODE" in
     die "cannot reach https://api.wandb.ai through the proxy ($CODE).
   This is the failure the preflight exists to catch: without it, \`wandb agent\` would not
   error -- it would block for the whole allocation waiting for a config.
-  Check PROXY, and that your account is permitted to use it." ;;
+  The proxy variables are set (shown above) but nothing answered through them. Check that
+  \`module load httpproxy\` is the right mechanism for this cluster and that your account is
+  permitted to use it." ;;
 esac
 
 # ------------------------------------------------------------- 4. verify we got the allocation

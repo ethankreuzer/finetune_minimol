@@ -65,9 +65,9 @@ sbatch --account=<def-xxx> scripts/tamia_sweep_agent.sbatch <sweep_id>
 
 Three things that decide whether this works, each with its own section below or in the runbook:
 
-1. **TamIA compute nodes have no internet.** The route out is a Mila HTTP proxy, under a new
-   wandb account on Ethan's Mila email. Without it `wandb agent` blocks rather than failing —
-   see the correction under "The sweep".
+1. **TamIA compute nodes have no internet.** The route out is `module load httpproxy`, under
+   a new wandb account on Ethan's Mila email. Without it `wandb agent` blocks rather than
+   failing — see the correction under "The sweep".
 2. **`git push` carries no data.** The CSV and splits must be copied (141 MB) and the 4.5 GB
    feature cache regenerated there. `INSTRUCTIONS.md` §B.
 3. **The sweep saves no weights.** `run_config.py:238` forces `--no-save-checkpoint`, and the
@@ -630,10 +630,19 @@ The failure mode is what makes this worth a correction rather than a footnote: w
 out, **`wandb agent` does not error — it blocks**, waiting for a config that never arrives, while
 the job looks healthy and burns its whole allocation.
 
-**The route that does work is a Mila HTTP proxy**, which Ethan can use as a Mila student, under a
-**new wandb account on his Mila email**. So the `ethan_personal` entity that `train.py:256` still
-defaults to is *not* the entity this sweep runs under — `scripts/tamia_sweep_agent.sbatch`
-requires the entity explicitly and refuses to start without it, rather than falling back.
+**The route that does work is `module load httpproxy`** (Alliance support, 2026-08-25) — an
+Lmod module that sets `http_proxy`/`https_proxy` itself, so there is no host:port anywhere in
+this repo. Runs go under a **new wandb account on Ethan's Mila email**, so the `ethan_personal`
+entity that `train.py:256` still defaults to is *not* the entity this sweep runs under;
+`scripts/tamia_sweep_agent.sbatch` requires the entity explicitly and refuses to start without
+it, rather than falling back into an entity that account cannot write to.
+
+**`module` is a shell function, and that is a live footgun.** Only a function can export into
+the calling shell, so `module load httpproxy` must not be piped or run in a command
+substitution — doing either runs it in a subshell and the proxy variables vanish with it. This
+was written as `module load httpproxy | sed ...` for prettier output and failed exactly that
+way; the script now checks that `http_proxy`/`https_proxy` are non-empty **after** the load,
+because `module load` of a missing module can still exit 0.
 
 #### Two things about TamIA that change the job shape
 
