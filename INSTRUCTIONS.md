@@ -84,8 +84,16 @@ Rust**, so that path tries to bootstrap a Rust toolchain and hangs at
 # the ~1 h sync -- and it silently undoes the decision to keep everything off $HOME.
 export UV_CACHE_DIR=~/links/projects/aip-yvesbrun/ethankrz/.uv-cache
 
-UV_HTTP_TIMEOUT=3600 uv sync --extra dev        # ~1 h; the timeout is mandatory, see CLAUDE.md
+UV_HTTP_TIMEOUT=3600 uv sync --locked --extra dev   # ~1 h; the timeout is mandatory
 ```
+
+**`--locked` is not optional.** It makes uv *assert* the lockfile is current and fail if it
+would re-resolve, rather than quietly resolving something else. This repo has already been bitten
+once: graphium declares no torch dependency, so an unpinned resolve picked the newest torch and
+orphaned the compiled PyG extensions (CLAUDE.md, "The uv environment"). The uv on TamIA (0.12.5)
+is also newer than the one that wrote this lock (0.11.7, `version = 1, revision = 3`), so
+`--locked` is what turns any disagreement between them into an immediate error instead of an
+hour of downloading the wrong stack.
 
 Those exports are per-shell. Put them in `~/.bashrc`, or re-issue them each time — `uv sync`
 with the default cache dir is the one step that quietly puts 31 GB back in `$HOME`.
