@@ -97,8 +97,11 @@ KNN_K = 20
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--runs", nargs="+", type=Path, default=[Path("outputs/rank_v1")],
-                   help="roots to search for run directories (val_embeddings.npy + meta.json)")
+    p.add_argument("--runs", nargs="+", type=Path, default=[Path("outputs/enc_v2")],
+                   help="roots to search for run directories (val_embeddings.npy + meta.json); "
+                        "defaults to this branch's namespace, NOT bare outputs/ -- 61 runs from "
+                        "the 32-d arc live there and find_runs does not gate on the provenance "
+                        "triple it records")
     p.add_argument("--splits", type=Path, default=Path("data/splits/cluster_kfold_v1"))
     p.add_argument("--n-sample", type=int, default=5000,
                    help="molecules per fold for the structural readout; pairs grow as n^2")

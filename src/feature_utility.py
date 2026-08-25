@@ -197,10 +197,14 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--runs", nargs="+", type=Path,
-                   default=[Path("outputs/rank_v1"), Path("outputs/rank_v2")])
-    p.add_argument("--cells", nargs="+",
-                   default=["A_base", "C_w1", "D_w3", "E_w10"],
-                   help="cells to probe; the k-curve is read against the w_vic dose")
+                   default=[Path("outputs/enc_v2")],
+                   help="roots to search; defaults to this branch's namespace, NOT bare "
+                        "outputs/ -- 61 runs from the 32-d arc live there and this probe "
+                        "does not gate on the provenance triple")
+    p.add_argument("--cells", nargs="+", default=None,
+                   help="restrict to these cells (a cell is the run directory's PARENT name); "
+                        "default is no filter, so any layout works. The 32-d arc used "
+                        "A_base/C_w1/D_w3/E_w10 -- naming those here reproduces its reading")
     p.add_argument("--splits", type=Path, default=Path("data/splits/cluster_kfold_v1"))
     p.add_argument("--csv-path", type=Path, default=Path("data/ampc_subset_331k.csv"))
     p.add_argument("--features", type=Path, default=Path("data/features/minimol_v1"))
@@ -234,7 +238,7 @@ def main(argv=None):
         for emb in sorted(Path(root).rglob("val_embeddings.npy")):
             d = emb.parent
             cell = d.parent.name
-            if cell in args.cells and (d / "meta.json").exists():
+            if (args.cells is None or cell in args.cells) and (d / "meta.json").exists():
                 runs.append(d)
 
     rows = []

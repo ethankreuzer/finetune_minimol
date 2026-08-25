@@ -1,31 +1,109 @@
-# finetune_minimol
+# finetune_minimol — the encoder branch
 
-Fine-tune the **entire MiniMol trunk** (~10M params) on AmpC docking-score regression —
-not the usual frozen-embedding + MLP workflow. Gradients must reach all trunk parameters.
+Fine-tune the **entire MiniMol trunk** (~10M params) on AmpC docking data to produce a
+**molecular encoder** — not the usual frozen-embedding + MLP workflow. Gradients must reach
+all trunk parameters.
 
 `NOTES.md` is the reference document: background, source-level findings, and the full plan.
 This file is the operational summary. When they disagree, `NOTES.md` §§1–11 is authoritative
 on *why*; this file is authoritative on *what currently exists*.
 
+`Minimol_architecture_overview.md` describes what MiniMol itself does between a SMILES string
+and its 512-d output, measured against the pinned stack. Read it before touching `trunk.py`.
+
+## What this branch is, and what it is not
+
+The deliverable is still a molecular encoder, and its consumer is still the **deep-kernel-
+learning GP** in a colleague's downstream active-learning project. What ended on 2026-08-25 is
+the *contract* that shaped every earlier decision: that the product is specifically a frozen
+`SMILES → R³²`, exported from the last layer before the linear task heads.
+
+**`embed_dim`, the export point, and the objective are now open design questions**, argued on
+their own merits and measured, rather than assumed. That is §6 question 4 of the design
+document — *"is `embed_dim = 32` renegotiable?"* — answered by building the evidence rather
+than by asking first. **That document is not on this branch**; read it with
+`git show embedding-head-32d:reports/featurizer_design.md`.
+
+**The prior arc is kept, not deleted.** ~60 GPU-runs establishing whether the 32-d bottleneck
+is a valid featurizer are thesis material and live complete on the `embedding-head-32d` branch,
+whose own CLAUDE.md is the authority on that work:
+
+```bash
+git show embedding-head-32d:CLAUDE.md          # the sealed 32-d record
+git log --oneline main..embedding-head-32d     # the 15 commits of that arc
+```
+
+**Do not treat its conclusions as binding here** — in particular the `w_vic=3` pin. `--w-vic`
+came across as an available tool at its inert default `0.0`; the conclusion did not.
+
 ---
 
-## State as of 2026-08-12
+## NEXT: what to run
+
+**The width scan — how many dimensions does the encoder actually need?** This is
+§8's open question 1 of the design document (`git show
+embedding-head-32d:reports/featurizer_design.md`), which that document names and does not
+settle, and it is the question this branch exists to ask.
+
+What is already known, both from the sealed arc: **R1 saturates early** — held-out-cluster kNN
+Spearman reaches 96% of its value by k=4 — while **R2, decodability of held-out structure
+against components retained, has never been measured at any width.** Those two curves together
+are the entire case for or against 32.
+
+```bash
+VENV=/home/ethan2/finetune_minimol/.venv/bin/python
+for D in 8 16 32 64 128; do
+  for S in 0 1 2; do
+    $VENV src/train.py --fold 0 --seed $S --embed-dim $D \
+      --out outputs/enc_v2/width_scan/d${D}/seed${S}
+  done
+done
+$VENV src/feature_utility.py --runs outputs/enc_v2/width_scan -o reports/width_r1.csv  # R1
+$VENV src/emb_readout.py     --runs outputs/enc_v2/width_scan -o reports/width_r2.csv  # R2
+```
+
+**The `d${D}/seed${S}` nesting is not cosmetic.** `feature_utility.py:236` reads a run's *cell*
+as `d.parent.name`, so `--out .../d64/seed0` gives cell `d64` and the k-curve groups by width.
+Flattening it to `.../d64_seed0` makes every run's cell `width_scan` and the grouping collapses.
+
+**Pre-register the reading before running**, because the consumer is unchanged and you have
+evidence and a request, not authority:
+
+| outcome | reading | what to do |
+|---|---|---|
+| R2 saturates by 32, like R1 | 32 is generous; width is not the binding constraint | drop the width question, move to *what fills* the dimensions |
+| R2 still climbing at 32 | the bottleneck is discarding recoverable structure | a concrete, evidenced case to take to the DKL side |
+| R1 degrades below 32 but R2 flat | the two requirements disagree about width | report the exchange rate; the choice is the consumer's |
+
+**If the answer comes back "32 stays", the scan is still not wasted** — it prices what 32 costs
+instead of assuming it is free. A prediction with no failure branch is the defect this project
+has already been bitten by once; write the branch down first.
+
+---
+
+---
+
+## State as of 2026-08-25
 
 | Piece | Status |
 |---|---|
 | Dataset subset (331,480 molecules) | **done** — `src/subset.py` |
 | 5-fold cluster CV splits | **done, verified, frozen** — `src/split.py`, `src/splits.py` |
 | Environment (uv, in-repo `.venv`) | **done, verified** — `pyproject.toml` + `uv.lock` |
-| Trainable trunk | **done, 10/10 checks pass** — `src/trunk.py`, `src/verify_trunk.py` |
+| Trainable trunk | **done, 11/11 checks pass** — `src/trunk.py`, `src/verify_trunk.py` |
 | Feature cache (Phase 2) | **done, verified** — `src/featurize.py`, `src/features.py` |
-| Prototype training run | **done, verified** — `src/train.py`, 5 epochs, fold 0 seed 0 |
 | Loss / metrics / objective ported from `pProp_MLP` | **done, 8/8 checks pass** — `src/losses.py`, `src/metrics.py`, `src/objective.py`, `src/verify_metrics.py` |
 | Dual head (binary @ 3.5 + regression) | **done** — `head.DualHead` |
+| Bottleneck + embedding export (`--embed-dim`) | **done, imported from the 32-d arc** — `head.py`, `train.py:173`. Width is a free variable; **the default 32 is inherited, not chosen** |
+| R1 probe — held-out-cluster kNN / ridge | **done** — `src/feature_utility.py` |
+| R2 probe — ECFP structural readout | **done** — `src/emb_readout.py` |
 | Pooled out-of-fold tail metrics | **written, code path exercised; no real runs pooled yet** — `src/pool_oof.py` |
 | Compute profile / benchmarks | **done** — `src/benchmark.py`, `reports/compute_profile.md` |
-| 5×2 grid runner / SLURM | `scripts/run_grid.sbatch` exists; sweep driver not started |
 | Config-level runner (1 config = 1 wandb run) | **done, verified 2026-08-13** — `src/run_config.py` |
-| Hyperparameter sweep (wandb bayes) | **config written 2026-08-13, not yet launched** — `sweeps/bayes_v1.yaml` |
+| Width scan (the branch's first experiment) | **not started** — see "NEXT" above |
+| Hyperparameter sweep (wandb bayes) | **blocked on the width question** — `sweeps/bayes_v1.yaml` is stale; `bayes_v2.yaml` was deliberately not imported |
+| R3 probe — GP uncertainty | **not imported.** Lives at `embedding-head-32d:src/uncertainty_probe.py`, repaired 2026-08-24; re-import if the width work needs an uncertainty reading |
+| `src/export.py` | **does not exist.** Nothing on disk is exportable — see "The export gap" |
 | Layer-wise freeze/unfreeze | **not started, deferred 2026-08-13** — see "Deferred: layer-wise freeze/unfreeze" |
 
 The trunk reproduces frozen MiniMol embeddings **exactly** (max|Δ| = 0.000e+00 over 64×512),
@@ -33,9 +111,12 @@ gradients reach all 284 reachable trunk tensors (7,919,912 params), and an optim
 moves trunk weights. Two further tensors are unreachable inside graphium itself — see "The
 rw_pos dead norm" below. `verification.md` reads `OVERALL: PASS`.
 
-Commit `c00bc4e` tracks the env (`pyproject.toml` + `uv.lock`), the trunk, the feature cache
-code and training, so `git clone` + `uv sync` reproduces on TamIA. Everything from the loss /
-metrics / objective port onward is still uncommitted.
+**Verified on this branch 2026-08-25, after the import commit:** `verify_trunk.py` 11/11 and
+`verify_metrics.py` 8/8 — including the loss-parity check and the freeze negative test, the two
+most at risk since `verify_metrics.py` is byte-identical to `main`'s while `losses.py` arrived
+with 101 lines of change. Smoke run at `--embed-dim 64` wrote `val_embeddings.npy` at
+**(5000, 64)**, which is the assertion that proves the width knob reaches the exported artifact.
+Head is 1,644,866 params at width 64 against 1,611,938 at 32.
 
 ---
 
@@ -120,13 +201,15 @@ src/
 
   trunk.py / model.py / head.py      the trainable trunk, the two-group optimizer, DualHead
   train.py                           one fold, one seed  <- the entry point
-  losses.py                          4-term loss + the three weighting flavours
+  losses.py                          5-term loss (vic off by default) + the two weighting flavours
   metrics.py                         AP / correlation / error / enrichment, all suffixed
   objective.py                       goal_metric + the derived OBJECTIVE_VERSION
   normalization.py                   --pprop-norm; ported verbatim
-  run_paths.py                       outputs/<sweep_id>/<run_id>  <- never hardcode a path
+  run_paths.py                       <outputs-root>/<sweep_id>/<run_id>  <- never hardcode a path
   pool_oof.py                        pooled out-of-fold tail metrics across the 5 folds
   run_config.py                      one hyperparameter config -> ONE wandb run  <- sweep entry
+  feature_utility.py                 R1: held-out-cluster kNN + ridge on the export
+  emb_readout.py                     R2: ECFP structural readout + bottleneck geometry
   verify_trunk.py / verify_metrics.py    the two verification suites
   dump_metric_reference.py           run under pProp_MLP's venv; feeds verify_metrics
   benchmark.py / concurrency.py / collect_runs.py / report_charts.py   the compute profile
@@ -137,7 +220,12 @@ scripts/
   sample_gpu.sh                      nvidia-smi telemetry sampler
 reports/                             compute_profile.md + its evidence
 NOTES.md                             the reference document; §12 is the pProp_MLP translation
+Minimol_architecture_overview.md     SMILES -> 512-d, measured; read before touching trunk.py
 ```
+
+**`outputs/` is shared with the sealed 32-d arc.** This branch writes under `outputs/enc_v2/`
+by default and the probes read from there by default. See "The outputs namespace" below —
+it is the one mistake here that would produce a plausible number rather than an error.
 
 ---
 
@@ -249,10 +337,70 @@ these splits**. That is the only honest baseline for the fine-tuned arm — `pPr
 numbers were measured on different data and a different partition, and cannot be quoted
 against these.
 
+### The deliverable is the encoder, not the predictions
+
+The head is `512 → 1024 → 1024 → **embed_dim** → {Linear cls, Linear reg}`. **The export point
+is the output of `head.shared`** — post-norm, post-activation, the exact tensor the linear heads
+consume — and it is written per run as `val_embeddings.npy`, `[n_val, embed_dim]`, final-epoch,
+in the same row order as `val_predictions.npy` and `val_indices.npy`.
+
+That inverts what "good" means. `goal_metric` scores the *predictions*, and the predictions are
+not the product — they are a training signal for the representation. **Treat `goal_metric` as a
+proxy and the R1/R2 probes as the thing being optimised.**
+
+`--embed-dim` (`train.py:173`, `type=sweep_int`) sets the width. **Its default of 32 is
+inherited from the sealed arc, not chosen** — no measurement in this repo has ever compared it
+against another width. That is what "NEXT" exists to fix. Measured 2026-08-25: at width 64 the
+head is 1,644,866 params against 1,611,938 at 32, and `val_embeddings.npy` comes back
+`(5000, 64)` on a `--subset 5000` smoke run.
+
+Two properties the arc chose deliberately, both now **open rather than settled**:
+
+- **The bottleneck is shared, not per-task.** The deliverable is one vector; a per-task
+  bottleneck would be shaped by a single objective.
+- **The task heads are linear** (`--cls-n-layers 0 --reg-n-layers 0`), which makes "pProp is
+  linear in the exported embedding" literally true. That was chosen for an RBF/Matérn kernel.
+  Under a **DKL** — which supplies its own warping — the property is worth less than it was,
+  and it is not free: a target affine in the export pushes the marginal likelihood toward a very
+  long lengthscale, so the kernel goes nearly flat.
+
+### The outputs namespace — the one silent failure mode
+
+**`--outputs-root` defaults to `outputs/enc_v2`, not `outputs/`** (`train.py:241`; one edit
+covers `run_config.py` too, since `mirror_train_arguments` walks `train.py`'s parser).
+
+The reason is measured: **61 runs from the 32-d arc carry `val_embeddings.npy` under
+`outputs/`** across seven roots (`wvic_scan`, `rank_v1/2/3`, `ckpt_v4`, `_no_sweep`, `_verify`).
+Both probes discover runs by `rglob` over a root, and **neither gates on the provenance
+triple** — `emb_readout.py` records `objective_version` / `split_sha256` / `input_sha256` as CSV
+columns but never filters on them, and `feature_utility.py` filters only on `--cells`.
+Directory separation is the only defense.
+
+It is a **default rather than a documented convention** because a probe that silently pools two
+arcs returns a plausible number, not an error. Both probes' `--runs` defaults were repointed to
+`outputs/enc_v2` for the same reason; they previously defaulted to `outputs/rank_v1` and
+`rank_v2`, which are the old arc. `--outputs-root` is excluded from `config_id`, so none of this
+moves what is trained.
+
+**Never point a probe at bare `outputs/`.** Measured 2026-08-25: `outputs/enc_v2` holds 1 run,
+bare `outputs/` finds 62.
+
+### The export gap
+
+**`src/export.py` does not exist**, and `run_config.py` forces `--no-save-checkpoint`, so
+**nothing on disk today is exportable.** Whatever configuration is chosen must be re-run with
+`--keep-checkpoints` before anything reaches the downstream project.
+
+The head is trivially portable; **the trunk is not.** Reconstructing it needs graphium 2.4.7,
+the minimol 1.3.4 wheel, and `trunk.py`'s exact construction ordering, so the downstream project
+must vendor `trunk.py` / `head.py` / `model.py` or put this `src/` on `sys.path`. State this in
+any handover.
+
 ### The task is joint, and binary at pProp ≥ 3.5
 
 `head.DualHead` puts a **classification logit** and a **regression scalar** on one shared MLP
-over the 512-d embedding. 3.5 is the threshold at which binders become possible, and it is
+over the 512-d embedding, narrowing to an `--embed-dim` bottleneck first — that bottleneck's
+output is the exported encoder. 3.5 is the threshold at which binders become possible, and it is
 also the finest split leaving a learnable positive class: **3,153 molecules, 619–643 per
 validation fold**, against only **100 in the whole dataset** at pProp ≥ 5.0.
 
@@ -264,11 +412,16 @@ existed solely to demote those 46 artifacts, has nothing left to do. It is porte
 ### The loss — `src/losses.py`
 
 ```
-loss = w_cls · cls  +  huber  +  w_pair · pair  +  w_std · std
+loss = w_cls · cls  +  huber  +  w_pair · pair  +  w_std · std  +  w_vic · vic
 ```
 
+`vic` is a VICReg-style variance + covariance penalty on the bottleneck, **off by default**
+(`--w-vic 0.0`). It came across from the 32-d arc as an available tool; **its `w_vic=3` pin did
+not.** That pin was selected against a 32-d-specific target and is not binding here — see the
+sealed record if you need its evidence.
+
 Huber is **grounded at weight 1** — the only term anchoring the absolute pProp level, so the
-other three are measured against it and only its `delta` is swept. Three deliberate
+others are measured against it and only its `delta` is swept. Three deliberate
 deviations from the port:
 
 - **`cls` is BCE normalised by `w.sum()`, not by `N`.** `CrossEntropyLoss(weight=w)` divides
@@ -280,7 +433,7 @@ deviations from the port:
   the smaller number while the weighted huber pulled toward the larger. They would fight.
 - **`pair` stays unweighted**, exactly as ported. It is O(B²) — ~1.4M pairs at batch 1200.
 
-`combined_loss` returns the four term values **unscaled**, and they are logged that way: a
+`combined_loss` returns the term values **unscaled**, and they are logged that way: a
 term that has collapsed and a term whose weight is tiny look identical once multiplied.
 
 ### Weighting — `--weights {uniform,balanced}`, default `balanced`
@@ -436,6 +589,13 @@ what has been exercised.
 
 ### The sweep — `sweeps/bayes_v1.yaml`
 
+**Blocked, and its ranges are stale.** `bayes_v1.yaml` predates the bottleneck entirely, so it
+sweeps neither `--embed-dim` nor `--w-vic`. `bayes_v2.yaml` was deliberately **not** imported —
+its ranges and its "`w_vic` is the most important axis" framing both assume the 32-d pin.
+**Do not register a sweep before the width question is settled:** every `train.py` flag
+re-hashes every `config_id`, so a sweep launched first would have its trials invalidated by the
+architecture decision that follows. The mechanics below are still correct.
+
 wandb bayes, on TamIA (**`wandb agent` does work there** — confirmed 2026-08-13, superseding
 `reports/compute_profile.md`'s "a wandb sweep cannot run on TamIA", which is why this is wandb
 and not Optuna).
@@ -536,12 +696,14 @@ Ambiguous in the supervisor's guidance, and worth resolving with him before writ
    axis entirely — edge features rather than node depth. Always frozen, unfrozen last, or on
    the same axis?
 4. **Does the frozen bottom ever unfreeze**, or stay frozen for the whole run?
-5. **How does this interact with the deliverable?** *If* the product is a pProp-specific 32-d
-   embedding (raised 2026-08-13, not yet confirmed with the supervisor — his head-sizing
-   advice assumed otherwise), then freezing 14 of 16 GNN blocks leaves the representation
-   mostly pretrained, which argues for unfreezing more; feature distortion (LP-FT, Kumar et
-   al. 2022) argues for less. That trade-off is a research question, not an implementation
-   detail.
+5. **How does this interact with the deliverable?** The product **is** a pProp-shaped
+   molecular encoder (settled 2026-08-17; its *width* reopened 2026-08-25). Freezing 14 of 16
+   GNN blocks leaves the representation mostly pretrained, which argues for unfreezing more;
+   feature distortion (LP-FT, Kumar et al. 2022) and the fact that a generative loop will query
+   novel chemistry argue for less. That trade-off is a research question, not an implementation
+   detail — and it should be decided on the R1/R2 probes over held-out clusters, **not** on
+   `goal_metric`, because `goal_metric` scores the predictions and the predictions are not the
+   product.
 
 ### Metrics — `src/metrics.py`, `src/objective.py`
 
@@ -622,6 +784,8 @@ seed, 5 epochs, no tail metrics.
 - **The loss is weighted, defaulting to `balanced`** (`weighted_mse`, normalised by `w.sum()`
   so the loss scale does not move when a scheme is swapped in). Never replace it with a bare
   `.mean()` — see NOTES §1.
+- `val_embeddings.npy` (`[n_val, embed_dim]`) is written per run beside the predictions — the
+  exported artifact itself, final-epoch, in the same row order. It is what both probes read.
 - `val_predictions.npy` + `val_indices.npy` are written per run, so pooled out-of-fold tail
   metrics need no re-running.
 - Pearson is `nan` when predictions are constant; `val/pred_std` is logged beside it so that
@@ -714,6 +878,13 @@ Full list in NOTES §9. The ones that bite hardest:
 - **`ampc_subset_331k.csv` is sorted by `(-pprop, smiles)`** — i.e. sorted by the target. A
   DataLoader that forgets to shuffle trains on target-sorted batches. Never rely on file
   order.
+- **The structural readout returns `nan` on a `--subset` run, and that is not a bug.**
+  `emb_readout.py` samples molecules from the *frozen* fold (`splits.load_fold`), not from the
+  run's own `val_indices.npy`, so a subset run has almost nothing to join against. Measured: a
+  `--subset 5000` run holds 5,000 of fold 0's 66,296 val rows, so a 500-molecule sample
+  overlaps by ~38 and every structural column comes back `nan` while the geometry columns —
+  which read `val_embeddings.npy` directly — compute normally. **Score probes on full runs
+  only.**
 - **`splits.py` re-hashes the source CSV on load and raises if it changed.** This is
   deliberate: `subset.py` takes `--seed`, so rerunning it silently produces a different 331k
   set and invalidates every split. Do not bypass the check — regenerate the splits.
