@@ -16,16 +16,19 @@ This exists because TamIA is not a machine anything here has ever run on
 
 ## A. The new wandb account *(from your laptop, before touching TamIA)*
 
-1. Create the wandb account under your **Mila** email.
-2. Note the **entity** name — wandb shows it in your profile URL, `wandb.ai/<entity>`. It is
-   *not* your email, and it is what the sweep gets created under.
-3. Copy the API key from <https://wandb.ai/authorize>.
+1. Create the wandb account under your **Mila** email. *(Done — `ethan-kreuzer-mila`.)*
+2. **The only thing you still need is the API key**, from <https://wandb.ai/authorize>.
 
-**Why this is called out rather than assumed:** `src/train.py:256` still defaults
-`--wandb-entity` to `ethan_personal`, the old account, and that default appears throughout
-`CLAUDE.md`. The sbatch therefore **requires** the entity explicitly and refuses to start without
-it — a silent fallback would file this sweep's runs under the wrong account, which is the kind of
-mistake you notice a day later.
+**Your entity is `ethan-kreuzer-mila`** — the username segment of your profile URL. It is
+already the default in `scripts/tamia_sweep_agent.sbatch`, so you do not have to pass it.
+Override with `export WANDB_ENTITY_=<other>` if that ever changes.
+
+**Why the entity gets handled so carefully.** `src/train.py:256` still defaults
+`--wandb-entity` to `ethan_personal` — the *old* account — and `run_config.py:351` passes it to
+`wandb.init(entity=...)` as an explicit argument, which **overrides** the `WANDB_ENTITY`
+environment variable. So setting the env var alone is not enough; `scripts/sweep_trial.sh`
+passes the flag too. Without that, every trial would try to write into an entity your new key
+cannot access — and it would fail *after* the preflight had already passed, deep into the job.
 
 ---
 
@@ -37,7 +40,8 @@ Everything here runs on a **login** node. Compute nodes cannot download anything
 which will crowd a home quota. Your project space is `~/links/projects/aip-yvesbrun`.
 
 ```bash
-git clone <repo-url> ~/links/projects/aip-yvesbrun/finetune_minimol
+git clone https://github.com/ethankreuzer/finetune_minimol.git \
+          ~/links/projects/aip-yvesbrun/finetune_minimol
 cd ~/links/projects/aip-yvesbrun/finetune_minimol
 git checkout encoder-vn
 
@@ -140,15 +144,21 @@ meaningful. **To switch to h200 anyway:** change `--gres` to `gpu:h200:8` and `-
 ## E. Create the sweep *(login node — compute nodes cannot)*
 
 ```bash
+cd ~/links/projects/aip-yvesbrun/finetune_minimol
 export WANDB_API_KEY=<key from step A>
 wandb login
 
-wandb sweep --project finetune_minimol --entity <entity> sweeps/bayes_v1.yaml
+wandb sweep --project finetune_minimol --entity ethan-kreuzer-mila sweeps/bayes_v1.yaml
 ```
 
 The output ends with a line containing the **sweep id** — an 8-character string. It is the
 argument the sbatch takes. `wandb` also prints the full `wandb agent <entity>/<project>/<id>`
 command; you want only the id.
+
+**Sanity-check the sweep page it links.** It should show **five** swept parameters —
+`freeze_epochs`, `unfrozen_epochs`, `head_lr`, `head_lr_unfrozen`, `trunk_lr`. Weight decay,
+dropout and the four loss weights are pinned constants (trimmed 2026-08-25). If you see ten,
+you created the sweep from an older copy of the yaml.
 
 **Do not run that agent command directly on the login node.** Login nodes have no GPUs, and
 running compute there is against Alliance policy.
@@ -160,9 +170,12 @@ running compute there is against Alliance policy.
 Two short jobs. **Do not submit the real one until both pass.**
 
 ```bash
+cd ~/links/projects/aip-yvesbrun/finetune_minimol     # sbatch logs land in the cwd
 export WANDB_API_KEY=<key from step A>
-export WANDB_ENTITY_=ethan-kreuzer-mila   # optional: already the default
 ```
+
+That is the whole set — the entity is already the script's default, the account is in the
+script, and the proxy comes from `module load httpproxy` inside the job.
 
 That is the whole set. `--account=aip-yvesbrun` is already in the script (override with
 `sbatch --account=...`), and the proxy comes from `module load httpproxy` inside the job — there
