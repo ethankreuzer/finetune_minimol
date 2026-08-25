@@ -90,7 +90,7 @@ has already been bitten by once; write the branch down first.
 | Dataset subset (331,480 molecules) | **done** — `src/subset.py` |
 | 5-fold cluster CV splits | **done, verified, frozen** — `src/split.py`, `src/splits.py` |
 | Environment (uv, in-repo `.venv`) | **done, verified** — `pyproject.toml` + `uv.lock` |
-| Trainable trunk | **done, 11/11 checks pass** — `src/trunk.py`, `src/verify_trunk.py` |
+| Trainable trunk | **done, 10/10 checks pass** — `src/trunk.py`, `src/verify_trunk.py` |
 | Feature cache (Phase 2) | **done, verified** — `src/featurize.py`, `src/features.py` |
 | Loss / metrics / objective ported from `pProp_MLP` | **done, 8/8 checks pass** — `src/losses.py`, `src/metrics.py`, `src/objective.py`, `src/verify_metrics.py` |
 | Dual head (binary @ 3.5 + regression) | **done** — `head.DualHead` |
@@ -111,10 +111,11 @@ gradients reach all 284 reachable trunk tensors (7,919,912 params), and an optim
 moves trunk weights. Two further tensors are unreachable inside graphium itself — see "The
 rw_pos dead norm" below. `verification.md` reads `OVERALL: PASS`.
 
-**Verified on this branch 2026-08-25, after the import commit:** `verify_trunk.py` 11/11 and
-`verify_metrics.py` 8/8 — including the loss-parity check and the freeze negative test, the two
-most at risk since `verify_metrics.py` is byte-identical to `main`'s while `losses.py` arrived
-with 101 lines of change. Smoke run at `--embed-dim 64` wrote `val_embeddings.npy` at
+**Verified on this branch 2026-08-25, re-run against the final tree:** `verify_trunk.py`
+`OVERALL: PASS` (10/10, plus the grad-flow meta-check that runs every time — 11 `[PASS]` lines
+in total) and `verify_metrics.py` **8/8** — including the loss-parity check and the freeze
+negative test, the two most at risk since `verify_metrics.py` is byte-identical to `main`'s
+while `losses.py` arrived with 101 lines of change. Smoke run at `--embed-dim 64` wrote `val_embeddings.npy` at
 **(5000, 64)**, which is the assertion that proves the width knob reaches the exported artifact.
 Head is 1,644,866 params at width 64 against 1,611,938 at 32.
 
