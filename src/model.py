@@ -54,8 +54,22 @@ class MiniMolRegressor(nn.Module):
             return out
         return out.squeeze(-1) if self.squeeze_output else out
 
+    def forward_with_embedding(self, batch):
+        """`(logits, pred, z)` where `z` is the head's `[B, embed_dim]` bottleneck.
+
+        Distinct from `embed` on purpose, and the distinction matters: `embed` returns the
+        trunk's **512-d** output, while `z` is the head's **32-d** bottleneck — the vector
+        this repo exists to export (see `head.DualHead`). Confusing the two would ship the
+        wrong artifact.
+
+        `forward` is deliberately left as a 2-tuple rather than widened to carry `z`:
+        `train.py` unpacks it as `logits, pred = model(batch)` in two places, and a 3-tuple
+        would fail there with an unpacking error rather than anything self-explanatory.
+        """
+        return self.head.forward_with_embedding(self.trunk(batch))
+
     def embed(self, batch):
-        """The 512-d embedding alone — for caching, probing, or diagnostics."""
+        """The 512-d trunk embedding alone — for caching, probing, or diagnostics."""
         return self.trunk(batch)
 
     def param_groups(self, trunk_lr, head_lr, weight_decay=None, trunk_weight_decay=None):
