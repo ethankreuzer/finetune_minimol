@@ -77,7 +77,11 @@ WANDB_PROJECT_="${WANDB_PROJECT_:-finetune_minimol}"
 # OPTIONAL override. Normally left empty: `module load httpproxy` below sets the proxy
 # variables itself, so there is no host:port to supply. Set this only to bypass the module.
 PROXY="${PROXY:-}"                                  # e.g. http://proxy.example:3128
-NO_PROXY_="${NO_PROXY_:-localhost,127.0.0.1,.int.ets1.calculquebec.ca,.computecanada.ca}"
+# Only used if `module load httpproxy` sets no no_proxy of its own -- it usually does, and
+# it knows the cluster's internal domains better than this file. TamIA is .ecpia.ca
+# (its proxy is squid.tamia.ecpia.ca:3128, observed 2026-08-25); the Alliance-wide names
+# are kept so the script is not TamIA-only.
+NO_PROXY_="${NO_PROXY_:-localhost,127.0.0.1,.ecpia.ca,.calculquebec.ca,.computecanada.ca,.alliancecan.ca}"
 
 AGENTS="${AGENTS:-auto}"                            # auto = one per GPU actually present
 AGENT_COUNT="${AGENT_COUNT:-0}"                     # trials per agent; 0 = unbounded
