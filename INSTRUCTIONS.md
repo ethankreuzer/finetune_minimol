@@ -50,9 +50,35 @@ git clone https://github.com/ethankreuzer/finetune_minimol.git \
           ~/links/projects/aip-yvesbrun/ethankrz/finetune_minimol
 cd ~/links/projects/aip-yvesbrun/ethankrz/finetune_minimol
 git checkout encoder-vn
+```
+
+### Getting `uv` in the first place
+
+Alliance clusters ship **no system Python**, which is why `pip` is not found. Load one first —
+this project needs **3.11 exactly** (`requires-python = "==3.11.*"`, because the PyG extension
+wheels are built per `(python, torch, cuda)` triple and these are `cp311`):
+
+```bash
+module load python/3.11
+module spider uv                 # some clusters provide it; if so, load it instead
+pip install --user uv            # otherwise
+export PATH="$HOME/.local/bin:$PATH"
+uv --version
+```
+
+### Then sync — but move uv's cache off `$HOME` first
+
+```bash
+# MANDATORY. uv caches wheels in ~/.cache/uv by default; measured 31 GB on rabelais for this
+# same lock file. Left at the default it lands in your home quota and fails partway through
+# the ~1 h sync -- and it silently undoes the decision to keep everything off $HOME.
+export UV_CACHE_DIR=~/links/projects/aip-yvesbrun/ethankrz/.uv-cache
 
 UV_HTTP_TIMEOUT=3600 uv sync --extra dev        # ~1 h; the timeout is mandatory, see CLAUDE.md
 ```
+
+Those exports are per-shell. Put them in `~/.bashrc`, or re-issue them each time — `uv sync`
+with the default cache dir is the one step that quietly puts 31 GB back in `$HOME`.
 
 **Audit the lock before trusting the env** — this is a standing rule in `CLAUDE.md`, not a
 formality; graphium declares no torch dependency, so a bad resolve silently installs CUDA 13 and
