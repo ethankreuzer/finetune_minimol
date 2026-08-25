@@ -74,12 +74,23 @@ Three things that decide whether this works, each with its own section below or 
    MiniMol-layer analysis is post-hoc on a trained model — so **the winner must be re-run with
    `--keep-checkpoints`** or there is nothing to extract features from. `INSTRUCTIONS.md` §I.
 
-**Still open: what the sweep should actually vary.** `bayes_v1.yaml` sweeps 10 axes (both phase
-lengths, three LR peaks, weight decay, dropout, four loss weights). Given "does not have to be
-too rigorous", a narrower schedule+LR sweep would converge in far fewer trials — bayes over 10
-dimensions is still early in its exploration at a few hundred trials. Settle this **before**
-creating the sweep, together with `fold_list`/`seed_list`: `"0"`/`"0"` makes a trial one model
-(~4 min projected) against ~40 min for the full 5×2, a 10× swing that sets `--count`.
+**Settled 2026-08-25: the sweep varies five things** — `freeze_epochs`, `unfrozen_epochs`,
+`head_lr`, `head_lr_unfrozen`, `trunk_lr`. Weight decay, dropout and the four loss weights are
+pinned as explicit `value:` entries (not deleted, so they stay in every run's config and in
+`config_id`); the loss weights sit at pProp_MLP's swept optima, which are already
+`train.py:218-221`'s defaults.
+
+The cut is about the optimiser, not the values. Bayes earns its advantage over random search by
+conditioning each trial on completed ones, and that advantage shrinks with dimension — over 10
+axes a few hundred trials is still mostly exploration, so the "winner" is a sample from a
+barely-informed posterior. Over 5 it is a real search. This tune's only job is to make the
+downstream MiniMol-feature analysis trustworthy, and the schedule and LRs are both what that is
+most sensitive to and what the supervisor ranked highest (see "Deferred: layer-wise
+freeze/unfreeze" — freeze schedule #1, LRs #3). **Re-sweeping the loss weights is the first thing
+to restore** if the tuned model underperforms.
+
+`fold_list`/`seed_list` stay at `"0"`/`"0"` — one model per trial (~4 min projected) against
+~40 min for the full 5×2. The winner gets the full grid afterwards, in the same bucket.
 
 ### Deferred: the width scan
 

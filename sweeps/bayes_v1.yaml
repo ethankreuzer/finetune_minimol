@@ -1,4 +1,5 @@
-# Bayesian hyperparameter sweep over the two-phase fine-tuning schedule.
+# Bayesian sweep over the two-phase fine-tuning schedule: FIVE axes -- the two phase
+# lengths and the three learning-rate peaks. Everything else is pinned; see `parameters`.
 #
 #   wandb sweep --project finetune_minimol --entity ethan_personal sweeps/bayes_v1.yaml
 #   python -m wandb agent ethan_personal/finetune_minimol/<sweep_id>
@@ -132,38 +133,39 @@ parameters:
     min: 1.0e-6
     max: 3.0e-4
 
-  # -- regularization -------------------------------------------------------------------
+  # -- PINNED 2026-08-25: regularization and the loss weights ------------------------------
+  # These six were swept in the original design (10 axes total). Cut to constants so the sweep
+  # varies FIVE things: the two phase lengths and the three LR peaks.
+  #
+  # WHY, and it is about the optimiser rather than the values. Bayesian optimisation buys its
+  # advantage over random search by conditioning each trial on completed ones, and that
+  # advantage shrinks as dimension grows -- over 10 axes, a few hundred trials is still mostly
+  # exploration, so the "winner" is a sample from a barely-informed posterior. Over 5 it is a
+  # real search. The purpose here is a not-too-rigorous tune whose only job is to make the
+  # downstream MiniMol-feature analysis trustworthy, and the schedule and learning rates are
+  # both what that analysis is most sensitive to and what the supervisor ranked highest
+  # (CLAUDE.md, "Deferred: layer-wise freeze/unfreeze" -- freeze schedule #1, LRs #3).
+  #
+  # They are written as explicit `value:` entries rather than deleted, so each still appears in
+  # every run's wandb config and in `config_id`. A deleted parameter would silently take
+  # train.py's default and leave no record that it was a decision.
+  #
+  # The four loss weights are pinned AT pProp_MLP's swept optima, which are already train.py's
+  # defaults (train.py:218-221). They transfer at all only because both projects train against
+  # a normalized target; re-sweeping them is the obvious thing to restore first if the tuned
+  # model turns out to underperform.
   weight_decay:
-    distribution: log_uniform_values
-    min: 1.0e-4
-    max: 1.0e-1
+    value: 0.01
   dropout:
-    distribution: uniform
-    min: 0.0
-    max: 0.3
-
-  # -- loss term weights, in z-units ------------------------------------------------------
-  # Inherited from pProp_MLP's own sweep (w_cls 0.4418, w_pair 7.486, w_std 0.7911,
-  # huber_delta 1.0513) and re-swept around those points: they were tuned against a
-  # different pProp distribution, and only the fact that both are normalized targets makes
-  # them transfer at all. Huber's *weight* stays pinned at 1 -- it is the term anchoring the
-  # absolute pProp level, so the other three are measured against it (losses.py).
+    value: 0.0
   w_cls:
-    distribution: log_uniform_values
-    min: 0.05
-    max: 5.0
+    value: 0.4418
   w_pair:
-    distribution: log_uniform_values
-    min: 1.0
-    max: 30.0
+    value: 7.486
   w_std:
-    distribution: log_uniform_values
-    min: 0.1
-    max: 3.0
+    value: 0.7911
   huber_delta:
-    distribution: uniform
-    min: 0.5
-    max: 2.0
+    value: 1.0513
 
   # -- DELIBERATELY NOT SWEPT -------------------------------------------------------------
   # Every one of these is reachable from the CLI; each is fixed for a stated reason, and the
