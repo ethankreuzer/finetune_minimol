@@ -368,17 +368,25 @@ Read `sweep_<jobid>.out`. It must show **all** of:
 ### F2 — one real trial *(bounded)*
 
 ```bash
-AGENT_COUNT=1 AGENTS=1 sbatch --partition=gpubase_bynode_b1 --time=01:00:00 \
+AGENT_COUNT=1 AGENTS=1 sbatch --partition=gpubase_bynode_b1 --time=02:00:00 \
   scripts/tamia_sweep_agent.sbatch <sweep_id>
 ```
+
+**Two hours, not one** (changed 2026-08-26). This step was sized when a trial was ONE model at
+~4 min; since the yaml went to the full 5×2 grid a trial is TEN models at ~40 min projected — and
+projected on hardware nothing has ever run on. A 1 h wall clock could kill the trial mid-run,
+which teaches you nothing about whether the setup works. `b1` caps at 3 h, so 2 h is still the
+right partition for the gate.
 
 Read `logs/agent_<jobid>_0.log`. It must show a trial starting, training epochs, and finishing —
 and **the run must appear in wandb under the new entity**. Check that in the browser; a log that
 looks fine while nothing reaches wandb is exactly the failure mode the proxy causes.
 
-**Also note how long the trial took.** That number sets `--count` in the next step, and it is the
-only honest source for it — the "~4 min/trial" figure in `compute_profile.md` is a projection for
-hardware nothing has ever run on.
+**Also note how long the trial took**, and treat it as the headline result of this gate. It is
+the only honest number for how many trials the 24 h job will actually get: the "~4 min/model"
+figure in `compute_profile.md` is a projection, and the "~140 trials" in `sweeps/bayes_v1.yaml`
+is arithmetic on top of that projection. If a trial comes in far over ~40 min, decide whether to
+narrow the grid or submit a second job **before** spending the 24 h, not after.
 
 ---
 
