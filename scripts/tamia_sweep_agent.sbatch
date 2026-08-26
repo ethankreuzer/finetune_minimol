@@ -17,7 +17,7 @@
 # WHY THE PROXY PREFLIGHT IS THE MOST IMPORTANT LINE IN THIS FILE. TamIA's compute nodes have
 # no internet (compute_profile.md:331); the route out is a Mila HTTP proxy. Without it
 # `wandb agent` does NOT error -- it blocks waiting for a config that never arrives, and the
-# job burns its entire allocation looking healthy. The preflight converts that silent 12-hour
+# job burns its entire allocation looking healthy. The preflight converts that silent 24-hour
 # stall into a ~20-second failure that names its cause.
 #
 # CLAUDE.md previously claimed `wandb agent` works on TamIA unaided, "confirmed 2026-08-13",
@@ -25,8 +25,8 @@
 
 #SBATCH --job-name=minimol_sweep
 #SBATCH --account=aip-yvesbrun
-#SBATCH --partition=gpubase_bynode_b2
-#SBATCH --time=12:00:00
+#SBATCH --partition=gpubase_bynode_b3
+#SBATCH --time=24:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --exclusive
@@ -37,7 +37,16 @@
 #SBATCH --error=sweep_%j.out
 #SBATCH --open-mode=append
 #
-# MEASURED 2026-08-25, `sinfo -p gpubase_bynode_b2 -o '%c %m %G'`:
+# --partition=gpubase_bynode_b3 and --time=24:00:00, set 2026-08-26. THE TWO MUST MOVE
+#   TOGETHER: the bynode partitions ARE the time buckets -- b1 3 h, b2 12 h, b3 24 h
+#   (compute_profile.md, `sinfo` from tamia2). This was b2/12:00:00; asking for 24 h while
+#   still naming b2 is rejected at `sbatch`, not silently truncated. 24 h is the cluster
+#   maximum, so there is no b4 to grow into -- to search longer, submit a SECOND job against
+#   the same sweep id. Agents attach to a sweep, so two jobs simply serve it together.
+#   The gate jobs in INSTRUCTIONS.md section F stay on b1: they are minutes, not hours.
+#
+# MEASURED 2026-08-25, `sinfo -p gpubase_bynode_b2 -o '%c %m %G'` (the two bynode partitions
+# are the same nodes under different time caps, so the node types below hold for b3 too):
 #
 #   CPUS  MEMORY   GRES
 #   48    500000   gpu:h100:4(S:0-1)
@@ -252,9 +261,9 @@ nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null
 
 [ "$GPUS" -ge 1 ] || die "no GPUs visible. The --gres request did not do what it should.
   Check the right form for this partition (some clusters need --gres=gpu:h100:4):
-    sinfo -p gpubase_bynode_b2 -o '%c %m %G'"
+    sinfo -p gpubase_bynode_b3 -o '%c %m %G'"
 
-# One agent per GPU, derived rather than assumed. gpubase_bynode_b2 holds both 4-GPU h100
+# One agent per GPU, derived rather than assumed. gpubase_bynode_b3 holds both 4-GPU h100
 # nodes and 8-GPU h200 nodes, so a fixed 4 would idle half an h200 allocation.
 if [ "$AGENTS" = "auto" ]; then
     AGENTS="$GPUS"

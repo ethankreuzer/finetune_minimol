@@ -311,7 +311,7 @@ running compute there is against Alliance policy.
 
 ---
 
-## F. The gate — prove it works before spending 12 hours
+## F. The gate — prove it works before spending 24 hours
 
 Two short jobs. **Do not submit the real one until both pass.**
 
@@ -362,7 +362,7 @@ hardware nothing has ever run on.
 ## G. The real submission
 
 ```bash
-sbatch scripts/tamia_sweep_agent.sbatch <sweep_id>          # 12 h, b2, 4 agents
+sbatch scripts/tamia_sweep_agent.sbatch <sweep_id>          # 24 h, b3, 4 agents
 ```
 
 **Leaving `AGENT_COUNT` unset is the recommended option.** The agents then run until the wall

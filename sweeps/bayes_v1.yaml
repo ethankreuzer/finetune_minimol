@@ -12,10 +12,11 @@
 # metrics. The runs table therefore gets one row per configuration, which is the only way
 # "which hyperparameters are best" has a sortable answer.
 #
-# `fold_list: [0]` / `seed_list: [0]` below is the CHEAP SEARCH setting -- one model per
-# trial, ~4 min on an H100. Widening to [0,1,2,3,4] x [0,1] makes every trial the full 5x2
-# grid (~40 min) and is a yaml edit, not a code change. The run *shape* is identical either
-# way, so a cheap search trial and a full confirmation are comparable rows in one table.
+# `fold_list: "0,1,2,3,4"` / `seed_list: "0,1"` below is the FULL 5x2 GRID -- ten models per
+# trial, ~40 min on an H100, so every trial is a low-variance estimate over the whole dataset.
+# Narrowing to "0" x "0" makes every trial one model (~4 min) and is a yaml edit, not a code
+# change. The run *shape* is identical either way, so a cheap search trial and a full
+# confirmation are comparable rows in one table.
 #
 # WHAT IS BEING OPTIMISED
 # -----------------------
@@ -73,20 +74,34 @@ command:
 parameters:
 
   # -- which models each trial trains ------------------------------------------------------
-  # THE COST DIAL. [0] x [0] is one model per trial (~4 min); [0,1,2,3,4] x [0,1] is the full
-  # 5x2 grid (~40 min) and makes every trial a low-variance estimate over the whole dataset.
-  # Search cheap, confirm wide: re-run the winning configuration by hand with the full lists,
-  # which lands in the SAME output bucket (config_id ignores the fold and seed lists) and
-  # reuses the models already trained.
+  # THE COST DIAL, set to the FULL GRID on 2026-08-26. "0,1,2,3,4" x "0,1" is ten models per
+  # trial (~40 min); "0" x "0" is one model (~4 min) and is the cheap-search setting this
+  # replaced. Re-running the winner by hand with these same lists lands in the SAME output
+  # bucket (config_id ignores the fold and seed lists) and reuses every model already trained.
+  #
+  # WHAT THE FULL GRID BUYS. The objective `final/goal_metric_mean` averages ten final-epoch
+  # values instead of one, so `final/goal_metric_std` beside it says whether a configuration
+  # actually won or drew a lucky fold. It also makes `pooled/*` exist at all: pooling is
+  # defined only when a seed holds all five folds, so the honest tail estimate over all 100
+  # potent molecules is simply absent at "0" x "0".
+  #
+  # WHAT IT COSTS, beyond wall-clock. (1) TRIAL BUDGET: at ~40 min a trial, four agents get
+  # ~140 trials out of the 24 h job instead of ~1400 -- thin but workable over five axes,
+  # which is the whole reason the other six were pinned. 24 h is the cluster maximum, so the
+  # way to search longer is a SECOND job against the same sweep id, not a longer one; do that
+  # rather than reading a 140-trial posterior as converged. (2) NAN IS NOW FATAL TO A WHOLE TRIAL:
+  # `run_config.aggregate` guards values with `isinstance(v, (int, float))` and nan passes
+  # that, so one model with constant predictions (Pearson is nan) makes the objective nan for
+  # all ten. Rarer at ten models than at one, but total rather than diluted when it happens.
   #
   # SPELL THESE AS COMMA-SEPARATED STRINGS, NOT YAML LISTS. A yaml list reaches the agent as
   # `--fold_list=[0, 1]`, which the shell splits into two tokens and argparse rejects with
   # `unrecognized arguments: 1]`. A quoted string arrives as one token; `run_config.int_list`
   # reads the integers out of it and also accepts `--fold-list 0 1` when typed by hand.
   fold_list:
-    value: "0"
+    value: "0,1,2,3,4"
   seed_list:
-    value: "0"
+    value: "0,1"
 
   # -- the schedule: the supervisor's #1 and #2 priorities -----------------------------
   # Log-spaced because 1 -> 2 epochs is a far bigger change than 20 -> 21. `q: 1` rounds to
