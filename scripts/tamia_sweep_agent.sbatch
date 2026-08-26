@@ -80,7 +80,13 @@ set -uo pipefail
 REPO="${REPO:-${SLURM_SUBMIT_DIR:-$PWD}}"
 VENV="${VENV:-$REPO/.venv/bin/python}"
 PYTHON_MODULE="${PYTHON_MODULE:-python/3.11}"   # the module the venv was BUILT against
-WANDB_ENTITY_="${WANDB_ENTITY_:-ethan-kreuzer-mila}"  # the Mila-email entity
+# MEASURED on tamia1 2026-08-26: the entity is NOT the username. `wandb login` reports
+# "logged in as: ethan-kreuzer-mila (models-mila5723)" -- username first, default entity in
+# parentheses -- and `wandb.Api().default_entity` / `.viewer.teams` both return exactly
+# ['models-mila5723']. Mila provisions wandb accounts into an org entity, so there is no
+# personal `ethan-kreuzer-mila` entity to write to; this line said there was until today, and
+# `wandb sweep --entity ethan-kreuzer-mila` fails with `Error: entity not found`.
+WANDB_ENTITY_="${WANDB_ENTITY_:-models-mila5723}"   # the Mila org entity, NOT the username
 WANDB_PROJECT_="${WANDB_PROJECT_:-finetune_minimol}"
 
 # OPTIONAL override. Normally left empty: `module load httpproxy` below sets the proxy

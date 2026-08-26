@@ -19,8 +19,31 @@ This exists because TamIA is not a machine anything here has ever run on
 1. Create the wandb account under your **Mila** email. *(Done — `ethan-kreuzer-mila`.)*
 2. **The only thing you still need is the API key**, from <https://wandb.ai/authorize>.
 
-**Your entity is `ethan-kreuzer-mila`** — the username segment of your profile URL. It is
-already the default in `scripts/tamia_sweep_agent.sbatch`, so you do not have to pass it.
+**Your entity is `models-mila5723`, which is NOT your username.** `ethan-kreuzer-mila` is the
+username; Mila provisions wandb accounts into an **org entity**, and no personal entity of that
+name exists. This file claimed the entity was "the username segment of your profile URL" until
+2026-08-26, and following it gives:
+
+```
+$ wandb sweep --project finetune_minimol --entity ethan-kreuzer-mila sweeps/bayes_v1.yaml
+Error: entity not found
+```
+
+`wandb login` prints both, and the parenthesis is the one you want:
+
+```
+Currently logged in as: ethan-kreuzer-mila (models-mila5723)
+                        └─ username         └─ entity
+```
+
+Ask wandb rather than reading it off a URL — measured on tamia1 2026-08-26, both return exactly
+`models-mila5723`:
+
+```bash
+python -c "import wandb; a=wandb.Api(); print(a.default_entity, a.viewer.teams)"
+```
+
+It is already the default in `scripts/tamia_sweep_agent.sbatch`, so you do not have to pass it.
 Override with `export WANDB_ENTITY_=<other>` if that ever changes.
 
 **Why the entity gets handled so carefully.** `src/train.py:256` still defaults
@@ -294,7 +317,7 @@ cd ~/links/projects/aip-yvesbrun/ethankrz/finetune_minimol
 export WANDB_API_KEY=<key from step A>
 wandb login
 
-wandb sweep --project finetune_minimol --entity ethan-kreuzer-mila sweeps/bayes_v1.yaml
+wandb sweep --project finetune_minimol --entity models-mila5723 sweeps/bayes_v1.yaml
 ```
 
 The output ends with a line containing the **sweep id** — an 8-character string. It is the
