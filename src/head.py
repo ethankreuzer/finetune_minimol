@@ -147,7 +147,7 @@ class MLPHead(nn.Module):
 
 
 class DualHead(nn.Module):
-    """Shared MLP down to an `embed_dim` bottleneck, then a linear logit and a linear scalar.
+    """Shared MLP ending at `embed_dim`, then a linear logit and a linear scalar.
 
     Ported in structure from `pProp_MLP.model.DualHeadMLP`, which is where the joint
     classify-and-regress design was validated. Two things about it are load-bearing here:
@@ -164,48 +164,63 @@ class DualHead(nn.Module):
     Sizes come in as scalars (`hidden_dim`, `n_layers`) rather than as a `hidden_dims`
     sequence, because sweep drivers pass scalars -- a list-valued hyperparameter has no
     natural representation in Optuna or a wandb sweep config. `n_layers=0` gives no shared
-    stack above the bottleneck, which then reads the 512-d embedding directly.
+    stack above the final block, which then reads the 512-d embedding directly -- and that is
+    the default: `Linear(512 -> embed_dim) -> norm -> activation`, nothing else.
 
-    THE BOTTLENECK IS THE DELIVERABLE
-    ---------------------------------
-    `self.shared` ends at `embed_dim` (32), and that tensor -- not the predictions -- is what
-    this repo exists to produce. It is deployed frozen into a generative + active-learning
-    project, where a deep-kernel-learning GP trains its own network on top of it and MiniMol
-    is never trained again. Three consequences that look like odd choices otherwise:
+    THE SHARED OUTPUT IS THE DELIVERABLE
+    ------------------------------------
+    `self.shared` ends at `embed_dim`, and that tensor -- not the predictions -- is what this
+    repo exists to produce. It is deployed frozen into a generative + active-learning project,
+    where a deep-kernel-learning GP trains its own network on top of it and MiniMol is never
+    trained again.
+
+    **It is no longer a bottleneck.** Until 2026-08-25 `embed_dim` was 32, narrowing hard from
+    a 1024-wide shared stack, because the downstream contract said the product was specifically
+    `SMILES -> R^32`. That contract ended; the default is now `n_layers=0, embed_dim=1024`, so
+    the whole head is `Linear(512 -> 1024) -> LayerNorm -> GELU` and then two bare
+    `Linear(1024 -> 1)`. The parameterisation is unchanged and still spells the old shape
+    (`n_layers=2, hidden_dim=1024, embed_dim=32`); only the defaults moved. Read "bottleneck"
+    below as "the last shared block", which may now widen rather than narrow.
+
+    Three consequences that look like odd choices otherwise:
 
     - **The task heads are linear** (`cls_n_layers = reg_n_layers = 0`, which `MLPHead` turns
       into a bare `Linear`). This makes "pProp is linear in the exported embedding" literally
       true, which is the geometry an RBF/Matern kernel wants. Deeper branches would likely
-      score better on `goal_metric` while letting the bottleneck encode the target in a shape
-      a GP reads poorly -- and `goal_metric` is a proxy here, not the product.
+      score better on `goal_metric` while letting the shared output encode the target in a
+      shape a GP reads poorly -- and `goal_metric` is a proxy here, not the product. Under a
+      DKL consumer, which supplies its own warping, this property is worth less than it was;
+      it is an open question on this branch rather than a settled choice.
     - **The export point is the OUTPUT of `self.shared`** -- post-norm, post-activation, the
-      exact tensor the linear heads consume. Exporting the pre-activation instead would make
+      exact tensor the linear heads consume. Exporting the pre-activation would make
       the target linear-*after*-GELU, which is not the property above. Dropout is identity
       under `eval()`, so the export is unambiguous either way.
     - **`forward_with_embedding` exists** because the training loop needs `z` for the
       variance/covariance term (`losses.variance_covariance_loss`) and for
       `metrics.embedding_metrics`. `forward` delegates to it so the two cannot drift.
 
-    The bottleneck is also where this architecture is most likely to fail, and the reason
-    `--w-vic` exists. Regression and "pProp >= 3.5" are near-collinear -- the same axis, the
-    second with its gradient concentrated at the boundary -- so the *supervised* signal
-    arriving here is close to rank-1, so nothing asks the other ~30 dimensions to hold
-    anything and the LayerNorm at the end of this very block divides them down -- it
-    normalises across the 32 dims *within each row*, so one dominant pre-activation shrinks
-    every other dim. (Earlier text here blamed weight decay. Falsified: at `lr * wd = 1e-5`
-    the head shrinks 4.3% over a whole run and the trunk 0.33%, which cannot erase 30
-    dimensions. See `reports/embedding_collapse_experiment.md` P6.3.) An embedding whose
-    effective rank is 2-4 of 32 hands the GP a disguised scalar, making its distances a
-    restatement of predicted pProp and its uncertainties meaningless on novel molecules.
-    MEASURED 2026-08-18: effective rank 2.78 at the default and 1.32 on another seed, with
+    The last shared block is also where this architecture is most likely to fail, and the
+    reason `--w-vic` exists. Regression and "pProp >= 3.5" are near-collinear -- the same axis,
+    the second with its gradient concentrated at the boundary -- so the *supervised* signal
+    arriving here is close to rank-1, so nothing asks the remaining dimensions to hold anything
+    and the LayerNorm at the end of this very block divides them down -- it normalises across
+    `embed_dim` *within each row*, so one dominant pre-activation shrinks every other dim.
+    (Earlier text here blamed weight decay. Falsified: at `lr * wd = 1e-5` the head shrinks
+    4.3% over a whole run and the trunk 0.33%, which cannot erase 30 dimensions. See
+    `reports/embedding_collapse_experiment.md` P6.3.) An embedding whose effective rank is a
+    handful of its width hands the GP a disguised scalar, making its distances a restatement of
+    predicted pProp and its uncertainties meaningless on novel molecules. MEASURED 2026-08-18
+    AT WIDTH 32: effective rank 2.78 at the then-default and 1.32 on another seed, with
     rho(embedding distance, |delta predicted pProp|) = 0.9986 -- the failure, not the risk.
+    **That measurement has not been repeated at 1024**, and widening does not by itself fix it:
+    the supervised signal is still near rank-1, so the ratio can get worse rather than better.
     `val/emb_effective_rank` is logged every epoch precisely so this stays observed.
 
     `forward` returns `(logits, pred)`, both shaped `[B]`. `MiniMolRegressor` passes tuples
     through untouched.
     """
 
-    def __init__(self, in_dim=EMBED_DIM, hidden_dim=1024, n_layers=2, embed_dim=32,
+    def __init__(self, in_dim=EMBED_DIM, hidden_dim=1024, n_layers=0, embed_dim=1024,
                  cls_hidden_dim=256, cls_n_layers=0,
                  reg_hidden_dim=256, reg_n_layers=0,
                  activation="gelu", dropout=0.0, norm="layer", bias=True,

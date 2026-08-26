@@ -637,14 +637,21 @@ needs one output per atom, so pooling would destroy exactly the axis it predicts
 
 `head.DualHead` occupies these same two slots. MiniMol's post-GNN stack is
 `[graph branch: 512 → 512 → 1024]` followed by `[head: 1024 → 128 → out]`; this repo's is
-`512 → 1024 → 1024 → 32 → {Linear(32→1) cls, Linear(32→1) reg}`. Same two stages, with a 32-d
-bottleneck spliced in at the join and the heads reduced to bare linear maps.
+`512 → 1024 → {Linear(1024→1) cls, Linear(1024→1) reg}` — **as of 2026-08-25**. Same two stages,
+with the second reduced to bare linear maps.
 
-The difference that matters for the collapse question in `CLAUDE.md`: MiniMol widens to 1024 and
+Until that date it was `512 → 1024 → 1024 → 32 → {Linear(32→1) cls, Linear(32→1) reg}`, a 32-d
+bottleneck spliced in at the join, which is the shape most of this repo's measurements were taken
+under. The defaults moved (`--n-layers 0 --embed-dim 1024`); the parameterisation did not, so
+`--n-layers 2 --hidden-dim 1024 --embed-dim 32` restores the old shape exactly.
+
+The difference that mattered for the collapse question in `CLAUDE.md`: MiniMol widens to 1024 and
 lets each of its five heads compress **privately** to 128, so no single tensor carries all tasks
-at low rank. This repo compresses to 32 **shared**, deliberately — the 32-d vector is the
-deliverable — which is precisely why the rank of that one tensor is the number the project
-tracks.
+at low rank. This repo compressed to 32 **shared**, deliberately — the 32-d vector was the
+deliverable — which is why the rank of that one tensor is the number the project tracks. **The
+new shape removes the compression, not the question**: the exported tensor is still shared and
+the supervised signal reaching it is still near rank-1, so `val/emb_effective_rank` at width 1024
+is an open measurement, not a solved problem.
 
 ---
 

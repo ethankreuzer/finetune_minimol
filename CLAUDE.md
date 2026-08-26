@@ -371,7 +371,12 @@ against these.
 
 ### The deliverable is the encoder, not the predictions
 
-The head is `512 → 1024 → 1024 → **embed_dim** → {Linear cls, Linear reg}`. **The export point
+The head is `512 → **embed_dim** → {Linear cls, Linear reg}` — **changed 2026-08-25**, and the
+export is no longer a bottleneck. It was `512 → 1024 → 1024 → 32 → …`; the defaults are now
+`--n-layers 0 --embed-dim 1024`, so the whole head is one `Linear(512→1024) → LayerNorm → GELU`
+and two bare `Linear(1024→1)`. **529,410 params against 1,611,938.** The parameterisation did
+not change — `--n-layers 2 --hidden-dim 1024 --embed-dim 32` restores the old shape exactly.
+**The export point
 is the output of `head.shared`** — post-norm, post-activation, the exact tensor the linear heads
 consume — and it is written per run as `val_embeddings.npy`, `[n_val, embed_dim]`, final-epoch,
 in the same row order as `val_predictions.npy` and `val_indices.npy`.
@@ -380,11 +385,14 @@ That inverts what "good" means. `goal_metric` scores the *predictions*, and the 
 not the product — they are a training signal for the representation. **Treat `goal_metric` as a
 proxy and the R1/R2 probes as the thing being optimised.**
 
-`--embed-dim` (`train.py:173`, `type=sweep_int`) sets the width. **Its default of 32 is
-inherited from the sealed arc, not chosen** — no measurement in this repo has ever compared it
-against another width. That is what "NEXT" exists to fix. Measured 2026-08-25: at width 64 the
+`--embed-dim` (`train.py`, `type=sweep_int`) sets the width. Its default was 32, inherited
+from the sealed arc rather than chosen; **it is 1024 as of 2026-08-25**, which is likewise a
+decision rather than a measurement — no run in this repo has yet compared two widths on the
+R1/R2 probes. That is still what the deferred width scan exists to fix. Measured 2026-08-25: at width 64 the
 head is 1,644,866 params against 1,611,938 at 32, and `val_embeddings.npy` comes back
-`(5000, 64)` on a `--subset 5000` smoke run.
+`(5000, 64)` on a `--subset 5000` smoke run. **At the new default of 1024 the same smoke run
+gives `(5000, 1024)` and a 529,410-param head** (verified 2026-08-25, alongside
+`verify_trunk.py` 10/10 and `verify_metrics.py` 8/8).
 
 Two properties the arc chose deliberately, both now **open rather than settled**:
 
@@ -431,8 +439,9 @@ any handover.
 ### The task is joint, and binary at pProp ≥ 3.5
 
 `head.DualHead` puts a **classification logit** and a **regression scalar** on one shared MLP
-over the 512-d embedding, narrowing to an `--embed-dim` bottleneck first — that bottleneck's
-output is the exported encoder. 3.5 is the threshold at which binders become possible, and it is
+over the 512-d embedding, ending at an `--embed-dim` block — that block's output is the
+exported encoder. At the default `--n-layers 0 --embed-dim 1024` that shared MLP is a single
+widening layer, not a narrowing stack. 3.5 is the threshold at which binders become possible, and it is
 also the finest split leaving a learnable positive class: **3,153 molecules, 619–643 per
 validation fold**, against only **100 in the whole dataset** at pProp ≥ 5.0.
 

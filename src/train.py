@@ -168,23 +168,31 @@ def build_parser():
 
     # Head shape as scalars, not a list: sweep drivers pass scalars, and a list-valued
     # hyperparameter has no natural representation in Optuna or a wandb sweep config.
-    p.add_argument("--n-layers", type=sweep_int, default=2, help="shared trunk depth (0 = none)")
-    p.add_argument("--hidden-dim", type=sweep_int, default=1024)
-    p.add_argument("--embed-dim", type=sweep_int, default=32,
-                   help="the exported bottleneck width; 32 is fixed by the downstream GP")
-    # 0 layers = a bare Linear on the bottleneck. Deliberate: it makes pProp linear in the
-    # exported embedding, which is the geometry a GP kernel wants. See head.DualHead.
+    p.add_argument("--n-layers", type=sweep_int, default=0, help="shared trunk depth (0 = none)")
+    p.add_argument("--hidden-dim", type=sweep_int, default=1024,
+                   help="width of each of the --n-layers shared hidden layers. INERT at the "
+                        "default --n-layers 0, but still part of config_id")
+    p.add_argument("--embed-dim", type=sweep_int, default=1024,
+                   help="width of the exported embedding -- the last shared block, whose "
+                        "output the two linear task heads read. The 32 this branch inherited "
+                        "was fixed by a downstream-GP contract that ended 2026-08-25; the "
+                        "default is now 1024, i.e. a single Linear(512 -> 1024) over MiniMol "
+                        "with no narrowing. Width is a free variable again")
+    # 0 layers = a bare Linear on the exported embedding. Deliberate: it makes pProp linear
+    # in the exported embedding, which is the geometry a GP kernel wants. See head.DualHead.
     p.add_argument("--cls-n-layers", type=sweep_int, default=0)
     p.add_argument("--cls-hidden-dim", type=sweep_int, default=256)
     p.add_argument("--reg-n-layers", type=sweep_int, default=0)
     p.add_argument("--reg-hidden-dim", type=sweep_int, default=256)
     p.add_argument("--head-norm", default="layer", help="'layer', 'batch' or 'none'")
     p.add_argument("--bottleneck-norm", default=None,
-                   help="norm on the EXPORTED 32-d block only; defaults to --head-norm. "
+                   help="norm on the EXPORTED block only; defaults to --head-norm. "
                         "'none' removes the LayerNorm that P6.3 names as the likely collapse "
-                        "mechanism -- it normalises across the 32 dims within each row, so one "
+                        "mechanism -- it normalises across embed_dim within each row, so one "
                         "dominant dimension divides the rest down. Removes the cause where "
-                        "--w-vic penalises the symptom.")
+                        "--w-vic penalises the symptom. Note that at --n-layers 0 this is the "
+                        "norm on the ONLY shared layer, and --head-norm reaches it only "
+                        "through this flag's None fallback.")
     p.add_argument("--dropout", type=float, default=0.0, help="head dropout")
 
     p.add_argument("--head-lr", type=float, default=1e-3,
@@ -814,7 +822,9 @@ def main(argv=None):
     np.save(out / "val_logits.npy", val_logits)
     np.save(out / "val_indices.npy", val_rows)
     # The exported artifact itself, final-epoch, in the same row order as the three above.
-    # ~8 MB at [66296, 32] float32. This is what any downstream analysis of the embedding
+    # 8 MB at [66296, 32] float32 -- but 271 MB at [66296, 1024], which is the new default.
+    # Unconditional, with no --no-save-checkpoint equivalent, so a few-hundred-trial sweep
+    # writes ~50-70 GB. Flagged 2026-08-25, not yet decided. This is what any analysis of
     # reads, and what makes `emb_effective_rank` checkable after the fact rather than only
     # in the training log.
     np.save(out / "val_embeddings.npy", val_emb.astype(np.float32))
