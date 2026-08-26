@@ -90,8 +90,15 @@ most sensitive to and what the supervisor ranked highest (see "Deferred: layer-w
 freeze/unfreeze" — freeze schedule #1, LRs #3). **Re-sweeping the loss weights is the first thing
 to restore** if the tuned model underperforms.
 
-`fold_list`/`seed_list` stay at `"0"`/`"0"` — one model per trial (~4 min projected) against
-~40 min for the full 5×2. The winner gets the full grid afterwards, in the same bucket.
+`fold_list`/`seed_list` are at `"0,1,2,3,4"`/`"0,1"` — **the full 5×2 grid on every trial**,
+changed 2026-08-26 from `"0"`/`"0"`. ~40 min a trial against ~4, so the 24 h job yields **~140
+trials rather than ~1400**; thin but workable over five axes, which is the whole reason the other
+six were pinned. What it buys: `final/goal_metric_std` beside the objective, which separates a
+configuration that won from one that drew a lucky fold, and `pooled/*`, which is undefined unless
+a seed holds all five folds and so did not exist *at all* under one model per trial. What it
+costs, besides wall-clock: **a nan is now fatal to a whole trial rather than one model** —
+`run_config.aggregate` guards values with `isinstance(v, (int, float))` and `nan` passes that, so
+one model with constant predictions (Pearson is nan) makes the objective nan for all ten.
 
 ### Deferred: the width scan
 
@@ -671,8 +678,17 @@ because `module load` of a missing module can still exit 0.
   `scripts/run_grid.sbatch` — ten single-GPU array tasks of ~3 min — is the shape that report
   calls one that "does not map to TamIA at all". Hence one long job running **one agent per GPU**.
 
-  **Measured 2026-08-25** (`sinfo -p gpubase_bynode_b2 -o '%c %m %G'`), correcting this file's
-  earlier "4 GPUs" as if it were universal — **the partition holds two node types**:
+  **The bynode partitions ARE the time buckets** — `b1` 3 h, `b2` 12 h, `b3` 24 h
+  (`compute_profile.md:303`, `sinfo` from tamia2). So `--partition` and `--time` must move
+  **together**: asking for 24 h while still naming `b2` is *rejected at `sbatch`*, not silently
+  truncated. The job is `gpubase_bynode_b3` / `--time=24:00:00` as of 2026-08-26; it was `b2` /
+  12 h. **24 h is the cluster maximum**, so searching longer means a *second job against the same
+  sweep id* — agents attach to a sweep, so two jobs serve it together — not a longer one. The
+  `INSTRUCTIONS.md` §F gate jobs stay on `b1`: they are minutes, not hours.
+
+  **Measured 2026-08-25** (`sinfo -p gpubase_bynode_b2 -o '%c %m %G'`; the two bynode partitions
+  are the same nodes under different time caps, so this holds for `b3` too), correcting this
+  file's earlier "4 GPUs" as if it were universal — **the partition holds two node types**:
 
   | type | CPUs | memory | GPUs |
   |---|---|---|---|
@@ -706,17 +722,24 @@ data paths, which do not exist when the sweep is created. **Its flags go before 
 **The objective is `final/goal_metric_mean`** — the mean over models of each model's
 final-epoch `goal_metric`. Two things it is deliberately not:
 
-- **Not the best epoch.** `agg/val/goal_metric_mean` carries `summary="max"`; optimising that
-  would be early stopping on the same validation fold the run reports, exactly the bias the
-  fixed epoch budget exists to avoid. Both are logged so the gap stays visible.
+- **Not the best epoch.** The per-epoch curve `agg/goal_metric_mean` is logged beside it so the
+  gap stays visible; optimising *that* would be early stopping on the same validation fold the
+  run reports, exactly the bias the fixed epoch budget exists to avoid. (This file used to say
+  that curve carries `summary="max"`. It does not — `run_config.py:369` declares `summary="max"`
+  on `final/goal_metric_mean`, which is never `run.log`'d but written once through
+  `run.summary.update`, so the declaration is **inert**. Behaviour is correct either way: the
+  objective is the value written at the end.)
 - **Not the pooled score**, though pooling is the more honest tail estimate (100 potent
-  molecules against 20 per fold). Pooling is *undefined* unless a seed holds all five folds,
-  so it would not exist for a cheap search trial. The mean is defined for any subset, which is
-  what lets search and confirmation share one sortable column. Report `pooled/*` from the
-  winner.
+  molecules against 20 per fold). Pooling is *undefined* unless a seed holds all five folds, so
+  it does not exist for any trial narrower than the full grid, whereas the mean is defined for
+  any subset — which is what lets a cheap trial and a full confirmation share one sortable
+  column. **Since 2026-08-26 every trial does hold all five folds**, so `pooled/*` is in fact
+  populated throughout; the objective stays the mean regardless, so the column keeps its meaning
+  if the cost dial is ever turned back down. Report `pooled/*` from the winner.
 
 `fold_list` / `seed_list` are **the cost dial**, pinned as parameters: `"0"` × `"0"` is one
-model per trial (~4 min on H100), `"0,1,2,3,4"` × `"0,1"` is the full grid (~40 min). Spell
+model per trial (~4 min on H100), `"0,1,2,3,4"` × `"0,1"` is the full grid (~40 min). **Set to
+the full grid 2026-08-26** — see "NEXT" for what that buys and what it costs. Spell
 them as **comma-separated strings, not YAML lists** — a yaml list reaches the agent as
 `--fold_list=[0, 1]`, which the shell splits and argparse rejects.
 
