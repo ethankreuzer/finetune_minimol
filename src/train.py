@@ -161,6 +161,16 @@ def build_parser():
     p.add_argument("--bootstrap-seed", type=int, default=None,
                    help="resample the training fold WITH replacement to its own size, using "
                         "this seed. Leaves the validation fold untouched. Off by default.")
+    # The refit-on-everything switch, for producing a model to SHIP rather than to score.
+    # It deliberately keeps `--fold`'s validation rows so the loop, the schedule assertions
+    # and the artifact writes need no second code path -- but those rows are now inside the
+    # training set, so every `val/*` number becomes in-sample. `meta.json` stamps
+    # `val_is_in_sample: true` and the run prints a banner; nothing downstream should quote
+    # them. Honest numbers for a configuration come from runs that held a fold out.
+    p.add_argument("--train-all", action="store_true",
+                   help="train on EVERY row of the CSV, not just --fold's training side. The "
+                        "validation metrics are then in-sample and must not be reported. For "
+                        "building a deliverable after the hyperparameters are settled.")
 
     # Two phase LENGTHS, not a total and a cut point. A bayes sweep samples its parameters
     # independently, and (epochs, freeze_epochs) carries the cross-constraint
@@ -329,7 +339,26 @@ def fold_weights(kind, y, train_idx, val_idx):
 
     Rows in neither fold keep weight 0; nothing reads them, and a zero is a louder failure
     than a plausible-looking 1 if that ever stops being true.
+
+    **The two index sets must be disjoint, or identical.** The loop writes `val_idx` second,
+    so on an overlap the validation composition wins on the shared rows -- and those rows are
+    then *trained* under weights derived from the validation set. Under a K-fold that can
+    never happen and the guard is inert. Under `--train-all` it is exactly what would happen:
+    `train_idx` becomes every row and `val_idx` stays a 66,296-row subset of it, so a fifth of
+    the training set would silently be weighted by the wrong composition. Both vectors have a
+    base rate near 0.0097, so nothing would error and no number would look wrong.
+
+    Identical sets are allowed because both writes are then the same write -- that is how
+    `--train-all` asks for "one composition over everything".
     """
+    train_idx, val_idx = np.asarray(train_idx), np.asarray(val_idx)
+    train_set, val_set = set(train_idx.tolist()), set(val_idx.tolist())
+    if train_set & val_set and train_set != val_set:
+        raise ValueError(
+            f"fold_weights: train and val overlap in {len(train_set & val_set):,} rows but "
+            f"are not the same set ({len(train_set):,} train, {len(val_set):,} val). The "
+            "second write would win on the shared rows, training them under validation-"
+            "derived weights. Pass disjoint folds, or the same index set for both.")
     w = np.zeros(len(y), dtype=np.float64)
     for idx in (train_idx, val_idx):
         w[idx] = build_sample_weights(kind, y[idx])
@@ -646,6 +675,18 @@ def main(argv=None):
     # Duplicated rows are fine for both: `RowDataset` indexes by row and `fold_weights`
     # writes a per-row weight that depends only on that row's class.
     n_train_unique = None
+    if args.train_all:
+        if args.bootstrap_seed is not None:
+            raise SystemExit(
+                "--train-all and --bootstrap-seed compose two different resamplings of the "
+                "training set. Pick one: --train-all refits on everything, --bootstrap-seed "
+                "draws with replacement from one fold's training side.")
+        train_idx = np.arange(len(y))
+        print("=" * 78)
+        print(f"--train-all: training on ALL {len(train_idx):,} rows. Fold {args.fold}'s "
+              f"{len(val_idx):,} validation rows are INSIDE the training set, so every")
+        print("val/* metric below is IN-SAMPLE and must not be reported as performance.")
+        print("=" * 78)
     if args.bootstrap_seed is not None:
         brng = np.random.default_rng(args.bootstrap_seed)
         train_idx = brng.choice(train_idx, size=len(train_idx), replace=True)
@@ -655,7 +696,12 @@ def main(argv=None):
     if args.subset:
         rng = np.random.default_rng(args.seed)
         train_idx = rng.choice(train_idx, min(args.subset, len(train_idx)), replace=False)
-        val_idx = rng.choice(val_idx, min(args.subset, len(val_idx)), replace=False)
+        # Under --train-all the validation rows must stay a subset of the training rows, or
+        # the smoke run stops exercising the same shape as the real one: `fold_weights` is
+        # handed `train_idx` for both, so any val row outside it would carry weight 0 and
+        # every val metric would be computed against zeros. Draw from the subset instead.
+        pool = train_idx if args.train_all else val_idx
+        val_idx = rng.choice(pool, min(args.subset, len(pool)), replace=False)
     print(f"fold {args.fold}: {len(train_idx):,} train / {len(val_idx):,} val | "
           f"{int(binary_labels(y[train_idx]).sum()):,} / "
           f"{int(binary_labels(y[val_idx]).sum()):,} positive at pProp >= {PPROP_EDGE}")
@@ -666,7 +712,13 @@ def main(argv=None):
     args._norm_stats = norm_stats
     y_norm = normalize_pprop(y, norm_stats)
     y_bin = binary_labels(y, PPROP_EDGE).astype(np.float64)
-    w = fold_weights(args.weights, y, train_idx, val_idx)
+    # Under --train-all the validation rows are a SUBSET of the training rows, and
+    # `fold_weights` refuses an overlap that is not an identity -- see its docstring. Passing
+    # the training index for both is how "one composition over everything" is spelled: both
+    # writes become the same write, and the val rows are weighted as the training rows they
+    # now are, rather than by fold 0's own composition.
+    w = fold_weights(args.weights, y, train_idx,
+                     train_idx if args.train_all else val_idx)
     ess = effective_sample_size(w[train_idx])
     print(f"weights={args.weights}: train ESS {ess:,.0f} "
           f"({100 * ess / len(train_idx):.2f}% of the fold) | norm={args.pprop_norm}")
@@ -863,6 +915,11 @@ def main(argv=None):
         # A bootstrap draw has the same n_train as the parent fold but ~63.2% as many
         # distinct rows, so n_train alone cannot tell the two apart. None when not bootstrapped.
         "n_train_unique": n_train_unique,
+        # Set by --train-all, where the validation rows are inside the training set. It is a
+        # SEPARATE field rather than something a reader is expected to infer from
+        # `config["train_all"]`, because the thing that matters downstream is not which flag
+        # was passed but whether every `val/*` number in `history` can be quoted. It cannot.
+        "val_is_in_sample": bool(args.train_all),
         "frozen_baseline": frozen_baseline,
         # The provenance triple. pProp_MLP's runs/ became unreadable because an objective
         # revision and an in-place split regeneration both went unrecorded, so old

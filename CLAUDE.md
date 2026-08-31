@@ -137,7 +137,8 @@ width.
 | Width scan | **deferred**, superseded by the above — see "Deferred: the width scan" |
 | Hyperparameter sweep (wandb bayes) | **blocked on the width question** — `sweeps/bayes_v1.yaml` is stale; `bayes_v2.yaml` was deliberately not imported |
 | R3 probe — GP uncertainty | **not imported.** Lives at `embedding-head-32d:src/uncertainty_probe.py`, repaired 2026-08-24; re-import if the width work needs an uncertainty reading |
-| `src/export.py` | **does not exist.** Nothing on disk is exportable — see "The export gap" |
+| `src/export.py` | **done 2026-08-31** — builds a zippable handover package from one checkpoint. Templates in `src/export_pkg/` |
+| Handover package for the downstream project | **done 2026-08-31** — `handover/minimol_ampc_encoder_v1`, built from a `--train-all` refit of the sweep's cfg1. See "The handover package" |
 | Layer-wise freeze/unfreeze | **not started, deferred 2026-08-13** — see "Deferred: layer-wise freeze/unfreeze" |
 
 The trunk reproduces frozen MiniMol embeddings **exactly** (max|Δ| = 0.000e+00 over 64×512),
@@ -432,16 +433,61 @@ moves what is trained.
 **Never point a probe at bare `outputs/`.** Measured 2026-08-25: `outputs/enc_v2` holds 1 run,
 bare `outputs/` finds 62.
 
-### The export gap
+### The export gap — CLOSED 2026-08-31
 
-**`src/export.py` does not exist**, and `run_config.py` forces `--no-save-checkpoint`, so
-**nothing on disk today is exportable.** Whatever configuration is chosen must be re-run with
-`--keep-checkpoints` before anything reaches the downstream project.
+`src/export.py` now exists and `handover/minimol_ampc_encoder_v1` is a built, verified package.
+See "The handover package" below. What follows is still true of any *other* run:
+`run_config.py` forces `--no-save-checkpoint`, so a sweep trial is not exportable and the
+configuration must be re-run with `--keep-checkpoints` first.
 
 The head is trivially portable; **the trunk is not.** Reconstructing it needs graphium 2.4.7,
 the minimol 1.3.4 wheel, and `trunk.py`'s exact construction ordering, so the downstream project
 must vendor `trunk.py` / `head.py` / `model.py` or put this `src/` on `sys.path`. State this in
 any handover.
+
+### The handover package — `src/export.py`
+
+**Built 2026-08-31 for the downstream active-learning project.**
+`handover/minimol_ampc_encoder_v1` (35 MB, zips to 32 MB) is a self-contained
+`SMILES -> R^512` encoder: weights, the four modules needed to rebuild the trunk, pinned
+requirements, two documents, two examples, and a fixture.
+
+```bash
+python src/train.py --train-all --seed 0 --out handover/_train/cfg1_all ...   # 9.1 min
+python src/export.py --checkpoint handover/_train/cfg1_all/final.pt \
+                     --out handover/minimol_ampc_encoder_v1
+```
+
+`src/export.py` and the templates in `src/export_pkg/` are the source. `.gitignore` covers the
+built packages and the run's 271 MB of `val_*.npy`, but **deliberately not
+`handover/_train/*/final.pt`** — that checkpoint is the input a package is built from, and an
+ignored `handover/` would have made the one irreplaceable file the one invisible to
+`git status`. It is untracked, not ignored; committing or archiving it is a decision to take
+knowingly. `handover/` deliberately is **not** under `outputs/` — both probes `rglob` a
+root and neither gates on the provenance triple, so a `val_embeddings.npy` there would be
+silently pooled into an analysis.
+
+- **The shipped export is `pooled512`, not `z`** — `reports/vn_feature_analysis.md`'s
+  recommendation. `z`'s effective rank is 23.5 ± 6.7 of 1024 and its `scalarness` 0.843, so
+  its distances largely restate predicted pProp, which is the one thing a GP kernel must not
+  be handed.
+- **The shipped weights were refit on all 331,480 rows** and have no held-out set. The card
+  quotes the ten cfg1 bootstrap siblings that did hold fold 0 out, and states plainly that
+  every molecule in `ampc_subset_331k.csv` is in-sample — an AL benchmark scored on that
+  subset reads optimistically. In-sample `goal_metric` is **1.2973** against the siblings'
+  held-out **1.0186**, which is the size of the gap being warned about.
+- **`export.py` refuses a checkpoint not trained with `--train-all`** (unless
+  `--allow-partial-train`), because the card it generates claims the full dataset.
+- **Both documents are generated**, every number interpolated from the run's `meta.json` and
+  the siblings' — no figure is typed into a template.
+- Verified: `verify_install.py` 5/5 from outside the repo, from an unzipped copy, on GPU
+  (max|Δ| 5.6e-06) and CPU (**0.000e+00**); both examples run; the four vendored modules
+  `diff` clean against `src/`; and both module-import orders leave the importer's `sys.path`
+  and `sys.modules` untouched.
+
+Measured while building it: **12,600 mol/s** to encode on an A6000, against ~1,745 mol/s to
+featurize — which is why the package's `featurize.py` caches graphs and the AL example
+reloads them.
 
 ### The task is joint, and binary at pProp ≥ 3.5
 

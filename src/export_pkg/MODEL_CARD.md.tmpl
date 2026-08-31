@@ -1,0 +1,142 @@
+# Model card — MiniMol/AmpC encoder
+
+Built {built_date} from `{git_sha}`, checkpoint sha256 `{ckpt_sha}`.
+
+## What it is
+
+MiniMol v1's full trunk — 16 message-passing GNN layers over the molecular graph, a virtual
+node updated 15 times, two positional encoders, **{trunk_params:,} parameters** — fine-tuned
+end to end on AmpC docking data, with a {head_params:,}-parameter joint classification +
+regression head on top.
+
+The **deliverable is the encoder**, not the predictions. The predictions are the training
+signal that shaped the representation.
+
+| | |
+|---|---|
+| export | `pooled512` — `global_max_pool` over the final GNN layer, 512-d |
+| also available | `z` — the head's shared layer, {embed_dim}-d, **not** recommended (README, "Which vector to use") |
+| predictions | pProp (regression) and a logit for pProp ≥ {pprop_edge} |
+
+## The target
+
+`pprop = -log10(rank_max / 1e7)`, a quantile of the AmpC docking score over a 10M-molecule
+library. **Higher = more potent.** It caps at **7.0** (rank 1 of 10M).
+
+Note the sign convention flips relative to the raw docking score, which is in kcal/mol where
+*more negative* is better. pProp is monotone in it.
+
+The binary threshold is **pProp ≥ {pprop_edge}** — the point at which binders become possible,
+and the finest split leaving a learnable positive class: 3,153 molecules of 331,480 (~0.95%).
+At pProp ≥ 5.0 there are only 100 in the whole dataset.
+
+## Training data
+
+{n_train:,} molecules from `ampc_subset_331k.csv` — a subsample of a 10M AmpC docking library
+that keeps the **entire potent tail** and subsamples the bulk. Every molecule in the library
+with pProp ≥ 2.5 is present, so the positive class is a census rather than a sample. SMILES are
+RDKit-canonical (isomeric) and deduplicated.
+
+The subset is therefore **~30× tail-enriched by construction** relative to the library.
+
+## How it was trained
+
+Hyperparameters were selected by a 131-configuration Bayesian sweep (`lyc0lh2d`), each
+configuration scored as the mean over a full 5-fold × 2-seed grid on cluster-CV splits. The
+top three were a statistical tie (0.09 σ apart); this checkpoint uses the second, refit.
+
+Two phases with independent lengths and one cosine anneal each: the head trains alone on the
+frozen trunk, then the trunk unfreezes and both train together.
+
+| | |
+|---|---|
+| freeze / unfrozen epochs | {freeze_epochs} / {unfrozen_epochs} |
+| head LR (phase 1 / phase 2) | {head_lr:.3e} / {head_lr_unfrozen:.3e} |
+| trunk LR (phase 2) | {trunk_lr:.3e} |
+| batch size | {batch_size} |
+| loss weighting | `balanced` — two-group inverse frequency at pProp {pprop_edge} (104× ratio) |
+| target normalization | `{pprop_norm}`, statistics from the training set; predictions are denormalized back to raw pProp |
+| head | `512 → {embed_dim}` (Linear + LayerNorm + GELU), then two bare `Linear({embed_dim} → 1)` |
+
+The freeze was asserted, not assumed: across the frozen phase the trunk was bit-for-bit
+unchanged (Δ = {frozen_trunk_delta:.3e}) while the head provably moved (Δ =
+{frozen_head_delta:.3e}), and the trunk moved once unfrozen (Δ = {unfrozen_trunk_delta:.3e}).
+
+## ⚠ These weights were refit on ALL the data
+
+**This checkpoint was trained on all {n_train:,} molecules, with nothing held out.** That is a
+deliberate refit-after-selection: the hyperparameters were chosen with cross-validation, and
+the shipped model then uses every molecule available.
+
+Two consequences you have to design around:
+
+1. **No held-out metric exists for these exact weights.** The numbers below come from ten
+   *identically configured* models that did hold a fold out. The run's own `val/*` metrics are
+   in-sample and are stamped `"val_is_in_sample": true` in `model/meta.json`; do not quote them.
+
+2. **Every molecule in `ampc_subset_331k.csv` is in-sample for this model.** An
+   active-learning benchmark scored on molecules drawn from that subset will read
+   optimistically, and the size of the optimism is not measured. Score on library molecules
+   **outside** the 331k subset — the other ~9.67M — or accept and state the bias.
+
+If you need a model with an honest held-out set, the same configuration trained with fold 0
+held out is a ~10-minute run in the source repository.
+
+## Performance
+
+{n_siblings} models at this configuration, each trained on a bootstrap resample of fold 0's
+training side, scored on fold 0's **held-out** {sib_n_val:,} molecules ({sib_n_pos:,} positive
+at pProp >= {pprop_edge}). Mean +/- sd over the {n_siblings}:
+
+| metric | value |
+|---|---|
+| Pearson r (pProp) | **{m_pearson}** |
+| Spearman rho | {m_spearman} |
+| R^2 | {m_r2} |
+| MAE (raw pProp units) | {m_mae} |
+| Average precision, pProp >= {pprop_edge} | **{m_ap}** (base rate {sib_base_rate:.4f}) |
+| Enrichment factor @ top 1% | {m_ef1} |
+| Enrichment factor @ top 0.1% | {m_ef01} |
+| composite `goal_metric` | {m_goal} |
+
+Those {n_siblings} each saw ~167k unique of 265,184 training rows (a bootstrap keeps ~63.2%
+distinct), against this checkpoint's {n_train:,}. So they are a **conservative** read on it —
+but a read on a *sibling*, not a measurement of these weights.
+
+Regression quality is very uneven across the range, and this matters for acquisition: within
+the bulk (pProp < {pprop_edge}) Pearson is {m_pearson_lt}, but **within the potent group
+(pProp >= {pprop_edge}) it is {m_pearson_ge}** and Spearman {m_spearman_ge}. The model ranks
+potent-vs-bulk well and ranks *within* the potent tail poorly.
+
+## Scope — what this model can and cannot claim
+
+- **Generalisation to new clusters within this library, not to new chemistry.** The CV split
+  is ECFP4/2048 sphere-exclusion clustering at Tanimoto distance 0.65, with whole clusters
+  dealt into folds. That removes analog leakage (molecules with a training neighbour ≥ 0.7
+  similarity drop 5.15% → 2.11%) but barely moves the median nearest-neighbour similarity. It
+  is a harder split than random, and it is not a test of novel chemistry.
+- **One target, one protein.** AmpC β-lactamase docking scores. Nothing here transfers to
+  another target without measurement.
+- **Docking scores, not activity.** The label is a docking program's output, with all of that
+  method's biases; it is not experimental binding.
+- **The metrics above describe this ~30× tail-enriched subset**, not the 10M library. There is
+  no reweighting in this package that corrects back to library base rates, so read the
+  enrichment factors as subset numbers.
+- **`pooled512` is not a MiniMol embedding.** Fine-tuning cost it 54% of its structural
+  correlation with ECFP4 Tanimoto similarity and 28% of its effective rank. It is a
+  pProp-shaped space now.
+
+## Provenance
+
+Every number in this card traces to a file. `model/meta.json` is the training run's own
+record: argv, full config, per-epoch history, hardware, library versions, and the provenance
+triple — `objective_version`, `split_sha256`, `input_sha256` — that identifies which objective
+definition and which data partition it was trained under.
+
+| | |
+|---|---|
+| objective version | `{objective_version}` |
+| split sha256 | `{split_sha256}` |
+| input (CSV) sha256 | `{input_sha256}` |
+| trained on | {gpu_name}, {total_minutes:.1f} min |
+| versions | {versions} |

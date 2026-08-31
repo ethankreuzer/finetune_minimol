@@ -1,0 +1,272 @@
+# MiniMol/AmpC encoder — `SMILES → R^512`
+
+A frozen molecular encoder. MiniMol's full ~7.9M-parameter trunk, fine-tuned end to end on
+AmpC docking scores, exported as a `SMILES → 512-d vector` featurizer for a deep-kernel-
+learning GP.
+
+Built {built_date} from `{git_sha}`. See **MODEL_CARD.md** for what it was trained on, what
+its numbers are, and where its scope stops — read that before you trust a result.
+
+```python
+from minimol_ampc import MiniMolAmpcEncoder
+
+enc = MiniMolAmpcEncoder.load("model/final.pt")
+emb = enc.encode(["CCO", "c1ccccc1"])        # (2, 512) float32   <- the export
+```
+
+---
+
+## Contents
+
+```
+README.md  MODEL_CARD.md          this file, and the provenance
+verify_install.py                 run this first
+requirements.txt                  pip fallback
+pyproject.toml  uv.lock           the real dependency spec
+meta.json                         checksums, versions, what this was built from
+model/
+  final.pt                        the weights ({ckpt_mb:.0f} MB)
+  config.json  meta.json          the training run's own configuration and provenance
+  pooled512_stats.npz             per-dimension mean/std, for standardizing before a kernel
+minimol_ampc/
+  encoder.py                      load + inference          <- the API
+  featurize.py                    SMILES -> graphs, cached  <- read this for the AL loop
+  trunk.py head.py model.py normalization.py                <- vendored, byte-identical
+examples/
+  quickstart.py                   SMILES in, vectors out
+  active_learning.py              the loop shape, and the mistake that makes it slow
+fixtures/                         64 molecules with their expected outputs
+```
+
+## Installing
+
+The environment is narrow and three of its pins exist only to hold back the modern world.
+Removing any of them breaks things **silently or confusingly**, so all three have their reason
+written beside them in `requirements.txt`.
+
+### Primary: uv
+
+```bash
+UV_HTTP_TIMEOUT=3600 uv sync --locked
+```
+
+`uv.lock` is the exact resolution this package was verified under. `--locked` refuses to
+re-resolve, so a newer uv cannot quietly substitute a different graph.
+
+**`UV_HTTP_TIMEOUT=3600` is mandatory, not defensive.** uv's default is 30 s, which is shorter
+than a ~780 MB torch wheel takes on a slow link. It fails as `operation timed out (Connect)`,
+which reads like an unreachable host and is not.
+
+### Fallback: pip
+
+```bash
+python3.11 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+`requirements.txt` carries its own `--extra-index-url` and `-f` lines, because a plain
+requirements file cannot otherwise express this environment: torch comes from
+`download.pytorch.org/whl/cu124` and the three compiled PyG extensions come from a *flat
+index* at `data.pyg.org`.
+
+### Non-negotiable, on every path
+
+| pin | why |
+|---|---|
+| **Python 3.11 exactly** | the PyG extension wheels are built per (python, torch, cuda) triple |
+| **`torch==2.6.0+cu124`** | graphium declares *no* torch dependency, so an unpinned resolve replaces it and orphans the compiled extensions |
+| **`setuptools<81`** | graphium pins `torchmetrics<0.11`, which imports `pkg_resources`; setuptools 81 deprecated it, 84 removed it |
+| **`scipy<1.14`** | graphium's featurizer hands a float16 adjacency matrix to `scipy.sparse.coo_matrix`; scipy ≥ 1.15 rejects float16 |
+| **graphium 2.4.7 + minimol 1.3.4** | the trunk is rebuilt through graphium's own loaders; `trunk.py` relies on private APIs that carry no stability promise |
+
+### CUDA, and running without one
+
+The pins target **CUDA 12.4**, which covers sm_80/86/90 (A100, A6000, H100/H200). If your CUDA
+differs, change the `+pt26cu124` suffix on torch and the `+pt26cu124` suffix on all three PyG
+extensions **together**, along with the `-f` index line — they must agree with each other and
+with your driver.
+
+**CPU works.** Verified {cpu_verified}: the full load → encode path runs on CPU under this same
+cu124 install and is deterministic there (repeating a batch gives max|Δ| = 0.0). Pass
+`device="cpu"`, or just let `device=None` fall back when no GPU is present. A dedicated
+CPU-only wheel set (`+pt26cpu`) was **not** tested; if you have a GPU-less machine, the
+cu124 install above is the tested route.
+
+### Then, before anything else
+
+```bash
+python verify_install.py            # add `cpu` or `cuda` to force a device
+```
+
+This is not a smoke test. minimol's own loader uses `load_state_dict(..., strict=False)`, so a
+version skew that renames one parameter produces a **partly randomly initialised trunk with no
+error** — a model that runs, returns correctly-shaped vectors, and is worthless.
+`verify_install.py` compares numbers against the shipped fixture, which key names cannot fake.
+Expect `max|Δ|` around 0 on CPU and ~1e-6 on GPU, against a tolerance of 1e-4.
+
+---
+
+## Step 1: SMILES → graphs
+
+**MiniMol does not consume SMILES.** It consumes a molecular graph carrying node features,
+edge features and two kinds of positional encoding, built by graphium's featurizer. Everything
+in this package goes through that step, and for a loop it is the step that decides whether you
+are fast or slow.
+
+`enc.encode(smiles)` does the conversion for you on every call. That is right for a script and
+wrong for a loop, because **SMILES → graph is a pure function of the string**: it depends on no
+weight, no round and no random seed. Re-deriving it every round recomputes an answer that
+cannot have changed.
+
+Measured in the source project: featurization runs at **~775–1,745 mol/s**, while a full
+network pass over 265k graphs takes ~1.7 min. On a fixed candidate pool the *conversion*, not
+the network, becomes the loop's cost.
+
+So for anything you will encode more than once:
+
+```python
+from minimol_ampc import MiniMolAmpcEncoder, featurize
+
+enc = MiniMolAmpcEncoder.load("model/final.pt")
+
+# ONCE per pool. Reuses the encoder's already-built graphium object (~30 s saved).
+featurize.build_cache(pool_smiles, "cache/pool", on_invalid="skip", trunk=enc.model.trunk)
+
+# EVERY round. ~1 s to reload, against minutes to re-featurize.
+graphs, meta = featurize.load_cache("cache/pool")
+emb = enc.encode_graphs(graphs).pooled512
+```
+
+or from the command line:
+
+```bash
+python -m minimol_ampc.featurize --smiles pool.txt --out cache/pool --skip-invalid
+```
+
+Two properties of the cache, both measured rather than assumed:
+
+- Graphs are stored **PyG-collated** — `(data, slices)`, a few large concatenated tensors plus
+  a slice index — not as a list of `Data`. Benchmarked at 331k molecules: **4.81 GB / 1.0 s to
+  load** against 5.44 GB / 81.7 s. `separate` was verified to round-trip every key of every
+  graph exactly and give bit-identical embeddings.
+- **Do not wrap featurization in a process pool.** graphium sets `featurization_n_jobs = -1`
+  and already uses every core; a second pool oversubscribes the machine and runs *slower*.
+
+### Molecules that will not featurize
+
+graphium returns the **error string in place of the graph** rather than raising. Left alone,
+that becomes a silent hole that shifts every subsequent row out of alignment with your labels.
+Both this package's entry points refuse to let that happen:
+
+- `on_invalid="raise"` (the default) — refuses the whole call and names the offenders.
+- `on_invalid="skip"` — drops them and hands back a `kept` mask (`encode_all`) or records them
+  in `meta.json` and returns the surviving SMILES on `cache.smiles` (`build_cache`).
+
+**For an active-learning loop over generated molecules, use `skip`** — a generator will produce
+SMILES that do not featurize — and then use the mask or `cache.smiles`, never your original
+list, to tie a row back to a molecule.
+
+## Step 2: encoding
+
+```python
+emb = enc.encode(smiles)                      # (N, 512) — one row per input, or it raises
+out = enc.encode_all(smiles, on_invalid="skip")
+out.pooled512    # (n_kept, 512)  the export
+out.z            # (n_kept, {embed_dim})  the head's shared layer — see below
+out.pprop        # (n_kept,)  predicted pProp, RAW scale, higher = more potent
+out.logit        # (n_kept,)  raw logit for pProp >= {pprop_edge}; apply a sigmoid yourself
+out.kept         # (N,) bool over your inputs
+```
+
+`grad=True` keeps the autograd graph if you want to backpropagate into the encoder. Off by
+default; the intended use is frozen.
+
+## Which vector to use
+
+**Use `pooled512`.** It is MiniMol's own graph-level output — a `global_max_pool` over the
+final (16th) GNN layer's atom features — and it is the recommended export for a kernel-based
+consumer. `z`, the head's {embed_dim}-d shared layer, is also returned, and is *not*.
+
+That is a measurement, not a preference. `z` sits one bare `Linear` from the prediction, so
+pProp is close to linear in it by construction — which makes it the better *predictor* and the
+worse *encoder*. Across ten identically-configured models:
+
+| | `pooled512` | `z` |
+|---|---|---|
+| effective rank | — | **{z_eff_rank:.1f} of {embed_dim}** |
+| `scalarness` (how much "far apart" just means "different predicted pProp") | 0.40 | **0.84** |
+| directions actually used | 22% | 3% |
+
+*Effective rank is computed by `export.py` from the {n_siblings} sibling runs. The other two
+rows are quoted from `reports/vn_feature_analysis.md` in the source repository, which measured
+them over 30 models across three configurations — ask for that report if you want the method
+and the full comparison.*
+
+A GP kernel consumes exactly one thing — distance between molecules — and its posterior
+variance is what acquisition steers on. A space where distance is 84% a restatement of the
+point prediction hands the GP a disguised scalar and makes its uncertainties meaningless on
+novel chemistry. `pooled512` costs ~2% of kNN correlation against `z` and buys the geometry.
+
+### Standardize before an RBF/Matérn kernel
+
+`pooled512` is a **max-pool** output: its dimensions have heterogeneous scales and are not
+centred. `model/pooled512_stats.npz` holds the per-dimension mean and std, computed over
+{stats_n:,} molecules with this exact checkpoint.
+
+```python
+s = np.load("model/pooled512_stats.npz")
+xs = (x - s["mean"]) / s["std"]
+```
+
+---
+
+## Footguns
+
+Every one of these fails **silently** — no exception, plausible-looking output. The first three
+are enforced in `encoder.py` so you cannot hit them through this API; they are listed because
+you *can* hit them if you build the forward pass yourself.
+
+1. **`.eval()` is mandatory.** In train mode MiniMol applies random Laplacian sign-flip
+   augmentation to the positional encodings — measured at max|Δ| ≈ 2.8 on internal state
+   between two otherwise identical passes. A training-mode encoder returns a different vector
+   every call for the same molecule. `load()` calls `.eval()`; `encode` asserts it.
+2. **A collated batch is single-use.** The positional encoders concatenate into `feat` during
+   `forward`, so the batch's feature width grows as it is used. Re-collate; never reuse.
+   `encode_graphs` collates fresh per batch.
+3. **`load_state_dict(..., strict=False)`** — minimol's own loader — tolerates missing keys and
+   yields a partly random trunk with no error. This package loads `strict=True` and asserts the
+   result is empty.
+4. **This is not stock MiniMol.** The trunk was fine-tuned, and that cost `pooled512` **54% of
+   its structural correlation** with ECFP4 Tanimoto similarity (measured against an
+   un-fine-tuned trunk over the same molecules; `reports/vn_feature_analysis.md`). These vectors are not
+   interchangeable with MiniMol embeddings and must not be mixed with them in one kernel.
+5. **pProp is not a docking score.** Higher = more potent, it caps at 7.0, and the classifier's
+   threshold is {pprop_edge}. The underlying AmpC score is in kcal/mol where *more negative* is
+   better; the sign convention is opposite. See MODEL_CARD.md.
+6. **The normalization statistics are per-checkpoint.** They live inside `final.pt` and
+   `encoder.py` reads them from there. Do not copy the numbers out of a document.
+
+## Portability
+
+The head is trivially portable. **The trunk is not.** Reconstructing it requires graphium
+2.4.7, the minimol 1.3.4 wheel, and `trunk.py`'s exact construction ordering — which is why
+`trunk.py`, `head.py`, `model.py` and `normalization.py` are vendored here **byte-identically**
+from the source repository, with their sha256 sums in `meta.json`. Keep them together with the
+checkpoint; `final.pt` alone is not loadable.
+
+The vendored files import each other **flatly** (`model.py` does `from head import MLPHead`),
+which is the price of byte-identity. So importing `minimol_ampc` borrows six bare module names
+— `trunk`, `head`, `model`, `normalization`, `encoder`, `featurize` — and **gives them back**:
+anything of yours already under one of those names is set aside and restored afterwards, along
+with `sys.path`. Import order does not matter, nothing of yours is shadowed, and `import model`
+still gets yours. They stay reachable as `minimol_ampc.trunk`, `minimol_ampc.model`, and so on.
+
+## Questions this package cannot answer
+
+- **How well does it work on molecules unlike this library?** Not measured. See MODEL_CARD.md,
+  "Scope" — the honest claim is generalisation to new *clusters within this library*, not to
+  new chemistry.
+- **Is 512 the right width, or `pooled512` the right layer?** The layer was chosen by
+  measurement (above); the width is MiniMol's own and was not scanned.
+- **Should the encoder stay frozen under DKL?** Untested here. `grad=True` exists if you want
+  to find out.

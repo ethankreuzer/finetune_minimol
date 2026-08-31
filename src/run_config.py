@@ -106,7 +106,13 @@ CONSTANT_METRICS = ("n", "n_positive", "n_group_lt", "n_group_ge", "group_edge",
 
 # `train.py` flags the driver does not expose at all: it sets `--fold`, `--seed` and `--out`
 # per model, and owns the checkpoint decision through `--keep-checkpoints`.
-NOT_EXPOSED = {"fold", "seed", "out", "save_checkpoint"}
+#
+# `train_all` belongs here for the same reason `fold` does: it says which ROWS a model sees,
+# and "train on everything" has no meaning to a driver whose entire job is to run a K-fold
+# grid -- a configuration cannot be a 5x2 CV design and a refit-on-all-data at once. Keeping
+# it unexposed also keeps it out of `config_id`, which hashes `vars(args)` below; exposing it
+# would re-stamp every configuration id in the repo, including the sweep's own `5b94e92b`.
+NOT_EXPOSED = {"fold", "seed", "out", "save_checkpoint", "train_all"}
 
 # Exposed on this CLI but NOT forwarded: the driver is the only thing that talks to wandb,
 # and it resolves the output bucket itself. Forwarding `--no-wandb` would be harmless (the

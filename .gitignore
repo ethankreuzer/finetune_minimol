@@ -48,3 +48,21 @@ outputs/
 wandb/
 *.out
 *.err
+
+# Handover packages built by src/export.py -- generated artifacts, each carrying a 34 MB copy
+# of a checkpoint. `src/export.py` and the templates under `src/export_pkg/` are their source.
+handover/*.zip
+handover/minimol_ampc_encoder_*/
+
+# The 271 MB of per-run embeddings a training run writes. Nothing in a handover package reads
+# them; the probes' artifacts, not this one's.
+handover/_train/*/val_*.npy
+
+# NOT ignored, deliberately: handover/_train/*/final.pt and its meta.json. That checkpoint is
+# the INPUT the package is built from, and a package cannot be rebuilt or amended without it
+# -- an ignored `handover/` would have made the one irreplaceable file here the one invisible
+# to `git status`. Whether to commit 34 MB or archive it elsewhere is a decision to take
+# knowingly; it should not be taken by an ignore rule.
+
+# Local run logs. `job.sh` and the SLURM convention put logs in ~/logs/, not here.
+logs/

@@ -1,0 +1,50 @@
+# Fallback install path. `uv sync --locked` against the shipped pyproject.toml + uv.lock is
+# the primary one -- see README.md, "Installing". Use this only if uv is not an option.
+#
+#     python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#
+# Python 3.11 EXACTLY. Not a preference: the torch-scatter/sparse/cluster wheels below are
+# built per (python, torch, cuda) triple -- cp311 + pt26cu124 -- so the interpreter version is
+# part of the ABI contract. graphium 2.4.7's own classifiers stop at 3.11.
+
+# torch comes from PyTorch's own index, not PyPI, because the +cu124 local version tag does
+# not exist on PyPI.
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# The three compiled PyG extensions come from a FLAT INDEX -- a plain HTML page of wheels,
+# which is why a requirements file cannot express this environment through version pins
+# alone. PyPI carries only sdists for these, which try to compile against torch at build time
+# and fail.
+-f https://data.pyg.org/whl/torch-2.6.0+cu124.html
+
+# ---------------------------------------------------------------------------------------
+# Pinned exactly. graphium declares NO torch dependency at all (only the PyG extensions), so
+# an unpinned resolve picks whatever the newest torch is and silently uninstalls this one,
+# orphaning the three compiled extensions. That is not hypothetical -- it happened, and the
+# symptom was an import error a long way from the cause.
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+
+# Compiled against torch 2.6.0+cu124. If your CUDA differs, change the `+pt26cu124` suffix on
+# all three AND the -f line above to the matching page at https://data.pyg.org/whl/ -- they
+# must agree, and they must match your torch build.
+torch-scatter==2.1.2+pt26cu124
+torch-sparse==0.6.18+pt26cu124
+torch-cluster==1.6.3+pt26cu124
+
+# Pulls graphium==2.4.7 and hydra-core. The wheel is ~19 MB because it carries MiniMol's
+# pretrained weights, which is why nothing here downloads a checkpoint at load time.
+minimol==1.3.4
+
+# NOT optional. graphium pins torchmetrics<0.11, and torchmetrics 0.10.3 imports
+# `pkg_resources` at module scope. setuptools 81 deprecated it and 84 removed it, and a bare
+# venv ships no setuptools at all -- so without this the install succeeds and `import
+# graphium` then fails with ModuleNotFoundError: No module named 'pkg_resources'.
+setuptools<81
+
+# NOT optional either. graphium's featurizer builds the adjacency matrix as float16 and hands
+# it to scipy.sparse.coo_matrix; newer scipy enforces a dtype whitelist that excludes float16
+# and raises "scipy.sparse does not support dtype float16" on every molecule. Measured per
+# version: 1.13.1 works, 1.14.1 works, 1.15.3 fails, 1.17.1 fails -- so the real boundary is
+# 1.15. Pinned one lower because 1.13.1 is what this package was verified under.
+scipy<1.14
