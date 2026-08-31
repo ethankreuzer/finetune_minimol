@@ -1,0 +1,31 @@
+{
+  "script": "src/vn_probe.py",
+  "argv": [
+    "src/vn_probe.py",
+    "--root",
+    "outputs/vn_analysis/lyc0lh2d",
+    "--oob",
+    "-o",
+    "/tmp/claude-1000/-home-ethan2-finetune-minimol/bc94f406-c4fd-4ef8-9ddf-89e183ab62fd/scratchpad/probe_metrics_rerun.csv"
+  ],
+  "sweep_id": "lyc0lh2d",
+  "n_models": "31 = 30 fine-tuned + 1 pretrained baseline (config='pretrained')",
+  "embeddings": [
+    "vn03",
+    "vn06",
+    "vn09",
+    "vn12",
+    "vn15",
+    "pooled512"
+  ],
+  "scoring": "in-sample: the forest is fit and evaluated on the same molecules",
+  "pprop_edge": 3.5,
+  "rf": {
+    "n_estimators": 100,
+    "min_samples_leaf": 1,
+    "n_components": 32,
+    "seed": 0
+  },
+  "minutes": 22.3,
+  "note": "Written to a scratch path by the argv above, then copied here. Regenerate in place with: python src/vn_probe.py --root outputs/vn_analysis/lyc0lh2d --oob"
+}

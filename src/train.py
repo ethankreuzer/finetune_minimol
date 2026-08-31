@@ -155,6 +155,12 @@ def build_parser():
     p.add_argument("--fold", type=int, default=0)
     p.add_argument("--seed", type=int, default=0,
                    help="head init, dropout and shuffling only -- never the partition")
+    # Deliberately a separate knob from --seed. The bootstrap resamples the DATA; --seed
+    # governs optimisation. An experiment may want them to move together (pass both) or to
+    # hold one fixed while the other varies, and one integer cannot express that.
+    p.add_argument("--bootstrap-seed", type=int, default=None,
+                   help="resample the training fold WITH replacement to its own size, using "
+                        "this seed. Leaves the validation fold untouched. Off by default.")
 
     # Two phase LENGTHS, not a total and a cut point. A bayes sweep samples its parameters
     # independently, and (epochs, freeze_epochs) carries the cross-constraint
@@ -632,6 +638,20 @@ def main(argv=None):
                          "rows; they are aligned by row position only")
 
     train_idx, val_idx = load_fold(args.splits, fold=args.fold)
+    # The bootstrap resample. It must land HERE -- after the fold is loaded, before anything
+    # derived from `train_idx` is computed -- because two things downstream read the training
+    # set's composition and would otherwise describe the parent fold rather than the draw:
+    # `compute_norm_stats(y[train_idx])` and `fold_weights(...)`, whose balanced weights are
+    # inverse frequencies over `y[train_idx]` and so shift with the resampled tail count.
+    # Duplicated rows are fine for both: `RowDataset` indexes by row and `fold_weights`
+    # writes a per-row weight that depends only on that row's class.
+    n_train_unique = None
+    if args.bootstrap_seed is not None:
+        brng = np.random.default_rng(args.bootstrap_seed)
+        train_idx = brng.choice(train_idx, size=len(train_idx), replace=True)
+        n_train_unique = int(np.unique(train_idx).size)
+        print(f"bootstrap seed {args.bootstrap_seed}: {len(train_idx):,} draws, "
+              f"{n_train_unique:,} unique ({100 * n_train_unique / len(train_idx):.1f}%)")
     if args.subset:
         rng = np.random.default_rng(args.seed)
         train_idx = rng.choice(train_idx, min(args.subset, len(train_idx)), replace=False)
@@ -840,6 +860,9 @@ def main(argv=None):
         "hardware": hardware(),
         "params": counts,
         "n_train": len(train_idx), "n_val": len(val_idx),
+        # A bootstrap draw has the same n_train as the parent fold but ~63.2% as many
+        # distinct rows, so n_train alone cannot tell the two apart. None when not bootstrapped.
+        "n_train_unique": n_train_unique,
         "frozen_baseline": frozen_baseline,
         # The provenance triple. pProp_MLP's runs/ became unreadable because an objective
         # revision and an in-place split regeneration both went unrecorded, so old

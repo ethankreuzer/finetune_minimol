@@ -1,0 +1,27 @@
+{
+  "script": "src/vn_cluster_probe.py",
+  "argv": [
+    "src/vn_cluster_probe.py",
+    "--root",
+    "outputs/vn_analysis/lyc0lh2d",
+    "--n-per-half",
+    "5000",
+    "--pca"
+  ],
+  "sweep_id": "lyc0lh2d",
+  "n_models": 31,
+  "fold": 0,
+  "n_per_half": 5000,
+  "n_positive_per_half": [
+    54,
+    48
+  ],
+  "positive_edge": 3.5,
+  "knn_k": 20,
+  "deal_seed": 20260819,
+  "proj_seed": 20260828,
+  "concat_tap": "vn15",
+  "pca_k": 32,
+  "scoring": "cluster-disjoint halves, both directions averaged",
+  "minutes": 15.6
+}

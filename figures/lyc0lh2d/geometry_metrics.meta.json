@@ -1,0 +1,25 @@
+{
+  "script": "src/vn_geometry.py",
+  "argv": [
+    "src/vn_geometry.py",
+    "--root",
+    "outputs/vn_analysis/lyc0lh2d"
+  ],
+  "sweep_id": "lyc0lh2d",
+  "n_models": 31,
+  "embeddings": [
+    "vn03",
+    "vn06",
+    "vn09",
+    "vn12",
+    "vn15",
+    "pooled512",
+    "z"
+  ],
+  "fold": 0,
+  "n_sample": 5000,
+  "sample_seed": 20260818,
+  "knn_k": 20,
+  "pred_columns_nan_for": "pretrained (no head, so no val_predictions.npy)",
+  "minutes": 11.5
+}
