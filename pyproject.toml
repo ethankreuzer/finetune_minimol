@@ -49,6 +49,30 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["ipython", "jupyter"]
 
+# Mol-JEPA (the `frozen-moljepa` branch). Loaded frozen, via
+# `AutoModel.from_pretrained("Flogrammer/Mol-JEPA", trust_remote_code=True)`, so transformers
+# is the loader and safetensors reads the 182 MB weight file. huggingface-hub is what pins a
+# revision and, on a machine without internet, is what a pre-fetched snapshot is read through.
+#
+# transformers is bounded below at 4.50 because the checkpoint's config.json was stamped
+# `"transformers_version": "4.50.3"`, and below 5 because a major release may change
+# `trust_remote_code` loading, which is the whole mechanism here.
+#
+# molfeat is listed by the model card's install line. Whether Mol-JEPA's own featurization
+# actually imports it is checked in src/jepa_embed.py; if it does not, drop it -- it is the
+# one package in this list heavy enough to move the resolve. Its heaviest dependency,
+# datamol 0.12.5, is already installed.
+#
+# NOTE the constraint this extra must not break: `scipy<1.14` below is load-bearing for
+# graphium, which stays installed so the MiniMol baseline remains re-runnable from this
+# branch. Audit `uv.lock` after resolving, before syncing.
+jepa = [
+    "transformers>=4.50,<5",
+    "safetensors",
+    "huggingface-hub",
+    "molfeat",
+]
+
 [[tool.uv.index]]
 name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu124"

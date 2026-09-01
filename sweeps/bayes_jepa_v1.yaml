@@ -1,0 +1,181 @@
+# Bayes sweep over the head that sits on FROZEN Mol-JEPA embeddings.
+#
+# The sibling of `bayes_v1.yaml`, and deliberately the same machinery: `method: bayes`, the
+# objective `final/goal_metric_mean` maximised, no `early_terminate`, the full 5x2 grid on
+# every trial, one configuration = one wandb run through `src/run_config.py`. The loss, the
+# metrics, the objective, the CSV and the splits are all identical -- that is the point of
+# the branch, and it is what makes a Mol-JEPA number comparable to a MiniMol one.
+#
+# What changes is the axes, because the encoder never moves. `freeze_epochs`,
+# `unfrozen_epochs`, `trunk_lr` and `head_lr_unfrozen` have no referent under a frozen trunk:
+# there is one phase, so one cosine, and no trunk parameter group at all. What is left to
+# tune is the head, which is exactly the set `bayes_v1.yaml` marked "deliberately not swept:
+# blocked on the architecture question".
+#
+# The MiniMol sweep was cut from ten axes to five because bayes' advantage over random search
+# shrinks with dimension and ~140 trials over ten axes is mostly exploration. That argument is
+# about the ratio of trials to axes, not about seven being too many: a trial here trains a
+# small MLP on a cached matrix rather than fine-tuning a 10M-parameter GNN, so the trial count
+# goes up by roughly an order of magnitude and seven axes is a real search again. If the
+# trials turn out slower than that, cut `cls_hidden_dim`/`reg_hidden_dim` first -- the task
+# heads are linear by default and those two do nothing at `*_n_layers: 0`.
+
+program: scripts/sweep_trial.sh
+method: bayes
+
+metric:
+  name: final/goal_metric_mean
+  goal: maximize
+
+# NO ABSOLUTE INTERPRETER PATH HERE -- see bayes_v1.yaml's block for why. `${args}` expands to
+# one `--<key>=<value>` per parameter, spelled with underscores; `train.dashed` normalises
+# them and `run_config.py` reuses it. `--wandb-tags` is `nargs="*"`, so it goes LAST.
+command:
+  - ${env}
+  - ${program}
+  - ${args}
+  - --wandb-tags
+  - sweep
+  - bayes_jepa_v1
+
+# No `early_terminate`, for the same reason as the MiniMol sweep: hyperband prunes on the
+# intermediate value, which systematically penalises long-anneal schedules. `epochs` is a
+# swept axis here too, so pruning on it would decide the sweep before it started.
+
+parameters:
+
+  # -- which program, and which part of Mol-JEPA is the encoder ----------------------------
+
+  # Selects `src/train_jepa.py` over `src/train.py`. Pinned here rather than left to the
+  # default so it appears in every run's wandb config. It is in run_config's OWN_FLAGS and so
+  # is NOT hashed into config_id -- it does not need to be, because the two trainers have
+  # disjoint flag sets and their payloads therefore cannot collide.
+  trainer:
+    value: train_jepa
+
+  # WHICH TENSOR IS THE ENCODER. A real design question, and NOT settled.
+  #
+  # Pinned to the best of a one-fold scan (CLAUDE.md "A first readout scan"), not to a
+  # measured winner. `train_jepa.py`'s own default is `cls`, which exists only so the
+  # pipeline can be smoke-tested and which that scan put LAST of six -- so leaving this
+  # unpinned would spend the whole sweep on the worst readout measured.
+  #
+  # Confirmed on the full 5x2 grid: `emb:graph+emb:ecfp` gives goal_metric 0.7964 +/- 0.0242
+  # over 10 models. Note fold 0 alone read 0.8166, ~0.8 sigma high -- which is why a
+  # single-fold scan picks a direction and not a value.
+  #
+  # `readout` IS hashed into config_id, so changing it costs a new bucket and nothing else:
+  # two readouts are two configurations and can never silently share models.
+  #
+  # Grammar (src/jepa_features.py): cls, emb:<token>, proj:<token>, emb:*, proj:*, joined
+  # with '+'. Tokens are
+  #   cls graph ecfp uma boltz boltz_preds moe bioxmol
+  #   chembl_targets tdc_targets pcba_targets nabla_targets xtb_targets
+  # of which only `graph` and `ecfp` are computed from SMILES -- the rest are masked at
+  # inference and *predicted*. On the one-fold scan those eleven did not help, which is a
+  # hypothesis worth testing properly rather than a settled finding.
+  readout:
+    value: emb:graph+emb:ecfp
+
+  # -- the cost dial ----------------------------------------------------------------------
+
+  # The full 5x2 grid on every trial, as in bayes_v1.yaml. Comma-separated STRINGS, not YAML
+  # lists: a YAML list reaches the agent as `--fold_list=[0, 1]`, which the shell splits and
+  # argparse rejects. `run_config.int_list` reads the integers back out.
+  #
+  # Buys `final/goal_metric_std` beside the objective, which separates a configuration that
+  # won from one that drew a lucky fold, and `pooled/*`, which is undefined unless one seed
+  # holds all five folds. Costs: a nan in any one model makes the objective nan for all ten.
+  fold_list:
+    value: "0,1,2,3,4"
+  seed_list:
+    value: "0,1"
+
+  # -- swept: the head ---------------------------------------------------------------------
+
+  # Depth of the shared trunk of the head, i.e. how much non-linearity sits between the frozen
+  # embedding and the exported vector. 0 is one widening Linear+norm+activation.
+  n_layers:
+    values: [0, 1, 2]
+
+  hidden_dim:
+    distribution: q_log_uniform_values
+    min: 256
+    max: 2048
+    q: 1
+
+  # The exported encoder width. Inherited as 1024 from the MiniMol arm, where it was itself a
+  # decision rather than a measurement -- no run in this repo has compared two widths on the
+  # R1/R2 probes. Swept here because a frozen arm is cheap enough to ask.
+  embed_dim:
+    distribution: q_log_uniform_values
+    min: 32
+    max: 2048
+    q: 1
+
+  # -- swept: optimisation -----------------------------------------------------------------
+
+  epochs:
+    distribution: q_log_uniform_values
+    min: 3
+    max: 60
+    q: 1
+
+  head_lr:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.01
+
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.00001
+    max: 0.1
+
+  dropout:
+    distribution: uniform
+    min: 0.0
+    max: 0.5
+
+  # -- pinned, and why ---------------------------------------------------------------------
+
+  # The four loss weights, at pProp_MLP's swept optima -- already train_jepa.py's defaults,
+  # and identical to the MiniMol arm's. Written as explicit `value:` entries rather than
+  # deleted so they stay in every run's config AND in config_id, exactly as bayes_v1.yaml
+  # does it. Re-sweeping these is the first thing to restore if the tuned model underperforms.
+  w_cls:
+    value: 0.4418
+  w_pair:
+    value: 7.486
+  w_std:
+    value: 0.7911
+  huber_delta:
+    value: 1.0513
+
+  # 1200 is argued twice over -- ~11.4 positives per batch at the pProp 3.5 edge, and
+  # throughput -- and moving it would confound every LR axis. Not swept, in either arm.
+  batch_size:
+    value: 1200
+
+  # The task heads stay linear, so the shared block's output is the exported encoder and
+  # "pProp is linear in the export" stays literally true. `cls_hidden_dim`/`reg_hidden_dim`
+  # are inert at 0 layers and are left at their defaults rather than swept into nothing.
+  cls_n_layers:
+    value: 0
+  reg_n_layers:
+    value: 0
+
+  # Fixed across both arms: `balanced` two-group inverse frequency at pProp 3.5, z-scored
+  # target, and the annealing that makes final-epoch selection valid.
+  weights:
+    value: balanced
+  pprop_norm:
+    value: zscore
+  eta_min:
+    value: 1.0e-8
+  lr_schedule:
+    value: cosine
+
+  # VICReg off, as in the MiniMol arm's default. It arrived from the sealed 32-d arc as an
+  # available tool; its `w_vic=3` pin did not, and is not binding here.
+  w_vic:
+    value: 0.0

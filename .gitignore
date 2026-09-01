@@ -27,6 +27,11 @@ data/*
 # src/featurize.py, which depends only on the CSV above rather than on an rdkit version.
 data/features/
 
+# The Mol-JEPA embedding cache: 17.6 GB, and genuinely regenerable in ~25 min from
+# src/jepa_embed.py, which is deterministic given the CSV and the pinned Hub revision --
+# both of which meta.json records, and both of which are tracked or immutable.
+data/embeddings/
+
 # Recreated by `uv sync` from the tracked pyproject.toml + uv.lock. ~5 GB with the CUDA
 # wheels, and it is platform-specific -- it must never travel to another cluster.
 .venv/

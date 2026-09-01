@@ -28,6 +28,12 @@ cd "$REPO"
 
 # Each is applied only if the environment set it, so running this by hand -- or from an agent
 # on a machine that stages nothing -- falls back to run_config.py's own defaults.
+#
+# MINIMOL_FEATURES and MINIMOL_EMBEDDINGS are trainer-specific and MUTUALLY EXCLUSIVE:
+# `--features` is the MiniMol graph cache and exists only on train.py, `--embeddings` is the
+# frozen Mol-JEPA cache and exists only on train_jepa.py. Setting the wrong one for the sweep
+# being served makes argparse reject the whole command line, which is the loud failure -- so
+# a job staging data must export the one matching its sweep's pinned `trainer`.
 # --wandb-entity must be passed as a FLAG. Exporting WANDB_ENTITY is NOT enough:
 # run_config.py:351 calls wandb.init(entity=args.wandb_entity), and an explicit entity=
 # argument overrides the environment variable (verified 2026-08-25). Since --wandb-entity
@@ -36,6 +42,7 @@ cd "$REPO"
 exec "$VENV" src/run_config.py \
     ${MINIMOL_ENTITY:+--wandb-entity "$MINIMOL_ENTITY"} \
     ${MINIMOL_FEATURES:+--features "$MINIMOL_FEATURES"} \
+    ${MINIMOL_EMBEDDINGS:+--embeddings "$MINIMOL_EMBEDDINGS"} \
     ${MINIMOL_SPLITS:+--splits "$MINIMOL_SPLITS"} \
     ${MINIMOL_CSV:+--csv "$MINIMOL_CSV"} \
     ${MINIMOL_WORKERS:+--num-workers "$MINIMOL_WORKERS"} \

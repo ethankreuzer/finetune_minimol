@@ -14,6 +14,39 @@ This exists because TamIA is not a machine anything here has ever run on
 
 ---
 
+## On `frozen-moljepa`, most of this is optional
+
+This runbook was written for the **MiniMol fine-tuning sweep**, where a trial fine-tunes a
+10M-parameter GNN for ~40 minutes and the whole TamIA apparatus earns its overhead. On the
+`frozen-moljepa` branch a trial trains a small MLP on a cached float32 matrix, so **run the
+sweep locally first** and come back here only if the measured trial time says otherwise:
+
+```bash
+wandb sweep --project finetune_minimol --entity <entity> sweeps/bayes_jepa_v1.yaml
+python -m wandb agent <sweep_id>          # here, one per GPU; three A6000s on this box
+```
+
+Locally, §§B.4 (the feature cache), C (the proxy), D (node shape), F (the gate) and G (the
+24 h job) do not apply. §§A and E still do.
+
+**If it does go to TamIA, three things change:**
+
+- **Extraction is login-node-only.** `src/jepa_embed.py` fetches the checkpoint from the
+  HuggingFace Hub with `trust_remote_code=True`. Compute nodes have no direct internet, so it
+  would **block, not error** — exactly the failure mode §C exists for. Run it on a login node,
+  or copy `data/embeddings/moljepa_v1/` across. **Once the cache exists, compute nodes need no
+  Hub access at all**, which removes the proxy from the sweep path entirely.
+- **Stage `data/embeddings/moljepa_v1/` instead of `data/features/minimol_v1/`**, and export
+  `MINIMOL_EMBEDDINGS` rather than `MINIMOL_FEATURES`. The two are **mutually exclusive**:
+  `--features` exists only on `train.py` and `--embeddings` only on `train_jepa.py`, so
+  setting the wrong one makes argparse reject the whole command line.
+- **The cache is 17.6 GB**, against the graph cache's 4.5 GB — check `$SLURM_TMPDIR` has room.
+  A single-token readout only *reads* 679 MB of it, but staging copies the file.
+
+Everything below is the MiniMol path, unchanged.
+
+---
+
 ## A. The new wandb account *(from your laptop, before touching TamIA)*
 
 1. Create the wandb account under your **Mila** email. *(Done — `ethan-kreuzer-mila`.)*

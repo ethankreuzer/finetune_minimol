@@ -46,6 +46,7 @@ sweep learns the configuration failed.
 
 import argparse
 import hashlib
+import importlib
 import json
 import re
 import statistics
@@ -60,6 +61,30 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import train                                                              # noqa: E402
+
+# Which trainer this driver drives. `train` fine-tunes the MiniMol trunk; `train_jepa`
+# trains a head on frozen Mol-JEPA embeddings. Both expose `build_parser()` and `main(argv)`,
+# which is the whole interface -- everything below walks the parser rather than naming flags.
+#
+# Resolved from argv BEFORE the parser is built, because the trainer is what *defines* the
+# parser. That is also why it cannot be an ordinary argparse option handled in the normal
+# order. `dashed()` is applied first so `--trainer=train_jepa` from a wandb agent, which
+# spells flags with underscores, is seen the same way as a typed `--trainer train_jepa`.
+TRAINERS = {"train": "train", "train_jepa": "train_jepa"}
+
+
+def resolve_trainer(argv=None):
+    """`(module, name)` for the trainer named in argv, defaulting to the MiniMol arm."""
+    tokens = dashed(list(sys.argv[1:] if argv is None else argv))
+    name = "train"
+    for i, tok in enumerate(tokens):
+        if tok == "--trainer" and i + 1 < len(tokens):
+            name = tokens[i + 1]
+        elif tok.startswith("--trainer="):
+            name = tok.split("=", 1)[1]
+    if name not in TRAINERS:
+        raise SystemExit(f"--trainer {name!r} is not one of {sorted(TRAINERS)}")
+    return importlib.import_module(TRAINERS[name]), name
 from objective import OBJECTIVE_VERSION                                   # noqa: E402
 from pool_oof import load_runs, pool_from_runs                            # noqa: E402
 from train import dashed, sweep_int                                       # noqa: E402
@@ -123,8 +148,15 @@ NOT_FORWARDED = NOT_EXPOSED | {"outputs_root", "sweep_id", "no_wandb", "wandb_pr
 
 # This script's own flags, which are neither forwarded nor part of the configuration's
 # identity: they say which slice of the grid to run and where, not what is being trained.
+#
+# `trainer` belongs here rather than in the hash. It selects the *program*, and the two
+# programs have disjoint flag sets -- a MiniMol payload carries `freeze_epochs`/`trunk_lr`,
+# a Mol-JEPA payload carries `embeddings`/`readout` -- so `config_id` already cannot collide
+# across arms, and hashing `trainer` on top would buy nothing while re-stamping every
+# existing MiniMol id, including the sweep's own `5b94e92b`. Belt-and-braces separation
+# comes from `--outputs-root` and from the `encoder` field `aggregate` checks below.
 OWN_FLAGS = {"fold_list", "seed_list", "config_id", "keep_checkpoints", "force",
-             "aggregate_only", "expect_folds"}
+             "aggregate_only", "expect_folds", "trainer"}
 
 # Excluded from `config_id` on top of the above: these name *where* things live, or how the
 # work is executed, not what is trained. Two runs differing only in `--outputs-root` or
@@ -164,8 +196,15 @@ def parse_args(argv=None):
                    help="skip training; log the wandb run from this bucket's existing runs")
     p.add_argument("--expect-folds", type=int, default=5,
                    help="folds required before a seed's predictions may be pooled")
-    mirror_train_arguments(p)
+    trainer, trainer_name = resolve_trainer(argv)
+    p.add_argument("--trainer", default=trainer_name, choices=sorted(TRAINERS),
+                   help="which trainer to drive: `train` fine-tunes the MiniMol trunk, "
+                        "`train_jepa` trains a head on frozen Mol-JEPA embeddings. Already "
+                        "resolved before this parser was built -- declared here so it "
+                        "appears in --help and in the wandb run config.")
+    mirror_train_arguments(p, trainer)
     args = p.parse_args(dashed(sys.argv[1:] if argv is None else list(argv)))
+    args._trainer = trainer
     args.fold_list = int_list(args.fold_list)
     args.seed_list = int_list(args.seed_list)
     if not args.fold_list or not args.seed_list:
@@ -188,11 +227,11 @@ def int_list(tokens):
     return [int(m) for m in re.findall(r"-?\d+", joined)]
 
 
-def mirror_train_arguments(p):
-    """Copy `train.py`'s flags onto this parser, defaults and all.
+def mirror_train_arguments(p, trainer=train):
+    """Copy the trainer's flags onto this parser, defaults and all.
 
-    Walks `train.build_parser()`'s actions rather than restating them, so a hyperparameter
-    added to `train.py` reaches the sweep with no edit here -- which is the whole reason
+    Walks `trainer.build_parser()`'s actions rather than restating them, so a hyperparameter
+    added to a trainer reaches the sweep with no edit here -- which is the whole reason
     `build_parser` is split out over there.
 
     Defaults are copied rather than suppressed, so every forwarded value is explicit on the
@@ -200,8 +239,9 @@ def mirror_train_arguments(p):
     `config_id` moves if a default in `train.py` moves; that is correct, because it is then
     a different configuration.
     """
-    group = p.add_argument_group("train.py hyperparameters (forwarded verbatim)")
-    for action in train.build_parser()._actions:
+    group = p.add_argument_group(f"{trainer.__name__}.py hyperparameters "
+                                 "(forwarded verbatim)")
+    for action in trainer.build_parser()._actions:
         if action.dest in ("help", *NOT_EXPOSED):
             continue
         kwargs = {"dest": action.dest, "default": action.default, "help": action.help}
@@ -225,8 +265,8 @@ def config_id(args):
     return hashlib.sha256(blob.encode()).hexdigest()[:8]
 
 
-def boolean_flags():
-    """`{dest: (option_string, const)}` for `train.py`'s store_true/store_false flags.
+def boolean_flags(trainer=train):
+    """`{dest: (option_string, const)}` for the trainer's store_true/store_false flags.
 
     A boolean's flag name is not derivable from its dest -- `assert_schedule` is set by
     `--no-assert-schedule` -- and the flag is emitted only when the value differs from the
@@ -234,7 +274,7 @@ def boolean_flags():
     `train.py` needs no edit here either.
     """
     return {a.dest: (a.option_strings[0], a.const)
-            for a in train.build_parser()._actions
+            for a in trainer.build_parser()._actions
             if isinstance(a, (argparse._StoreTrueAction, argparse._StoreFalseAction))}
 
 
@@ -243,9 +283,12 @@ def child_argv(args, fold, seed, out):
     argv = ["--fold", str(fold), "--seed", str(seed), "--out", str(out), "--no-wandb"]
     if not args.keep_checkpoints:
         argv.append("--no-save-checkpoint")
-    bools = boolean_flags()
+    bools = boolean_flags(getattr(args, "_trainer", train))
     for key, value in sorted(vars(args).items()):
-        if key in NOT_FORWARDED or key in OWN_FLAGS or value is None:
+        # `_`-prefixed keys are this driver's own private state -- `_trainer` holds an
+        # imported module, which would render as `---trainer <module ...>` on a command line.
+        # `config_id` already skips them for the same reason.
+        if key.startswith("_") or key in NOT_FORWARDED or key in OWN_FLAGS or value is None:
             continue
         if key in bools:
             option, const = bools[key]
@@ -281,12 +324,17 @@ def aggregate(runs_meta, expect_folds, y_all, runs_loaded):
     `aggregate.json` as well as logged, so `WANDB_MODE=offline` loses nothing and the numbers
     can be checked without wandb in the loop.
     """
-    provenance = {(m["objective_version"], m["split_sha256"], m["input_sha256"])
+    # The triple, plus `encoder`. The triple alone cannot separate the two arms: this branch
+    # holds the CSV, the splits and the objective fixed *on purpose*, so a MiniMol run and a
+    # Mol-JEPA run agree on all three by design. `encoder` defaults to the MiniMol arm so
+    # every meta.json written before this field existed still validates.
+    provenance = {(m["objective_version"], m["split_sha256"], m["input_sha256"],
+                   m.get("encoder", "minimol-v1"))
                   for m in runs_meta.values()}
     if len(provenance) > 1:
         raise SystemExit(
-            "models disagree on the provenance triple (objective_version, split_sha256, "
-            f"input_sha256): {sorted(provenance)}. Averaging them would compare "
+            "models disagree on the provenance tuple (objective_version, split_sha256, "
+            f"input_sha256, encoder): {sorted(provenance)}. Averaging them would compare "
             "incomparables -- see the provenance rule in CLAUDE.md.")
 
     # Per-model: the final epoch, which is the selected model (no early stopping).
@@ -454,7 +502,7 @@ def main(argv=None):
                 print(f"[{n}/{len(pairs)}] fold {fold} seed {seed}: already complete, reusing")
                 continue
             print(f"[{n}/{len(pairs)}] fold {fold} seed {seed}", flush=True)
-            train.main(child_argv(args, fold, seed, out))
+            args._trainer.main(child_argv(args, fold, seed, out))
             # Straight after the model that produced them, so a long trial shows progress
             # instead of nothing until it ends.
             meta = json.loads((out / "meta.json").read_text())

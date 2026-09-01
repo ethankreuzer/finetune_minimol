@@ -1,8 +1,351 @@
-# finetune_minimol — the encoder branch
+# finetune_minimol — the `frozen-moljepa` branch
 
-Fine-tune the **entire MiniMol trunk** (~10M params) on AmpC docking data to produce a
-**molecular encoder** — not the usual frozen-embedding + MLP workflow. Gradients must reach
-all trunk parameters.
+**Swap the encoder, hold everything else fixed.** Every arc in this repo so far has
+fine-tuned MiniMol's ~10M-parameter trunk. This branch asks whether a newer molecular
+foundation model — **Mol-JEPA**, used **frozen** — carries more pProp signal in its
+embeddings, by running it once offline and training a network on the cached vectors.
+
+**Nothing is fine-tuned here.** There is no trainable trunk, no freeze schedule, no
+`--trunk-lr`. Settled with Ethan 2026-09-01: forward-pass inference, then a model on top.
+
+The comparison is only worth something if nothing else moves, so the data, the frozen 5-fold
+cluster splits, the 5-term weighted loss, the metrics, `goal_metric` and the wandb bayes
+machinery are **reused by import, not reimplemented** — see "What is shared, and how" below.
+The benchmark this branch is measured against is **MiniMol at `--unfrozen-epochs 0`**: frozen
+against frozen, same loss, same folds, same objective.
+
+The MiniMol arm is **kept and still runnable** — `train.py`, `trunk.py` and the graphium/
+minimol pins are untouched and stay installed, so the baseline can be re-run from this branch
+rather than quoted from an old wandb page.
+
+---
+
+## Mol-JEPA, measured
+
+[arXiv 2608.22642](https://arxiv.org/abs/2608.22642) (Boehringer Ingelheim), weights at
+[`Flogrammer/Mol-JEPA`](https://huggingface.co/Flogrammer/Mol-JEPA) — 45,406,721 params,
+182 MB safetensors, CC BY-NC 4.0. Loaded with `AutoModel.from_pretrained(...,
+trust_remote_code=True)`; `model(smiles_list)` takes SMILES directly. **No 3D conformers and
+no MoKa at inference** — those are pretraining-side only.
+
+**Seven modalities, of which only two are computable from a SMILES string:**
+
+| modality | input | encoder |
+|---|---|---|
+| `graph` | **smiles** | TransformerConv x3, node_dim 82 / edge_dim 17, max-pool -> 512 |
+| `ecfp` | **smiles** | 2048 -> 3-layer MLP -> 512 |
+| `uma`, `boltz`, `boltz_preds`, `moe`, `bioxmol` | precomputed | unavailable to us |
+| `chembl/tdc/pcba/nabla/xtb_targets` | label modalities | unavailable to us |
+
+From a bare SMILES the other eleven are **masked, and the JEPA predictor guesses them**. That
+is the design, not a limitation — and it makes those eleven columns a genuinely different kind
+of feature from anything MiniMol produces: a structure-only model's estimate of binding,
+ADMET, phenotype and quantum-chemistry embeddings.
+
+### What the three output tensors actually are
+
+**The model card's wording is misleading and cost a rewrite; the layout below is measured**
+(`MolJEPA.predict`, and re-derived bit-exactly on every run by `jepa_embed.check_layout`):
+
+```
+embeddings   [B, 13, 512]   the RAW transformer output: cls at column 0, then 12 modalities
+cls          [B,     512]   == modality_pred[0](embeddings[:, 0])
+predictions  [B, 12, 512]   == modality_pred[i+1](embeddings[:, i+1])
+```
+
+So **`cls` is NOT a slice of `embeddings`** — it is a *linear projection* of column 0, and
+`predictions` are the projections of columns 1..12. Verified: max|Δ| = 0.0 for both
+relationships. Caching `embeddings` + `predictions` would have silently dropped `cls`, which
+is the card's headline output. The cache therefore stores two **column-aligned** `[N, 13, 512]`
+arrays under one shared name list.
+
+---
+
+## NEXT: what to run
+
+The cache and the plumbing exist. What is **not** settled is the encoder itself.
+
+1. **Decide the readout** — `--readout` defaults to `cls` *as a placeholder so the pipeline
+   can be smoke-tested*, not as a design choice. Pin it in `sweeps/bayes_jepa_v1.yaml`
+   before reporting anything. Every option is a slice of the cache, so this costs no
+   re-inference: `cls`, `emb:graph`, `emb:*`, `proj:*`, `emb:graph+emb:ecfp`, ...
+2. **Decide what model sits on top.** `head.DualHead` is the starting point because it makes
+   the loss identical to the MiniMol arm's, not because it has been argued.
+3. **Run the sweep** (`sweeps/bayes_jepa_v1.yaml`), then report it **beside** frozen-MiniMol
+   on the same folds. A single number alone is not a result.
+
+---
+
+## A first readout scan — orientation, NOT a result
+
+Fold 0, seed 0, default head, 20 epochs. **Every caveat applies at once**: one fold, one seed,
+an untuned head, and `goal_metric` scores the *predictions* rather than the encoder. Treat the
+ordering as a hint about where to look, and nothing as measured until the sweep and the full
+5x2 grid have run.
+
+| readout | dim | `goal_metric` |
+|---|---|---|
+| **frozen MiniMol baseline** (`--unfrozen-epochs 0`) | 512 | **0.9070** (fold 0 only) |
+| `emb:graph+emb:ecfp` | 1024 | 0.8166 |
+| `emb:*` (all 13 raw tokens) | 6656 | 0.8084 |
+| `emb:graph` | 512 | 0.8005 |
+| `proj:*` (all 13 projections) | 6656 | 0.7782 |
+| `emb:cls` | 512 | 0.7742 |
+| `cls` (= `proj:cls`, the card's headline output) | 512 | 0.7736 |
+
+Three things worth noticing, all of which want confirming rather than believing:
+
+- **The two modalities actually computed from SMILES carry it.** `emb:graph+emb:ecfp` beats
+  all 13 tokens together. The 11 *predicted* modalities are the interesting part of this model
+  and, on this evidence, they add noise rather than signal for AmpC — which is a hypothesis
+  to test properly, not a conclusion. They may well carry signal a linear head cannot reach.
+- **Raw beats projected.** `emb:*` > `proj:*` and `emb:cls` ≈ `cls`. The `modality_pred` heads
+  are trained for JEPA's latent prediction objective, not to be a representation.
+- **Frozen MiniMol is ahead, and by more than the noise.** 0.9070 against 0.8166 on fold 0 is
+  a gap of 0.09 — roughly 4x the 0.0242 fold-to-fold spread measured below, so the ordering is
+  unlikely to be a lucky fold. That is the comparison this branch exists to make, and **it
+  currently favours the incumbent.** Before reading too much into it: the MiniMol number is
+  still fold 0 only, the head is untuned for either arm, and `goal_metric` scores predictions
+  rather than the encoder — the R1/R2 probes are the thing a *featurizer* should be judged on.
+
+### The one row that was taken past a single fold
+
+`emb:graph+emb:ecfp` on the **full 5x2 grid** (10 models, 7m07s):
+
+```
+goal_metric 0.7964 +/- 0.0242   (min 0.7595, max 0.8284)
+pooled seed0: goal 0.7897 | tail spearman 0.0194 | EF@5.0/top1% 73.0
+pooled seed1: goal 0.7975 | tail spearman 0.0210 | EF@5.0/top1% 73.0
+```
+
+**Fold 0 alone read 0.8166 — about 0.8 sigma high.** That is the whole argument for the full
+grid being the unit of measurement: a single-fold scan picks a *direction*, not a value, and
+the six-row table above is separated by less than two of these standard deviations in places.
+`sweeps/bayes_jepa_v1.yaml` pins this readout on exactly that basis — best available guess,
+not a settled winner.
+
+The pooled rows are the honest tail estimate (all 100 potent molecules, against ~20 per fold),
+and this is the first time the pooling path has run on this arm.
+
+Reproduce with:
+
+```bash
+python src/run_config.py --trainer train_jepa --fold-list 0 1 2 3 4 --seed-list 0 1 \
+    --readout "emb:graph+emb:ecfp" --no-wandb
+python src/run_config.py --fold-list 0 1 2 3 4 --seed-list 0 1 \
+    --freeze-epochs 20 --unfrozen-epochs 0 --no-wandb          # the MiniMol baseline
+```
+
+---
+
+## What is shared, and how
+
+Reused **by import, unmodified**. This is what makes "identical" a fact rather than a claim —
+if any of these changed, both arms would change together.
+
+| imported by `train_jepa.py` | from | what it fixes |
+|---|---|---|
+| `combined_loss`, `binary_labels`, `effective_sample_size`, `PPROP_EDGE` | `losses.py` | the whole loss |
+| `score_split` | `train.py` | the whole reported-metrics path |
+| `scheduled_lr`, `RowDataset`, `fold_weights`, `dashed`, `sweep_int` | `train.py` | the cosine, the batch record, the weighting, the agent's flag spelling |
+| `compute_norm_stats`, `normalize_pprop` | `normalization.py` | the target transform |
+| `load_fold`, `load_meta` | `splits.py` | the frozen partition + provenance |
+| `OBJECTIVE_VERSION` | `objective.py` | the objective's identity |
+| `DualHead` | `head.py` | the head, at `in_dim=` the readout's width |
+
+**`verify_metrics.py` still passing 8/8 is the evidence**, since it exercises the same
+`losses.py`/`metrics.py` both arms now share.
+
+Importing `train` pulls graphium in with it (`train.py` imports `MiniMolTrunk` at module
+scope), costing a few seconds once per process. That is the price of the identity, and it is
+worth paying: the alternative is a second copy of `score_split` that can drift.
+
+**One phase, so one cosine.** `scheduled_lr` is reused unchanged by handing it a config whose
+phase 1 is the whole run (`freeze_epochs = epochs`, `unfrozen_epochs = 0`). That keeps the
+`length - 1` denominator, which is what lands the final epoch exactly on `eta_min` and makes
+final-epoch selection a settled model rather than an arbitrary point on a moving trajectory.
+
+**Why `train_jepa.py` is a separate file** rather than a frozen trunk inside `train.py`: a
+zero-parameter trunk makes `model.param_groups` (`model.py:88-90`) drop the empty group, which
+trips `train.py:761`'s assertion that the optimizer's groups are exactly `{trunk, head}`. That
+assertion is what catches a silently-untrained trunk in the MiniMol arm — the failure mode
+with a healthy-looking loss curve. Widening it would weaken a live guard on code this branch
+does not change.
+
+---
+
+## The embedding cache — `data/embeddings/moljepa_v1/`
+
+```bash
+python src/jepa_embed.py            # ~25-90 min, 331,480 molecules, CSV row order
+```
+
+```
+embeddings.npy   [331480, 13, 512] float32   8.8 GB   raw transformer output
+projected.npy    [331480, 13, 512] float32   8.8 GB   cat([cls, predictions])
+meta.json                                             token_names, hashes, revision
+```
+
+17.6 GB, **untracked and regenerable** (`.gitignore:33`). Written in exact CSV row order, so
+`splits.py` indices index it directly with no mapping layer.
+
+- **The Hub revision is pinned** — `jepa_embed.HF_REVISION = "4c912b45..."`.
+  `trust_remote_code=True` executes Python fetched from the Hub, so an unpinned load means the
+  definition of the encoder can change under us between runs.
+- **The layout is re-derived bit-exactly on every run**, not assumed. `check_layout` asserts
+  `cls == modality_pred[0](embeddings[:,0])` and the per-token projection relationship, and
+  refuses to write a cache if either fails. The first draft of the script trusted the model
+  card and was wrong; only that check caught it.
+- **Reading it: `src/jepa_features.py`, never `np.load`.** It owns the provenance guard
+  (re-hashes the source CSV, refuses a `--limit` cache) exactly as `features.py` does.
+- **The readout grammar** is a `+`-joined list of `cls` (= `proj:cls`), `emb:<token>`,
+  `proj:<token>`, `emb:*`, `proj:*`. Tokens are `cls graph ecfp uma boltz boltz_preds moe
+  bioxmol chembl_targets tdc_targets pcba_targets nabla_targets xtb_targets`. Run
+  `python src/jepa_features.py <root>` to print what a cache offers.
+
+### Determinism is the reason this is not just a GPU job
+
+Measured on this box, on 64 molecules:
+
+| device | repeat @ same batch | re-chunk 8/16/256 vs 64 | reversed order |
+|---|---|---|---|
+| cuda (default) | **2.1e-06** | 2.4e-06 | 1.7e-06 |
+| cpu | 0.000e+00 | 0.000e+00 | 0.000e+00 |
+| cuda + deterministic | **0.000e+00** | 0.000e+00 | 0.000e+00 |
+
+The GPU differs from *itself* on a plain repeat, so this is kernel non-determinism — scatter
+atomics in message passing, and cuBLAS split-k — not a batching artifact. ~5e-07 relative, and
+it would not change a trained model; but the cache is computed **once** and every number on
+this branch inherits it, so "rebuilding the cache moves the results" is a bad property to
+accept for free.
+
+**A separate property, and do not confuse the two: the model is NOT invariant to batch
+composition, on either device.** Six scattered rows embedded together, against the same rows
+embedded inside their natural 256-chunks:
+
+| | cpu | cuda |
+|---|---|---|
+| batch **composition** (different neighbours) | **3.3e-07** | **7.5e-07** |
+
+`to_dense_batch` pads the graph batch to its widest member and the reductions reassociate, so
+a molecule's embedding depends slightly on what it was batched with. The middle column of the
+table above says nothing about this: re-chunking *the same contiguous list* keeps most
+compositions intact, which is why it reads 0.0. That reading is easy to over-interpret — it
+was, during this branch's first verification pass.
+
+Two consequences, both real:
+
+- **A rebuilt cache is bit-identical only at the same `--batch`, on the same device.** It is
+  identical to ~1e-06 otherwise, which is below anything that would move a result, but it is
+  not bit-identical. `meta.json` records `batch` and `device` so a rebuild can match.
+- **Anything checking a cached row against a fresh forward pass must re-embed it inside its
+  natural chunk**, or it measures composition noise instead of what it meant to.
+  `verify_jepa_embed.check_alignment` does exactly this, and is bit-exact as a result.
+
+`jepa_embed.py` sets `CUBLAS_WORKSPACE_CONFIG=:4096:8` **at module scope, before torch is
+imported** (cuBLAS reads it at init; set later it is ignored) and calls
+`torch.use_deterministic_algorithms(True, warn_only=True)`. `warn_only` means a PyG op with no
+deterministic kernel warns rather than raising — so determinism is a *request*, which is why
+the run **measures a repeat** and refuses to write unless it is 0.0. Cost: 218 mol/s against
+281. `--allow-nondeterministic` downgrades it to a warning; `meta.json` records the figure
+either way.
+
+---
+
+## Verification — `src/verify_jepa_embed.py`
+
+```bash
+python src/dump_jepa_reference.py          # the frozen fixture, first
+python src/verify_jepa_embed.py            # -> verification_jepa.md
+```
+
+Eight checks, in the shape of `verify_trunk.py`. The four failures they exist to catch, none
+of which announces itself:
+
+1. **The model moved.** Checked against `data/reference/moljepa_v1_ref64.npz`, dumped in its
+   own process by the plain `AutoModel` path — deliberately *not* through `jepa_embed.py`, so
+   the fixture cannot agree with the code it checks by construction.
+2. **The rows shifted.** Cached row *i* vs fresh inference on CSV row *i*, at rows
+   `0, 1, 3152, 165740, 331478, 331479` — both ends and four interior points.
+3. **The columns are misnamed.** The layout is re-derived and compared to `meta.json`.
+4. **It is not reproducible.** Repeat, batch size 8/16/256, and reversed order must all be
+   bit-identical.
+
+Plus: eval mode (dropout is 0.1 on all three expert encoders), loader guards shown *rejecting*
+something rather than merely existing, no non-finite values and no collapsed token
+(`max == min` per dimension, which is exact and needs no tolerance), and the 5 validation
+folds tiling the cache exactly once.
+
+**The alignment check is two-sided**, for the same reason `check_grad_flow` is: it is
+bit-exact against the right row *and* is shown to reject the neighbouring one. Measured
+2026-09-01 — right row **0.000e+00**, off-by-one **1.164**, scattered re-embed 7.5e-07. A
+tolerant check that has never been seen to reject a shifted comparison tests nothing.
+
+Measured result, `verification_jepa.md`, **OVERALL: PASS** (8/8) on the full 331,480-row cache.
+
+---
+
+## The sweep — `sweeps/bayes_jepa_v1.yaml`
+
+Same machinery as `bayes_v1.yaml`: `method: bayes`, objective `final/goal_metric_mean`
+maximised, no `early_terminate`, the full 5x2 grid per trial, one configuration = one wandb
+run. **Run it locally first** — a trial trains a small MLP on a cached matrix rather than
+fine-tuning a GNN, so the TamIA apparatus (httpproxy, 4.5 GB staging, whole-node b3 jobs) is
+no longer obviously worth its overhead. Three A6000s here.
+
+**Swept (7):** `n_layers`, `hidden_dim`, `embed_dim`, `epochs`, `head_lr`, `weight_decay`,
+`dropout` — precisely the set `bayes_v1.yaml:185-204` marked *"not swept: blocked on the
+architecture question"*. The MiniMol sweep was cut to five axes because bayes degrades with
+dimension at ~140 trials; that argument is about the trials-to-axes ratio, and the trial count
+here goes up by roughly an order of magnitude.
+
+**Pinned:** `trainer: train_jepa`, `readout`, the four loss weights at the same values, plus
+`batch_size 1200`, `weights balanced`, `pprop_norm zscore`, `eta_min`, `lr_schedule`, `w_vic 0`.
+
+### `run_config.py` drives both arms — one dispatch point, no fork
+
+`--trainer {train,train_jepa}` (default `train`), resolved from argv by `resolve_trainer()`
+**before** the parser is built, because the trainer is what *defines* the parser.
+`mirror_train_arguments` and `boolean_flags` take the module; the in-process call is
+`args._trainer.main(...)`.
+
+**On the `config_id` collision that does not happen.** The worry was that a Mol-JEPA run and a
+MiniMol run over the same CSV would hash identically, land in the same bucket, and be *reused*
+rather than retrained — silent, because `ID_EXCLUDED` drops `features` and the provenance
+triple is held fixed by design. It dissolves once the trainers are separate programs:
+`config_id` hashes `vars(args)`, and the payloads carry disjoint keys —
+`freeze_epochs`/`trunk_lr`/`head_lr_unfrozen` on one side, `embeddings`/`readout`/`epochs` on
+the other. **Verified: existing MiniMol ids are unchanged** (default config still `677f621f`).
+
+`trainer` is therefore in `OWN_FLAGS` and **not hashed** — hashing it would buy nothing and
+would re-stamp every existing MiniMol bucket. Belt-and-braces separation instead comes from:
+
+- **`--outputs-root` defaults to `outputs/jepa_v1`** for this arm. Both probes `rglob` a root
+  and neither gates on provenance, so directory separation is the only defence.
+- **`aggregate`'s provenance tuple gained `encoder`** —
+  `(objective_version, split_sha256, input_sha256, encoder)`, defaulting to `"minimol-v1"` so
+  every meta.json written before the field existed still validates.
+
+`scripts/sweep_trial.sh` gained `MINIMOL_EMBEDDINGS` -> `--embeddings`. It and
+`MINIMOL_FEATURES` are **mutually exclusive**: `--features` exists only on `train.py`,
+`--embeddings` only on `train_jepa.py`, so setting the wrong one for the sweep being served
+makes argparse reject the whole command line — which is the loud failure.
+
+---
+
+## Inert on this branch
+
+Not deleted, and not to be trusted here either:
+
+- **`src/vn_*.py`, `src/verify_vn_taps.py`** (~1,400 lines) reach inside graphium's GNN by
+  shadowing `virtual_node_layers[i].forward`. Nothing in them survives a trunk swap, and
+  nothing on the training path imports them.
+- **`src/export.py`, `src/export_pkg/`, `handover/`** build a MiniMol handover package.
+- **`src/trunk.py`, `src/model.py`, `src/featurize.py`, `src/features.py`,
+  `src/verify_trunk.py`** are the MiniMol arm. Still correct, still runnable, untouched.
+
+---
+
 
 `NOTES.md` is the reference document: background, source-level findings, and the full plan.
 This file is the operational summary. When they disagree, `NOTES.md` §§1–11 is authoritative
@@ -11,110 +354,57 @@ on *why*; this file is authoritative on *what currently exists*.
 `Minimol_architecture_overview.md` describes what MiniMol itself does between a SMILES string
 and its 512-d output, measured against the pinned stack. Read it before touching `trunk.py`.
 
-## What this branch is, and what it is not
+## The MiniMol arc this branch descends from
 
-**The question this branch exists to answer** (settled with Ethan 2026-08-25): do **features
-from different parts of MiniMol** carry pProp predictive ability, usable as components of the
-encoder? Today only one tensor is ever exported — the head's bottleneck, downstream of MiniMol's
-final 512-d readout. MiniMol has 16 GNN layers, a virtual node updated 15 times, and two
-positional encoders, none of which has ever been probed.
-`Minimol_architecture_overview.md` is the map of what is available to tap.
+`frozen-moljepa` branches off **`encoder-vn`**, and everything below this line was written for
+that arc — full-trunk fine-tuning of MiniMol. It is kept because the MiniMol arm is still
+runnable here and its mechanics are still authoritative for `train.py`, `trunk.py`, the loss,
+the metrics, the splits and the data. **Read it as the description of the other arm**, not of
+this one.
 
-The deliverable is still a molecular encoder, and its consumer is still the **deep-kernel-
-learning GP** in a colleague's downstream active-learning project. What ended on 2026-08-25 is
-the *contract* that shaped every earlier decision: that the product is specifically a frozen
-`SMILES → R³²`, exported from the last layer before the linear task heads.
+Two things in it are now superseded on this branch and would mislead if followed literally:
 
-**`embed_dim`, the export point, and the objective are now open design questions**, argued on
-their own merits and measured, rather than assumed. That is §6 question 4 of the design
-document — *"is `embed_dim = 32` renegotiable?"* — answered by building the evidence rather
-than by asking first. **That document is not on this branch**; read it with
-`git show embedding-head-32d:reports/featurizer_design.md`.
-
-**The prior arc is kept, not deleted.** ~60 GPU-runs establishing whether the 32-d bottleneck
-is a valid featurizer are thesis material and live complete on the `embedding-head-32d` branch,
-whose own CLAUDE.md is the authority on that work:
+- **"NEXT: what to run" below is `encoder-vn`'s next step**, not this branch's — it points at
+  a TamIA hyperparameter tune of the MiniMol trunk followed by a probe of MiniMol's internal
+  features. This branch's NEXT is at the top of this file.
+- **The MiniMol-internal feature analysis (`vn_*`) and the width scan** belong to `encoder-vn`.
+  The equivalent question here is natively answerable, and *without a trained checkpoint*: the
+  13 tokens and their 12 projections are already on disk, so `feature_utility.py` (R1) and
+  `emb_readout.py` (R2) could be pointed at any of them directly. That is the obvious follow-on
+  once the readout is settled; it is deliberately not part of this branch's first pass.
 
 ```bash
-git show embedding-head-32d:CLAUDE.md          # the sealed 32-d record
-git log --oneline main..embedding-head-32d     # the 15 commits of that arc
+git show encoder-vn:CLAUDE.md          # the MiniMol fine-tuning arc, as its own document
+git log --oneline main..encoder-vn     # its 28 commits
 ```
 
-**Do not treat its conclusions as binding here** — in particular the `w_vic=3` pin. `--w-vic`
-came across as an available tool at its inert default `0.0`; the conclusion did not.
-
 ---
 
-## NEXT: what to run
+## State
 
-**Tune the hyperparameters on TamIA, then analyse MiniMol's internal features.** The branch's
-real question — settled with Ethan 2026-08-25 — is **whether features from different parts of
-MiniMol carry pProp predictive ability**, as components of the encoder. That analysis is only
-worth trusting if the model whose internals get probed is not badly configured, so a sweep comes
-first. It does not need to be rigorous.
+### `frozen-moljepa`, as of 2026-09-01
 
-**The full procedure is `INSTRUCTIONS.md`.** Read it there, not here — it is the runbook, and
-duplicating its steps into this file would guarantee the two drift.
+| Piece | Status |
+|---|---|
+| Branch off `encoder-vn` | **done** — `frozen-moljepa` |
+| Environment (`jepa` extra) | **done, audited** — `transformers 4.57.6`, `safetensors`, `huggingface-hub`, `molfeat 0.11.0`. `uv lock` changed **no** pre-existing version; `torch 2.6.0+cu124` and `scipy 1.13.1` both held, no `cu13`/`cuda-toolkit` |
+| Mol-JEPA loads and is frozen | **done** — 45,406,721 params, revision pinned to `4c912b45…` |
+| Token layout | **measured, and it contradicted the model card** — `cls` is `modality_pred[0](embeddings[:,0])`, not a slice. Re-asserted bit-exactly on every run |
+| Determinism | **measured and enforced** — cuda is 2.1e-06 off itself by default; `CUBLAS_WORKSPACE_CONFIG` + `use_deterministic_algorithms` bring it to 0.000e+00 at 218 vs 281 mol/s |
+| Embedding extraction | **done, run** — `src/jepa_embed.py`; 331,480 molecules in **28.2 min at 196 mol/s**; 2 x `[331480, 13, 512]` float32, 17.6 GB, untracked |
+| Cache loader + readout grammar | **done** — `src/jepa_features.py`; guards exercised |
+| Reference fixture | **done** — `data/reference/moljepa_v1_ref64.{npz,json}`, `repeat max|Δ| = 0.000e+00` on cpu |
+| Verification suite | **done, 8/8 PASS on the full cache** — `src/verify_jepa_embed.py` -> `verification_jepa.md` |
+| Trainer | **done, run end to end** — `src/train_jepa.py`; **1.9 s/epoch over 265,184 rows**, 42 s for a 20-epoch model |
+| `run_config.py` dual dispatch | **done, verified** — `--trainer`; existing MiniMol `config_id`s unchanged (default still `677f621f`) |
+| Sweep | **written, parameters validated against the parser** — `sweeps/bayes_jepa_v1.yaml` |
+| Measured trial cost | **~7 min for the full 5x2 grid** (10 x 42 s). Against ~40 min on an H100 for a MiniMol trial — which is why the sweep runs here, on three A6000s, rather than on TamIA |
+| First numbers (orientation, not results) | see "A first readout scan" below |
+| **The readout decision** | **OPEN — Ethan's call.** `--readout cls` is a placeholder |
+| **What model sits on top** | **OPEN.** `DualHead` is the starting point, not the argument |
+| Frozen-MiniMol baseline on these folds | **not yet run** — `run_config.py --fold-list 0 1 2 3 4 --seed-list 0 1 --unfrozen-epochs 0` |
 
-```bash
-# on a LOGIN node
-wandb sweep --project finetune_minimol --entity <mila_entity> sweeps/bayes_v1.yaml
-# then the gate, then the real job -- INSTRUCTIONS.md sections F and G
-sbatch --account=<def-xxx> scripts/tamia_sweep_agent.sbatch <sweep_id>
-```
-
-Three things that decide whether this works, each with its own section below or in the runbook:
-
-1. **TamIA compute nodes have no internet.** The route out is `module load httpproxy`, under
-   a new wandb account on Ethan's Mila email. Without it `wandb agent` blocks rather than
-   failing — see the correction under "The sweep".
-2. **A clone is now self-sufficient except for the feature cache.** The CSV and the splits are
-   tracked as of 2026-08-25; only `src/featurize.py` (~3.5 min) has to run there.
-   `INSTRUCTIONS.md` §B.
-3. **The sweep saves no weights.** `run_config.py:238` forces `--no-save-checkpoint`, and the
-   MiniMol-layer analysis is post-hoc on a trained model — so **the winner must be re-run with
-   `--keep-checkpoints`** or there is nothing to extract features from. `INSTRUCTIONS.md` §I.
-
-**Settled 2026-08-25: the sweep varies five things** — `freeze_epochs`, `unfrozen_epochs`,
-`head_lr`, `head_lr_unfrozen`, `trunk_lr`. Weight decay, dropout and the four loss weights are
-pinned as explicit `value:` entries (not deleted, so they stay in every run's config and in
-`config_id`); the loss weights sit at pProp_MLP's swept optima, which are already
-`train.py:218-221`'s defaults.
-
-The cut is about the optimiser, not the values. Bayes earns its advantage over random search by
-conditioning each trial on completed ones, and that advantage shrinks with dimension — over 10
-axes a few hundred trials is still mostly exploration, so the "winner" is a sample from a
-barely-informed posterior. Over 5 it is a real search. This tune's only job is to make the
-downstream MiniMol-feature analysis trustworthy, and the schedule and LRs are both what that is
-most sensitive to and what the supervisor ranked highest (see "Deferred: layer-wise
-freeze/unfreeze" — freeze schedule #1, LRs #3). **Re-sweeping the loss weights is the first thing
-to restore** if the tuned model underperforms.
-
-`fold_list`/`seed_list` are at `"0,1,2,3,4"`/`"0,1"` — **the full 5×2 grid on every trial**,
-changed 2026-08-26 from `"0"`/`"0"`. ~40 min a trial against ~4, so the 24 h job yields **~140
-trials rather than ~1400**; thin but workable over five axes, which is the whole reason the other
-six were pinned. What it buys: `final/goal_metric_std` beside the objective, which separates a
-configuration that won from one that drew a lucky fold, and `pooled/*`, which is undefined unless
-a seed holds all five folds and so did not exist *at all* under one model per trial. What it
-costs, besides wall-clock: **a nan is now fatal to a whole trial rather than one model** —
-`run_config.aggregate` guards values with `isinstance(v, (int, float))` and `nan` passes that, so
-one model with constant predictions (Pearson is nan) makes the objective nan for all ten.
-
-### Deferred: the width scan
-
-`--embed-dim` is a free variable (`train.py:173`) and its default of 32 is **inherited from the
-sealed 32-d arc, not chosen** — no measurement in this repo has ever compared it against another
-width. Scanning it against the R1 and R2 probes is `featurizer_design.md` §8's open question 1
-(`git show embedding-head-32d:reports/featurizer_design.md`). It was this branch's planned first
-experiment and is **superseded, not cancelled**: the MiniMol-feature question came first. Worth
-returning to, since R1 is known to saturate by k≈4–8 while R2 has never been measured at any
-width.
-
----
-
----
-
-## State as of 2026-08-25
+### The MiniMol arc, as of 2026-08-25
 
 | Piece | Status |
 |---|---|
@@ -179,8 +469,24 @@ resolved torch 2.13.0/CUDA-13 over the pinned cu124 build; delete it, do not use
 `git clone` then `uv sync` — no wheelhouse needed.
 
 ```bash
-UV_HTTP_TIMEOUT=3600 uv sync --extra dev     # timeout matters: see below
+UV_HTTP_TIMEOUT=3600 uv sync --extra dev --extra jepa    # timeout matters: see below
 ```
+
+**`--extra jepa` is this branch's addition**: `transformers>=4.50,<5` (the checkpoint's
+`config.json` is stamped 4.50.3), `safetensors`, `huggingface-hub`, and `molfeat` — which is
+genuinely required, not optional: `modeling_moljepa.GraphFeaturizer.__init__` imports
+`AtomCalculator`, `EdgeMatCalculator` and `AdjGraphTransformer` from it, and they are what
+produce the node_dim 82 / edge_dim 17 graph.
+
+**Audited 2026-09-01, and it is clean**: resolving with the extra added 12 packages and
+changed **no** pre-existing version — `torch` stayed `2.6.0+cu124`, `scipy` stayed `1.13.1`
+(the `<1.14` pin graphium needs), `setuptools` stayed `80.10.2`, and there is no `cu13` or
+`cuda-toolkit` anywhere in `uv.lock`. **Always run `uv lock` and grep before `uv sync`** —
+resolution is metadata-only and free; the sync is not.
+
+One documented fact this changed: molfeat drags in **`pyarrow` 25.0.1**, so the "pyarrow is
+not installed anywhere here" note below is no longer true. Artifacts are still CSV + `.npy`,
+which is a convention, not a constraint.
 
 Pinned stack: **Python 3.11**, `torch 2.6.0+cu124` (arch list includes **sm_90**, so it
 covers TamIA's H100/H200), `torch-scatter/sparse/cluster` at `+pt26cu124` from an explicit
@@ -235,6 +541,12 @@ src/
   fold_histograms.py                 per-fold pProp distribution PNGs
   cluster_histograms.py              ORPHANED — per-cluster version, superseded
 
+  jepa_embed.py                      SMILES -> Mol-JEPA -> the 17.6 GB cache, once
+  jepa_features.py                   cache loader + readout grammar  <- use this
+  train_jepa.py                      one fold, one seed, on FROZEN embeddings  <- this branch
+  verify_jepa_embed.py               the 8-check suite -> verification_jepa.md
+  dump_jepa_reference.py             the frozen fixture verify_jepa_embed.py checks against
+
   trunk.py / model.py / head.py      the trainable trunk, the two-group optimizer, DualHead
   train.py                           one fold, one seed  <- the entry point
   losses.py                          5-term loss (vic off by default) + the two weighting flavours
@@ -250,6 +562,7 @@ src/
   dump_metric_reference.py           run under pProp_MLP's venv; feeds verify_metrics
   benchmark.py / concurrency.py / collect_runs.py / report_charts.py   the compute profile
 sweeps/
+  bayes_jepa_v1.yaml                 the frozen-Mol-JEPA sweep  <- this branch
   bayes_v1.yaml                      the wandb bayes sweep over the two-phase schedule
 scripts/
   tamia_sweep_agent.sbatch           the TamIA sweep job: 4 agents, 1/GPU  <- the sweep entry
