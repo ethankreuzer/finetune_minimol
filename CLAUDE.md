@@ -138,6 +138,81 @@ python src/run_config.py --fold-list 0 1 2 3 4 --seed-list 0 1 \
 
 ---
 
+## The transformer head — `head.TokenTransformerHead`
+
+The MLP arm has to choose between discarding 11 tokens and flattening all 13 into 6656
+dimensions, and on the fold-0 scan the flattened version scored *worse* than the two real
+tokens alone. Neither lets the model **relate** one token to another, which is what the 13
+tokens invite: 2 encoded from the SMILES, 1 pooled summary, 10 reconstructed by Mol-JEPA's own
+predictor from those 2. So: attention over the sequence.
+
+```
+[B, 13, 512]  + learned token identity                            <- REQUIRED, see below
+  -> TransformerEncoderLayer x2   d_model 512, nhead 4, ff F, norm_first, gelu
+  -> mean or max pool over the 13 tokens              -> [B, 512]
+  -> DualHead(n_layers=1)  two Linear+norm+GELU blocks, then two linear task heads
+```
+
+**Pinned by Ethan** (2026-09-01): 2 blocks, 4 heads, pool, 2 MLP layers, then predict.
+`--head token_transformer --token-source {raw,projected}`. The MLP arm is untouched and still
+the default (`--head dual`); verified — it reproduces its fold-0 `goal_metric` of **0.8166**
+exactly after the refactor.
+
+The MLP half is **composed, not reimplemented**: `self.mlp` is a `DualHead`, so the two
+post-pooling layers, the exported `z` and the two linear heads are the same tested code, and
+`forward_with_embedding` keeps the signature `train_jepa.py`, `combined_loss` and `score_split`
+already consume. The training loop and every metric are unchanged.
+
+### `token_embed` is load-bearing, and its absence would be silent
+
+`nn.TransformerEncoder` is **permutation-equivariant**. With no per-position parameter the 13
+tokens are an unordered bag: `graph` — a real encoding of the molecule — is indistinguishable
+from `boltz`, which is a reconstruction. The model would train, the loss would fall, and
+`goal_metric` would land somewhere plausible. Nothing would error.
+
+So `TokenTransformerHead` carries a learned `[1, 13, 512]` parameter, `normal_(std=0.02)`.
+**Not zeros**: under mean pooling, a permutation-equivariant encoder plus a zero position
+parameter is exactly permutation-*invariant*, so the model would start unable to use position
+at all. Mol-JEPA's own predictor carries the same thing (`MultiModalPredictor.modality_pos`).
+
+`src/verify_jepa_head.py` checks it **two-sidedly**, in the shape of `check_grad_flow`:
+
+| | measured |
+|---|---|
+| permuting the 13 tokens changes the output | **7.657e-03** |
+| ...with `token_embed` zeroed, the same permutation | **4.172e-07** |
+
+Four orders of magnitude apart, so a live reading is the position parameter and not float
+noise. A check that had only ever seen the passing case could not tell the two apart. Plus:
+gradient reaches every parameter, both poolings run and differ, the shape contract rejects a
+flat readout, and the five unscaled loss terms are finite and non-zero. **6/6 PASS** ->
+`verification_jepa_head.md`.
+
+### It costs 8x the MLP arm
+
+Measured: **15 s/epoch against 1.9 s**, so ~5 min per model and **~50 min for a full 5x2
+trial** rather than ~7. Two causes, both structural: the input is 13x larger
+(`[B, 13, 512]` against `[B, 1024]`), and `run_config.py` calls `train_jepa.main()`
+in-process per model, so the 8.83 GB token array is loaded ten times per trial.
+
+That is ~29 trials/day per GPU, ~86 across the three here. Still workable locally, but it is
+no longer the "a trial is minutes" regime that made the TamIA question obviously moot — read
+`sweeps/bayes_jepa_tx_v1.yaml` as a genuinely smaller search than `bayes_jepa_v1.yaml`.
+
+### The sweep — `sweeps/bayes_jepa_tx_v1.yaml`
+
+Same machinery again. **Pinned:** `head`, `n_blocks: 2`, `n_heads: 4`, the four loss weights,
+`batch_size 1200`, the two MLP widths, linear task heads. **Swept (7):** `pooling`
+(`mean`/`max`), `token_source` (`raw`/`projected`), `dim_feedforward`, `dropout`, `head_lr`,
+`weight_decay`, `epochs`.
+
+`pooling` and `token_source` are swept rather than assumed because nothing settles them. The
+fold-0 scan favoured raw over projected, but that was measured through a flattened *linear*
+readout — an attention stack may prefer the projected space, which is where JEPA's own
+objective lives. Not transferable evidence.
+
+---
+
 ## What is shared, and how
 
 Reused **by import, unmodified**. This is what makes "identical" a fact rather than a claim —

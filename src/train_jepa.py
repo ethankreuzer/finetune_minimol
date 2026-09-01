@@ -57,8 +57,8 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from head import DualHead                                                    # noqa: E402
-from jepa_features import load_embeddings, load_meta                        # noqa: E402
+from head import DualHead, TokenTransformerHead                              # noqa: E402
+from jepa_features import load_embeddings, load_meta, load_tokens           # noqa: E402
 from losses import (PPROP_EDGE, binary_labels, combined_loss,                # noqa: E402
                     effective_sample_size)
 from normalization import compute_norm_stats, normalize_pprop               # noqa: E402
@@ -83,13 +83,32 @@ def build_parser():
     p.add_argument("--fold", type=int, default=0)
     p.add_argument("--seed", type=int, default=0)
 
+    # -- what sits on top of the frozen encoder
+    p.add_argument("--head", default="dual", choices=["dual", "token_transformer"],
+                   help="`dual` flattens a --readout into one vector and trains an MLP. "
+                        "`token_transformer` attends over the 13 tokens with "
+                        "--token-source, then pools and runs the same MLP + task heads.")
+
     # -- data
     p.add_argument("--embeddings", type=Path, default=Path("data/embeddings/moljepa_v1"))
+    p.add_argument("--token-source", default=None, choices=["raw", "projected"],
+                   help="token_transformer only: `raw` is Mol-JEPA's transformer output, "
+                        "`projected` is each token through its own modality_pred head. "
+                        "Swept, because the fold-0 scan favoured raw but only for a "
+                        "flattened linear readout.")
+    p.add_argument("--n-blocks", type=sweep_int, default=2,
+                   help="transformer encoder layers over the 13 tokens")
+    p.add_argument("--n-heads", type=sweep_int, default=4,
+                   help="attention heads per block; must divide the 512-d token width")
+    p.add_argument("--dim-feedforward", type=sweep_int, default=2048)
+    p.add_argument("--pooling", default="mean", choices=["mean", "max"],
+                   help="how the 13 contextualised tokens collapse to one vector")
     p.add_argument("--readout", default="cls",
                    help="which part of Mol-JEPA is the encoder. 'cls' is a PLACEHOLDER that "
                         "lets the pipeline be smoke-tested, not a settled design choice -- "
                         "pin it explicitly in the sweep yaml. Grammar: cls, emb:<token>, "
-                        "proj:<token>, emb:*, proj:*, joined with '+'. See jepa_features.py.")
+                        "proj:<token>, emb:*, proj:*, joined with '+'. See jepa_features.py. "
+                        "Ignored when --head is token_transformer.")
     p.add_argument("--splits", type=Path, default=Path("data/splits/cluster_kfold_v1"))
     p.add_argument("--csv", type=Path, default=Path("data/ampc_subset_331k.csv"))
     p.add_argument("--subset", type=int, default=None,
@@ -218,15 +237,34 @@ def main(argv=None):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device: {device} | objective {OBJECTIVE_VERSION} | encoder {ENCODER}")
 
+    # The two heads read the cache in different shapes, and silently feeding one the other's
+    # input is exactly the failure this repo spends its guards on -- a flattened 6656-vector
+    # and a 13x512 sequence are both "the cache", and only one is what a given head means.
+    # So the combination is validated up front rather than left to a shape error deep in a
+    # forward pass, or worse, to a broadcast that happens to work.
+    if args.head == "token_transformer" and args.token_source is None:
+        raise SystemExit("--head token_transformer needs --token-source {raw,projected}")
+    if args.head != "token_transformer" and args.token_source is not None:
+        raise SystemExit(f"--token-source is meaningless for --head {args.head}: that head "
+                         "consumes a flattened --readout. Pick one.")
+
     emb_meta = load_meta(args.embeddings)
-    X = load_embeddings(args.embeddings, args.readout)
     y = pd.read_csv(args.csv, usecols=["pprop"])["pprop"].to_numpy(dtype=np.float64)
+    token_names = None
+    if args.head == "token_transformer":
+        X, token_names = load_tokens(args.embeddings, args.token_source)
+        in_dim, n_tokens = X.shape[2], X.shape[1]
+        print(f"tokens {args.token_source!r} -> [{len(X):,}, {n_tokens}, {in_dim}] "
+              f"({X.nbytes / 1e9:.2f} GB in memory)")
+        print(f"  {token_names}")
+    else:
+        X = load_embeddings(args.embeddings, args.readout)
+        in_dim, n_tokens = X.shape[1], None
+        print(f"readout {args.readout!r} -> [{len(X):,}, {in_dim}] "
+              f"({X.nbytes / 1e9:.2f} GB in memory)")
     if len(X) != len(y):
         raise SystemExit(f"embedding cache has {len(X)} rows but the CSV has {len(y)}; "
                          "they are aligned by row position only")
-    in_dim = X.shape[1]
-    print(f"readout {args.readout!r} -> [{len(X):,}, {in_dim}] "
-          f"({X.nbytes / 1e9:.2f} GB in memory)")
 
     train_idx, val_idx = load_fold(args.splits, fold=args.fold)
     if args.subset:
@@ -256,13 +294,23 @@ def main(argv=None):
     val_loader = DataLoader(RowDataset(X, y_norm, y_bin, w, val_idx), shuffle=False,
                             **common)
 
-    head = DualHead(in_dim=in_dim, hidden_dim=args.hidden_dim, n_layers=args.n_layers,
-                    embed_dim=args.embed_dim, cls_hidden_dim=args.cls_hidden_dim,
-                    cls_n_layers=args.cls_n_layers, reg_hidden_dim=args.reg_hidden_dim,
-                    reg_n_layers=args.reg_n_layers, dropout=args.dropout, norm=args.head_norm,
-                    bottleneck_norm=args.bottleneck_norm).to(device)
+    shared = dict(in_dim=in_dim, embed_dim=args.embed_dim, hidden_dim=args.hidden_dim,
+                  cls_hidden_dim=args.cls_hidden_dim, cls_n_layers=args.cls_n_layers,
+                  reg_hidden_dim=args.reg_hidden_dim, reg_n_layers=args.reg_n_layers,
+                  dropout=args.dropout, norm=args.head_norm,
+                  bottleneck_norm=args.bottleneck_norm)
+    if args.head == "token_transformer":
+        head = TokenTransformerHead(n_tokens=n_tokens, n_blocks=args.n_blocks,
+                                    n_heads=args.n_heads,
+                                    dim_feedforward=args.dim_feedforward,
+                                    pooling=args.pooling, **shared).to(device)
+        shape = (f"{n_tokens}x{in_dim} -> {args.n_blocks} blocks x {args.n_heads} heads "
+                 f"(ff {args.dim_feedforward}) -> {args.pooling} pool -> {args.embed_dim}")
+    else:
+        head = DualHead(n_layers=args.n_layers, **shared).to(device)
+        shape = f"{in_dim} -> {args.embed_dim}"
     n_params = sum(p.numel() for p in head.parameters())
-    print(f"head: {in_dim} -> {args.embed_dim} -> 2 heads | {n_params:,} params")
+    print(f"head [{args.head}]: {shape} -> 2 heads | {n_params:,} params")
 
     optimizer = torch.optim.AdamW(head.parameters(), lr=args.head_lr,
                                   weight_decay=args.weight_decay)
@@ -321,7 +369,8 @@ def main(argv=None):
     np.save(out / "val_embeddings.npy", val_emb.astype(np.float32))
     if args.save_checkpoint:
         torch.save({"head_state": head.state_dict(), "in_dim": in_dim,
-                    "readout": args.readout, "encoder": ENCODER,
+                    "head": args.head, "readout": args.readout,
+                    "token_source": args.token_source, "encoder": ENCODER,
                     "hf_revision": emb_meta.get("hf_revision"),
                     "config": {k: str(v) if isinstance(v, Path) else v
                                for k, v in vars(args).items() if not k.startswith("_")},
@@ -349,7 +398,10 @@ def main(argv=None):
         "split_sha256": split_meta.get("split_sha256"),
         "input_sha256": split_meta.get("input_sha256"),
         "encoder": ENCODER,
-        "readout": args.readout,
+        "head": args.head,
+        "readout": args.readout if args.head != "token_transformer" else None,
+        "token_source": args.token_source,
+        "token_names": token_names,
         "in_dim": in_dim,
         "hf_repo": emb_meta.get("hf_repo"),
         "hf_revision": emb_meta.get("hf_revision"),

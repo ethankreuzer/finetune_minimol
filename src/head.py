@@ -28,6 +28,7 @@ re-implement them -- `src/normalization.py` and `src/losses.py` own them instead
 
 from collections.abc import Sequence
 
+import torch
 import torch.nn as nn
 
 # The MiniMol v1 embedding width: global max-pool over the final (16th) GNN layer, whose
@@ -280,9 +281,117 @@ class DualHead(nn.Module):
                 f"cls={self.cls_head.hidden_dims}, reg={self.reg_head.hidden_dims}")
 
 
+class TokenTransformerHead(nn.Module):
+    """A transformer encoder over Mol-JEPA's 13 tokens, then pool, then `DualHead`.
+
+    The MLP arm flattens a readout into one vector, which forces a choice between throwing
+    tokens away (`emb:graph+emb:ecfp`) and concatenating all of them into 6656 dimensions
+    (`emb:*`, which scored *worse* on the fold-0 scan). Neither lets the model **relate** one
+    token to another. The 13 tokens are a sequence with structure -- 2 encoded from the SMILES,
+    1 pooled summary, 10 reconstructed by Mol-JEPA's predictor from those 2 -- so attention is
+    the natural way to weigh them against each other.
+
+        [B, 13, 512]  + learned token identity
+          -> TransformerEncoderLayer x n_blocks   (d_model 512, nhead 4, norm_first)
+          -> mean or max over the 13 tokens       -> [B, 512]
+          -> DualHead(n_layers=1)                 -> (logits, pred, z)
+
+    **`token_embed` is not optional, and its absence would be silent.** `nn.TransformerEncoder`
+    is permutation-equivariant: with no per-position parameter the 13 tokens are an unordered
+    bag and `graph` is indistinguishable from `boltz`. The model would train, the loss would
+    fall, and it would simply never learn that one of those two is real. Mol-JEPA's own
+    predictor carries exactly this (`MultiModalPredictor.modality_pos`). Initialised to
+    **zeros**, so the module begins as the identity on token identity and differentiates the
+    positions only as the gradient asks it to.
+
+    Initialised `normal_(std=0.02)`, the usual scale for a learned positional parameter. NOT
+    zeros: with mean pooling a permutation-equivariant encoder plus a zero position parameter
+    is exactly permutation-INVARIANT, so the model would start unable to use position at all
+    and would have to break that symmetry from nothing. The tokens' own contents still differ,
+    so it is not a degenerate init either way -- but there is no reason to start blind.
+
+    `verify_jepa_head.py` checks the property directly, and two-sidedly: permuting the tokens
+    of a batch must change the output, AND zeroing `token_embed` under mean pooling must make
+    that same permutation a no-op. A check that only ever sees the passing case cannot tell a
+    working position parameter from a dead one.
+
+    The MLP half is **composed, not reimplemented**: `self.mlp` is a `DualHead`, so the two
+    post-pooling layers, the exported `z`, and the two linear task heads are the same tested
+    code the MLP arm uses. `forward_with_embedding` therefore keeps the exact signature
+    `train_jepa.py`, `combined_loss` and `score_split` already consume.
+    """
+
+    POOLINGS = ("mean", "max")
+
+    def __init__(self, in_dim=EMBED_DIM, n_tokens=13, n_blocks=2, n_heads=4,
+                 dim_feedforward=2048, pooling="mean",
+                 hidden_dim=1024, embed_dim=1024,
+                 cls_hidden_dim=256, cls_n_layers=0,
+                 reg_hidden_dim=256, reg_n_layers=0,
+                 activation="gelu", dropout=0.0, norm="layer", bias=True,
+                 bottleneck_norm=None):
+        super().__init__()
+        if pooling not in self.POOLINGS:
+            raise ValueError(f"unknown pooling {pooling!r}; choose from {self.POOLINGS}")
+        if int(in_dim) % int(n_heads):
+            raise ValueError(f"d_model {in_dim} is not divisible by n_heads {n_heads}")
+
+        self.in_dim, self.n_tokens, self.pooling = int(in_dim), int(n_tokens), pooling
+        self.n_blocks, self.n_heads = int(n_blocks), int(n_heads)
+
+        self.token_embed = nn.Parameter(torch.empty(1, self.n_tokens, self.in_dim))
+        nn.init.normal_(self.token_embed, std=0.02)
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=self.in_dim, nhead=self.n_heads,
+            dim_feedforward=int(dim_feedforward), dropout=float(dropout),
+            activation=activation, batch_first=True,
+            # norm_first matches Mol-JEPA's own encoder and trains more stably here: with
+            # post-norm the residual stream is renormalised every block, which at these
+            # learning rates makes the first epochs fragile.
+            norm_first=True)
+        self.encoder = nn.TransformerEncoder(layer, num_layers=self.n_blocks,
+                                             enable_nested_tensor=False)
+
+        # One hidden block plus the bottleneck block = the two MLP layers after pooling; the
+        # task heads stay linear, so `z` is the exported encoder and "pProp is linear in the
+        # export" remains literally true.
+        self.mlp = DualHead(in_dim=self.in_dim, hidden_dim=hidden_dim, n_layers=1,
+                            embed_dim=embed_dim, cls_hidden_dim=cls_hidden_dim,
+                            cls_n_layers=cls_n_layers, reg_hidden_dim=reg_hidden_dim,
+                            reg_n_layers=reg_n_layers, activation=activation,
+                            dropout=dropout, norm=norm, bias=bias,
+                            bottleneck_norm=bottleneck_norm)
+        self.embed_dim = self.mlp.embed_dim
+
+    def pool(self, h):
+        """`[B, T, D] -> [B, D]`. Swept, because there is no argument that settles it."""
+        return h.mean(dim=1) if self.pooling == "mean" else h.max(dim=1).values
+
+    def forward_with_embedding(self, x):
+        """`[B, n_tokens, in_dim] -> ([B], [B], [B, embed_dim])`."""
+        if x.dim() != 3:
+            raise ValueError(
+                f"expected [B, {self.n_tokens}, {self.in_dim}] token input, got "
+                f"{tuple(x.shape)}. This head reads the cache in TOKEN form -- see "
+                "jepa_features.load_tokens, not load_embeddings.")
+        if x.shape[1] != self.n_tokens:
+            raise ValueError(f"expected {self.n_tokens} tokens, got {x.shape[1]}")
+        return self.mlp.forward_with_embedding(self.pool(self.encoder(x + self.token_embed)))
+
+    def forward(self, x):
+        logits, pred, _ = self.forward_with_embedding(x)
+        return logits, pred
+
+    def extra_repr(self):
+        return (f"n_tokens={self.n_tokens}, d_model={self.in_dim}, "
+                f"blocks={self.n_blocks}, heads={self.n_heads}, pooling={self.pooling!r}")
+
+
 HEADS = {
     "mlp": MLPHead,
     "dual": DualHead,
+    "token_transformer": TokenTransformerHead,
 }
 
 

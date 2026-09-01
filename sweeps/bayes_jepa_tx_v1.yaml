@@ -1,0 +1,157 @@
+# Bayes sweep over the head that sits on FROZEN Mol-JEPA embeddings.
+#
+# The sibling of `bayes_v1.yaml`, and deliberately the same machinery: `method: bayes`, the
+# objective `final/goal_metric_mean` maximised, no `early_terminate`, the full 5x2 grid on
+# every trial, one configuration = one wandb run through `src/run_config.py`. The loss, the
+# metrics, the objective, the CSV and the splits are all identical -- that is the point of
+# the branch, and it is what makes a Mol-JEPA number comparable to a MiniMol one.
+#
+# What changes is the axes, because the encoder never moves. `freeze_epochs`,
+# `unfrozen_epochs`, `trunk_lr` and `head_lr_unfrozen` have no referent under a frozen trunk:
+# there is one phase, so one cosine, and no trunk parameter group at all. What is left to
+# tune is the head, which is exactly the set `bayes_v1.yaml` marked "deliberately not swept:
+# blocked on the architecture question".
+#
+# The MiniMol sweep was cut from ten axes to five because bayes' advantage over random search
+# shrinks with dimension and ~140 trials over ten axes is mostly exploration. That argument is
+# about the ratio of trials to axes, not about seven being too many: a trial here trains a
+# small MLP on a cached matrix rather than fine-tuning a 10M-parameter GNN, so the trial count
+# goes up by roughly an order of magnitude and seven axes is a real search again. If the
+# trials turn out slower than that, cut `cls_hidden_dim`/`reg_hidden_dim` first -- the task
+# heads are linear by default and those two do nothing at `*_n_layers: 0`.
+
+program: scripts/sweep_trial.sh
+method: bayes
+
+metric:
+  name: final/goal_metric_mean
+  goal: maximize
+
+# NO ABSOLUTE INTERPRETER PATH HERE -- see bayes_v1.yaml's block for why. `${args}` expands to
+# one `--<key>=<value>` per parameter, spelled with underscores; `train.dashed` normalises
+# them and `run_config.py` reuses it. `--wandb-tags` is `nargs="*"`, so it goes LAST.
+command:
+  - ${env}
+  - ${program}
+  - ${args}
+  - --wandb-tags
+  - sweep
+  - bayes_jepa_tx_v1
+
+# No `early_terminate`, for the same reason as the MiniMol sweep: hyperband prunes on the
+# intermediate value, which systematically penalises long-anneal schedules. `epochs` is a
+# swept axis here too, so pruning on it would decide the sweep before it started.
+
+parameters:
+
+  # -- the program, and the architecture Ethan pinned ---------------------------------------
+
+  trainer:
+    value: train_jepa
+
+  # A transformer encoder over the 13 tokens, rather than an MLP over a flattened readout.
+  # The MLP arm must either discard 11 tokens or concatenate all of them into 6656 flat
+  # dimensions -- and on the fold-0 scan the concatenation scored WORSE than the two real
+  # tokens alone. Neither lets the model relate one token to another, which is what attention
+  # is for. `--readout` is ignored under this head; `--token-source` replaces it.
+  head:
+    value: token_transformer
+
+  # PINNED BY ETHAN, deliberately out of the sweep, so any result is attributable to the
+  # architecture as specified rather than to a search over architectures.
+  n_blocks:
+    value: 2
+  n_heads:
+    value: 4
+
+  # -- the cost dial ------------------------------------------------------------------------
+
+  # Comma-separated STRINGS, not YAML lists -- a YAML list reaches the agent as
+  # `--fold_list=[0, 1]`, which the shell splits and argparse rejects.
+  fold_list:
+    value: "0,1,2,3,4"
+  seed_list:
+    value: "0,1"
+
+  # -- swept: the two architecture choices with no settled answer ---------------------------
+
+  # How the 13 contextualised tokens collapse to one vector. There is no argument that settles
+  # it: mean reads every token out, max lets one dominate. Swept rather than assumed.
+  pooling:
+    values: [mean, max]
+
+  # Raw Mol-JEPA transformer output, or each token through its own `modality_pred[i]` head.
+  # The fold-0 scan favoured raw (emb:* 0.8084 vs proj:* 0.7782) -- but that was measured with
+  # a flattened LINEAR readout, and an attention stack may well prefer the projected space,
+  # which is where JEPA's own training objective lives. Not transferable evidence, so swept.
+  token_source:
+    values: [raw, projected]
+
+  # -- swept: width and optimisation --------------------------------------------------------
+
+  dim_feedforward:
+    distribution: q_log_uniform_values
+    min: 256
+    max: 4096
+    q: 1
+
+  dropout:
+    distribution: uniform
+    min: 0.0
+    max: 0.3
+
+  head_lr:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.01
+
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.00001
+    max: 0.1
+
+  epochs:
+    distribution: q_log_uniform_values
+    min: 3
+    max: 60
+    q: 1
+
+  # -- pinned, and why ----------------------------------------------------------------------
+
+  # The four loss weights at the same values as both other arms, so the loss is unchanged and
+  # a goal_metric here is comparable to the MLP arm's and to frozen MiniMol's.
+  w_cls:
+    value: 0.4418
+  w_pair:
+    value: 7.486
+  w_std:
+    value: 0.7911
+  huber_delta:
+    value: 1.0513
+
+  # 1200 is argued twice over -- ~11.4 positives per batch at the pProp 3.5 edge, and
+  # throughput -- and moving it would confound every LR axis.
+  batch_size:
+    value: 1200
+
+  # The two MLP layers after pooling keep the MLP arm's defaults, and the task heads stay
+  # linear so the bottleneck output is still the exported encoder.
+  hidden_dim:
+    value: 1024
+  embed_dim:
+    value: 1024
+  cls_n_layers:
+    value: 0
+  reg_n_layers:
+    value: 0
+
+  weights:
+    value: balanced
+  pprop_norm:
+    value: zscore
+  eta_min:
+    value: 1.0e-8
+  lr_schedule:
+    value: cosine
+  w_vic:
+    value: 0.0

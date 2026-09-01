@@ -170,6 +170,39 @@ def load_embeddings(root, readout="cls", check_input=True, allow_partial=False):
     return np.ascontiguousarray(X, dtype=np.float32)
 
 
+# The two arrays, under the names a caller uses to pick one. `raw`/`projected` rather than
+# the filenames, because the distinction that matters is what the vectors ARE -- Mol-JEPA's
+# raw transformer output, versus each token pushed through its own `modality_pred[i]`.
+TOKEN_SOURCES = {"raw": "embeddings", "projected": "projected"}
+
+
+def load_tokens(root, source="raw", check_input=True, allow_partial=False, mmap=False):
+    """Return `([N, n_tokens, embed_dim] float32, token_names)`, in exact CSV row order.
+
+    The sequence form of the cache, for a head that attends over the tokens rather than
+    consuming a flattened readout. `load_embeddings` is the flat counterpart; both go through
+    `load_meta`, so the CSV re-hash and the `--limit` refusal are the same guard in both paths.
+
+    Resident by default. The array is 8.8 GB and this box has 500 GB, so three concurrent
+    sweep agents fit comfortably, and a resident array turns every batch into a memory slice
+    rather than a disk read -- which matters because the whole point of the frozen arm is that
+    an epoch costs seconds. `mmap=True` trades that back for RSS if a machine cannot hold it.
+    """
+    root = Path(root)
+    meta = load_meta(root, check_input=check_input, allow_partial=allow_partial)
+    which = TOKEN_SOURCES.get(source)
+    if which is None:
+        raise ValueError(f"unknown token source {source!r}; "
+                         f"choose from {sorted(TOKEN_SOURCES)}")
+    if which not in meta["arrays"]:
+        raise ValueError(f"token source {source!r} needs array {which!r}, which this cache "
+                         f"does not have. Present: {sorted(meta['arrays'])}")
+
+    arr = _open(root, meta, which)
+    X = arr if mmap else np.ascontiguousarray(np.asarray(arr), dtype=np.float32)
+    return X, list(meta["token_names"])
+
+
 def describe(root, check_input=False):
     meta = load_meta(root, check_input=check_input, allow_partial=True)
     lines = [
