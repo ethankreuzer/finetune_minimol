@@ -161,13 +161,13 @@ def load_embeddings(root, readout="cls", check_input=True, allow_partial=False):
     # float32 explicitly: a float64 array here would silently double every downstream tensor
     # and change the loss's numerics rather than failing.
     #
-    # Note a deliberate asymmetry. A single-token term goes through fancy indexing, which
-    # copies, so it comes back as ~679 MB of real memory. A `*` term reshapes the memmap,
-    # which is already contiguous float32, so `ascontiguousarray` is a no-op and the result
-    # stays memory-mapped -- 8.8 GB read lazily per batch rather than resident. Both index
-    # identically; the `*` case just trades RAM for I/O, which is the right way round.
+    # An earlier comment here called the following asymmetry deliberate. It was not, and the
+    # same mistake cost the token loader an 8x slowdown: a single-token term goes through
+    # fancy indexing, which copies, but a `*` term only reshapes the memmap -- already
+    # contiguous float32 -- so `ascontiguousarray` was a no-op and the result stayed mapped.
+    # Correct numbers, silently paged. `np.asarray(..., copy=True)` makes both paths resident.
     X = (parts[0] if len(parts) == 1 else np.concatenate(parts, axis=1))
-    return np.ascontiguousarray(X, dtype=np.float32)
+    return np.array(X, dtype=np.float32, copy=True)
 
 
 # The two arrays, under the names a caller uses to pick one. `raw`/`projected` rather than
@@ -183,10 +183,19 @@ def load_tokens(root, source="raw", check_input=True, allow_partial=False, mmap=
     consuming a flattened readout. `load_embeddings` is the flat counterpart; both go through
     `load_meta`, so the CSV re-hash and the `--limit` refusal are the same guard in both paths.
 
-    Resident by default. The array is 8.8 GB and this box has 500 GB, so three concurrent
-    sweep agents fit comfortably, and a resident array turns every batch into a memory slice
-    rather than a disk read -- which matters because the whole point of the frozen arm is that
-    an epoch costs seconds. `mmap=True` trades that back for RSS if a machine cannot hold it.
+    Resident by default, and the copy is FORCED. This read used to be
+    `np.ascontiguousarray(np.asarray(arr), dtype=np.float32)`, which looks like a load and is
+    not: the cache is already contiguous float32, so numpy returned a view sharing the mapped
+    buffer and nothing was ever read. Every batch then fancy-indexed a memory-mapped 8.8 GB
+    file, pulling ~32 MB through the page cache 221 times an epoch. It was silent -- the shapes,
+    the dtype and the numbers were all correct, only the speed was wrong.
+
+    `np.array(..., copy=True)` is the whole fix. Afterwards a batch is a memory slice.
+
+    The cost is 8.8 GB of RSS per process, and that is per-PROCESS: it bounds how many sweep
+    agents fit on a box in a way the accidental memmap version did not. This box has 500 GB, so
+    nine agents fit with room to spare. `mmap=True` trades the speed back for RSS where they do
+    not.
     """
     root = Path(root)
     meta = load_meta(root, check_input=check_input, allow_partial=allow_partial)
@@ -199,7 +208,7 @@ def load_tokens(root, source="raw", check_input=True, allow_partial=False, mmap=
                          f"does not have. Present: {sorted(meta['arrays'])}")
 
     arr = _open(root, meta, which)
-    X = arr if mmap else np.ascontiguousarray(np.asarray(arr), dtype=np.float32)
+    X = arr if mmap else np.array(arr, dtype=np.float32, copy=True)
     return X, list(meta["token_names"])
 
 

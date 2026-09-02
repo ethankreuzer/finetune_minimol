@@ -1,24 +1,30 @@
-# Bayes sweep over the head that sits on FROZEN Mol-JEPA embeddings.
+# Bayes sweep over a TRANSFORMER ENCODER on FROZEN Mol-JEPA's 13 tokens.
 #
-# The sibling of `bayes_v1.yaml`, and deliberately the same machinery: `method: bayes`, the
-# objective `final/goal_metric_mean` maximised, no `early_terminate`, the full 5x2 grid on
-# every trial, one configuration = one wandb run through `src/run_config.py`. The loss, the
-# metrics, the objective, the CSV and the splits are all identical -- that is the point of
-# the branch, and it is what makes a Mol-JEPA number comparable to a MiniMol one.
+# The sibling of `bayes_jepa_v1.yaml` (which sweeps an MLP over a flattened readout) and of
+# `bayes_v1.yaml` (which fine-tunes MiniMol), and deliberately the same machinery:
+# `method: bayes`, the objective `final/goal_metric_mean` maximised, no `early_terminate`, the
+# full 5x2 grid on every trial, one configuration = one wandb run through `src/run_config.py`.
+# The loss, the metrics, the objective, the CSV and the splits are identical across all three
+# -- that is the point of the branch, and it is what makes these numbers comparable at all.
 #
-# What changes is the axes, because the encoder never moves. `freeze_epochs`,
-# `unfrozen_epochs`, `trunk_lr` and `head_lr_unfrozen` have no referent under a frozen trunk:
-# there is one phase, so one cosine, and no trunk parameter group at all. What is left to
-# tune is the head, which is exactly the set `bayes_v1.yaml` marked "deliberately not swept:
-# blocked on the architecture question".
+# What changes is the axes. The encoder never moves, so `freeze_epochs`, `unfrozen_epochs`,
+# `trunk_lr` and `head_lr_unfrozen` have no referent: one phase, one cosine, no trunk
+# parameter group. And the architecture itself is pinned by Ethan at 2 blocks x 4 heads, so
+# what is left is two architecture choices nothing settles (`pooling`, `token_source`) plus
+# width and optimisation.
 #
-# The MiniMol sweep was cut from ten axes to five because bayes' advantage over random search
-# shrinks with dimension and ~140 trials over ten axes is mostly exploration. That argument is
-# about the ratio of trials to axes, not about seven being too many: a trial here trains a
-# small MLP on a cached matrix rather than fine-tuning a 10M-parameter GNN, so the trial count
-# goes up by roughly an order of magnitude and seven axes is a real search again. If the
-# trials turn out slower than that, cut `cls_hidden_dim`/`reg_hidden_dim` first -- the task
-# heads are linear by default and those two do nothing at `*_n_layers: 0`.
+# COST, MEASURED -- this is a smaller search than it looks. 15 s/epoch against the MLP arm's
+# 1.9, so ~5 min per model and **~50 min for a full 5x2 trial**, not the ~7 min the MLP arm
+# costs. Two structural causes: the input is 13x larger (`[B, 13, 512]` against `[B, 1024]`),
+# and `run_config.py` calls `train_jepa.main()` in-process per model, so the 8.83 GB token
+# array is loaded ten times per trial. That is ~29 trials/day per GPU, ~86 across the three on
+# this box.
+#
+# Eight axes at ~86 trials/day is a thinner search than the MLP arm gets, and bayes' advantage
+# over random search shrinks with dimension. If it needs cutting, drop `weight_decay` and
+# `dropout` first -- they are the two least likely to interact with the architecture question
+# this sweep exists to answer, which is whether attention over the 13 tokens beats flattening
+# two of them.
 
 program: scripts/sweep_trial.sh
 method: bayes
@@ -116,6 +122,31 @@ parameters:
     max: 60
     q: 1
 
+  # SWEPT HERE, unlike in both other arms, which pin it at 1200. That pin rested on two
+  # arguments and only one of them transfers. The throughput half was measured on MiniMol's
+  # GNN and says nothing about a 2-block attention stack over 13 tokens. The other half is a
+  # property of the DATA, not the model, and still holds: positives are 0.95% of rows and
+  # `balanced` weighting puts roughly half the loss mass on them, so a small batch leaves that
+  # half riding on two or three molecules.
+  #
+  #     batch    expected positives/batch    steps/epoch
+  #       512            4.9                    518
+  #      1200           11.4                    221
+  #      4096           39                       65
+  #
+  # Hence 512 at the bottom -- below it the tail term is noise -- and 4096 at the top, where
+  # a 3-epoch trial is already down to ~200 optimizer steps in total. Memory is not the
+  # binding constraint at either end: batch 1200 used 1918 MiB of 49140.
+  #
+  # Note this axis is strongly correlated with `head_lr` -- a bigger batch wants a bigger
+  # step -- so some trials will fail for the pairing rather than for either value, and
+  # attribution on the lr axis is correspondingly noisier.
+  batch_size:
+    distribution: q_log_uniform_values
+    min: 512
+    max: 4096
+    q: 1
+
   # -- pinned, and why ----------------------------------------------------------------------
 
   # The four loss weights at the same values as both other arms, so the loss is unchanged and
@@ -129,10 +160,6 @@ parameters:
   huber_delta:
     value: 1.0513
 
-  # 1200 is argued twice over -- ~11.4 positives per batch at the pProp 3.5 edge, and
-  # throughput -- and moving it would confound every LR axis.
-  batch_size:
-    value: 1200
 
   # The two MLP layers after pooling keep the MLP arm's defaults, and the task heads stay
   # linear so the bottleneck output is still the exported encoder.

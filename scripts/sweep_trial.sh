@@ -39,8 +39,14 @@ cd "$REPO"
 # argument overrides the environment variable (verified 2026-08-25). Since --wandb-entity
 # still defaults to `ethan_personal`, the env var alone would have left every run trying to
 # write into the OLD account -- a permissions failure under the new key.
+#
+# MINIMOL_PROJECT is the same trap one level along. `wandb sweep --project X` sets the
+# project the SWEEP lives in, but run_config.py calls wandb.init(project=args.wandb_project),
+# which would send every run to the trainer's default (`finetune_minimol`) instead -- so the
+# sweep and its runs would end up in two different projects.
 exec "$VENV" src/run_config.py \
     ${MINIMOL_ENTITY:+--wandb-entity "$MINIMOL_ENTITY"} \
+    ${MINIMOL_PROJECT:+--wandb-project "$MINIMOL_PROJECT"} \
     ${MINIMOL_FEATURES:+--features "$MINIMOL_FEATURES"} \
     ${MINIMOL_EMBEDDINGS:+--embeddings "$MINIMOL_EMBEDDINGS"} \
     ${MINIMOL_SPLITS:+--splits "$MINIMOL_SPLITS"} \
